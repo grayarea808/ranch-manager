@@ -1,3 +1,4 @@
+import 'dotenv/config';
 // index.js
 
 // Load environment variables
@@ -68,3 +69,4 @@ async function updateLeaderboard() {
 
 // Login Discord bot
 client.login(process.env.DISCORD_TOKEN);
+
