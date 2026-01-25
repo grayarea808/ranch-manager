@@ -1,13 +1,14 @@
 {
   "name": "ranch-manager",
   "version": "1.0.0",
+  "description": "Ranch stats bot",
   "main": "index.js",
-  "dependencies": {
-    "discord.js": "^14.14.1",
-    "express": "^4.18.2",
-    "body-parser": "^1.20.2"
-  },
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.11.0",
+    "pg": "^8.11.0",
+    "dotenv": "^16.3.1"
   }
 }
