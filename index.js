@@ -1,29 +1,22 @@
-// index.js
-import 'dotenv/config';
-
 // ---------------------
-// PostgreSQL Setup (Railway-safe)
+// PostgreSQL Setup
 // ---------------------
 import pkg from 'pg';
 const { Pool } = pkg;
 
+// Use Railway DATABASE_URL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production'
-    ? { rejectUnauthorized: false }
-    : false
+  ssl: { rejectUnauthorized: false } // Required for Railway
 });
 
 // ---------------------
 // Discord Setup
 // ---------------------
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import { Client, GatewayIntentBits } from 'discord.js';
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -31,18 +24,9 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 // ---------------------
 // Bot Ready
 // ---------------------
-client.once(Events.ClientReady, async () => {
+client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}!`);
-
-  // Test DB connection once on startup
-  try {
-    await pool.query('SELECT 1');
-    console.log('Postgres connected successfully');
-  } catch (err) {
-    console.error('Postgres connection failed:', err);
-  }
-
-  await updateLeaderboard();
+  updateLeaderboard();
   setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
 });
 
@@ -52,29 +36,23 @@ client.once(Events.ClientReady, async () => {
 async function updateLeaderboard() {
   try {
     const result = await pool.query(`
-      SELECT username, milk, eggs, cattle,
-             milk * 1.1 + eggs * 1.1 + cattle AS total
+      SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
       FROM ranch_data
       ORDER BY total DESC
       LIMIT 10
     `);
 
     let leaderboardMessage = '🏆 Baba Yaga Ranch — Leaderboard\n\n';
-
     result.rows.forEach((row, i) => {
-      leaderboardMessage +=
-        `${i + 1}. ${row.username}\n` +
-        `🥛 Milk: ${row.milk}\n` +
-        `🥚 Eggs: ${row.eggs}\n` +
-        `🐄 Cattle: ${row.cattle}\n` +
-        `💰 Total: $${Number(row.total).toFixed(2)}\n\n`;
+      leaderboardMessage += `${i + 1}. ${row.username}\n`;
+      leaderboardMessage += `🥛 Milk: ${row.milk}\n`;
+      leaderboardMessage += `🥚 Eggs: ${row.eggs}\n`;
+      leaderboardMessage += `🐄 Cattle: ${row.cattle}\n`;
+      leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
     });
 
     const channel = await client.channels.fetch(CHANNEL_ID);
-    if (!channel) {
-      console.error('Channel not found');
-      return;
-    }
+    if (!channel) return console.error('Channel not found!');
 
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
@@ -85,7 +63,7 @@ async function updateLeaderboard() {
       await channel.send(leaderboardMessage);
     }
 
-    console.log('Leaderboard updated successfully');
+    console.log('Leaderboard updated successfully!');
   } catch (err) {
     console.error('Error updating leaderboard:', err);
   }
