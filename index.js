@@ -1,5 +1,3 @@
-// index.js
-
 // ---------------------
 // PostgreSQL Setup
 // ---------------------
@@ -7,14 +5,13 @@ import pkg from 'pg';
 const { Pool } = pkg;
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // Railway provides this
-  ssl: { rejectUnauthorized: false }          // required for Railway
+  user: process.env.PGUSER,
+  host: process.env.PGHOST,
+  database: process.env.PGDATABASE,
+  password: process.env.PGPASSWORD,
+  port: Number(process.env.PGPORT),
+  ssl: { rejectUnauthorized: false } // Railway requires this
 });
-
-// Test connection
-pool.connect()
-  .then(() => console.log('Postgres connected successfully'))
-  .catch(err => console.error('Postgres connection failed:', err));
 
 // ---------------------
 // Discord Setup
@@ -41,15 +38,13 @@ client.once('clientReady', () => {
 // ---------------------
 async function updateLeaderboard() {
   try {
-    // Query your actual table
     const result = await pool.query(`
-      SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
+      SELECT username, milk, eggs, cattle, milk*1.1 + eggs*1.1 + cattle AS total
       FROM ranch_stats
       ORDER BY total DESC
       LIMIT 10
     `);
 
-    // Build the leaderboard message
     let leaderboardMessage = '🏆 Baba Yaga Ranch — Leaderboard\n\n';
     result.rows.forEach((row, i) => {
       leaderboardMessage += `${i + 1}. ${row.username}\n`;
@@ -59,13 +54,11 @@ async function updateLeaderboard() {
       leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
     });
 
-    // Fetch channel and send/edit message
     const channel = await client.channels.fetch(CHANNEL_ID);
     if (!channel) return console.error('Channel not found!');
 
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
-
     if (botMessage) {
       await botMessage.edit(leaderboardMessage);
     } else {
