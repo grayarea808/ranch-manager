@@ -1,31 +1,31 @@
-import 'dotenv/config';
 // index.js
 
-// Load environment variables
-require('dotenv').config();
+// Load environment variables (ES module syntax)
+import 'dotenv/config';
 
 // PostgreSQL setup
-const { Pool } = require('pg');
+import pkg from 'pg';
+const { Pool } = pkg;
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false } // required for Railway
 });
 
 // Discord setup
-const { Client, GatewayIntentBits } = require('discord.js');
+import { Client, GatewayIntentBits } from 'discord.js';
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
 // Your environment variables in Railway:
 // DISCORD_TOKEN = your bot token
-// GUILD_ID = your server ID
 // CHANNEL_ID = the channel where leaderboard messages will post
-
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // Bot ready
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
   updateLeaderboard();
+
   // Update leaderboard every 5 minutes
   setInterval(updateLeaderboard, 5 * 60 * 1000);
 });
@@ -53,7 +53,7 @@ async function updateLeaderboard() {
     const channel = await client.channels.fetch(CHANNEL_ID);
     if (!channel) return console.error('Channel not found!');
 
-    // If you want it to **update existing message** instead of spamming:
+    // Update existing message if it exists, otherwise send new
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
     if (botMessage) {
@@ -69,4 +69,3 @@ async function updateLeaderboard() {
 
 // Login Discord bot
 client.login(process.env.DISCORD_TOKEN);
-
