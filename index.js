@@ -107,3 +107,13 @@ client.login(process.env.BOT_TOKEN);
 
 // Periodic leaderboard refresh
 setInterval(updateLeaderboard, 60 * 1000);
+
+const botToken = process.env.BOT_TOKEN;
+const pool = new Pool({
+    host: process.env.PGHOST,
+    user: process.env.PGUSER,
+    password: process.env.PGPASSWORD,
+    database: process.env.PGDATABASE,
+    port: process.env.PGPORT,
+});
+
