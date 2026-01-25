@@ -9,7 +9,6 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// PostgreSQL connection
 const pool = new Pool({
     host: process.env.PGHOST,
     user: process.env.PGUSER,
@@ -18,29 +17,26 @@ const pool = new Pool({
     port: process.env.PGPORT,
 });
 
-// Middleware to parse JSON
 app.use(bodyParser.json());
 
-let leaderboardMessageId; // Stores the message ID for editing
+let leaderboardMessageId;
+const PAGE_SIZE = 10;
 
 // Webhook endpoint
 app.post('/ranch-webhook', async (req, res) => {
     const { userId, action, amount, playerName } = req.body;
 
     if (!userId || !action || amount == null || !playerName) {
-        return res.status(400).send({ error: 'Missing fields in request body' });
+        return res.status(400).send({ error: 'Missing fields' });
     }
 
     try {
-        // Insert/update player stats in PostgreSQL
         await pool.query(`
             INSERT INTO ranch_stats (user_id, player_name, action, amount)
             VALUES ($1, $2, $3, $4)
         `, [userId, playerName, action, amount]);
 
-        // Update the leaderboard after each webhook
         await updateLeaderboard();
-
         res.status(200).send({ success: true });
     } catch (err) {
         console.error(err);
@@ -48,7 +44,7 @@ app.post('/ranch-webhook', async (req, res) => {
     }
 });
 
-// Function to update leaderboard
+// Build the leaderboard embed
 async function updateLeaderboard() {
     try {
         const res = await pool.query(`
@@ -58,15 +54,21 @@ async function updateLeaderboard() {
                    SUM(CASE WHEN action='cattle' THEN amount ELSE 0 END) AS cattle
             FROM ranch_stats
             GROUP BY player_name
-            ORDER BY milk + eggs + cattle DESC
-            LIMIT 10;
+            ORDER BY (SUM(CASE WHEN action='milk' THEN amount ELSE 0 END) +
+                      SUM(CASE WHEN action='eggs' THEN amount ELSE 0 END) +
+                      SUM(CASE WHEN action='cattle' THEN amount ELSE 0 END)) DESC;
         `);
 
         if (!res.rows.length) return;
 
+        const totalPages = Math.ceil(res.rows.length / PAGE_SIZE);
+        let page = 1; // For simplicity, we only do page 1
+
+        const pageRows = res.rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
         let totalRanchProfit = 0;
 
-        const leaderboardText = res.rows.map(row => {
+        const leaderboardText = pageRows.map(row => {
             const milkValue = (row.milk * 1.1).toFixed(2);
             const eggsValue = (row.eggs * 1.1).toFixed(2);
             const cattleValue = row.cattle.toFixed(2);
@@ -78,7 +80,7 @@ async function updateLeaderboard() {
         }).join('\n\n');
 
         const channel = await client.channels.fetch(process.env.LEADERBOARD_CHANNEL_ID);
-        const header = `🏆 Baba Yaga Ranch — Page 1/1\n📅 Next Ranch Payout: Saturday, Jan 31\n💰 Ranch Payout\n$${totalRanchProfit.toFixed(2)}\n`;
+        const header = `🏆 Baba Yaga Ranch — Page ${page}/${totalPages}\n📅 Next Ranch Payout: Saturday, Jan 31\n💰 Ranch Payout\n$${totalRanchProfit.toFixed(2)}\n`;
 
         if (leaderboardMessageId) {
             const msg = await channel.messages.fetch(leaderboardMessageId).catch(() => null);
@@ -96,12 +98,12 @@ async function updateLeaderboard() {
     }
 }
 
-// Start Express server
+// Express server
 app.listen(PORT, () => console.log(`Webhook server running on port ${PORT}`));
 
-// Login Discord client
+// Discord login
 client.once('clientReady', () => console.log(`Logged in as ${client.user.tag}`));
 client.login(process.env.BOT_TOKEN);
 
-// Optional: periodic leaderboard update (every 1 minute)
+// Periodic leaderboard refresh
 setInterval(updateLeaderboard, 60 * 1000);
