@@ -1,14 +1,30 @@
 // ---------------------
-// PostgreSQL Setup
+// Imports & Postgres Setup
 // ---------------------
 import pkg from 'pg';
 const { Pool } = pkg;
 
-// Use Railway DATABASE_URL
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Required for Railway
+  connectionString: process.env.DATABASE_URL, // Use Railway DATABASE_URL
+  ssl: { rejectUnauthorized: false }          // Required for Railway
 });
+
+// Automatically create the table if it doesn't exist
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ranch_stats (
+        username TEXT PRIMARY KEY,
+        milk INT DEFAULT 0,
+        eggs INT DEFAULT 0,
+        cattle INT DEFAULT 0
+      );
+    `);
+    console.log('Postgres table ready!');
+  } catch (err) {
+    console.error('Postgres table setup failed:', err);
+  }
+}
 
 // ---------------------
 // Discord Setup
@@ -24,9 +40,9 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 // ---------------------
 // Bot Ready
 // ---------------------
-client.once('clientReady', () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}!`);
-  updateLeaderboard();
+  await updateLeaderboard();
   setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
 });
 
@@ -37,7 +53,7 @@ async function updateLeaderboard() {
   try {
     const result = await pool.query(`
       SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
-      FROM ranch_data
+      FROM ranch_stats
       ORDER BY total DESC
       LIMIT 10
     `);
@@ -70,8 +86,11 @@ async function updateLeaderboard() {
 }
 
 // ---------------------
-// Login Discord Bot
+// Start Bot
 // ---------------------
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('🚨 Failed to login Discord bot:', err);
-});
+(async () => {
+  await initDatabase(); // ensure table exists
+  client.login(process.env.DISCORD_TOKEN).catch(err => {
+    console.error('🚨 Failed to login Discord bot:', err);
+  });
+})();
