@@ -1,64 +1,75 @@
 // index.js
-const express = require("express");
-const bodyParser = require("body-parser");
-const { Client, GatewayIntentBits } = require("discord.js");
+require('dotenv').config();
+const { Client, GatewayIntentBits } = require('discord.js');
+const express = require('express');
+const bodyParser = require('body-parser');
+const { Pool } = require('pg');
 
-// ---- Discord setup ----
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const BOT_TOKEN = process.env.BOT_TOKEN;
-
-client.once("ready", () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
-
-client.login(BOT_TOKEN);
-
-// ---- Express setup ----
 const app = express();
-app.use(bodyParser.json()); // Parse JSON POSTs
+app.use(bodyParser.json());
 
-// ---- In-memory ranch stats ----
-const ranchStats = {};
+// ---------- Discord Client ----------
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// ---- Webhook endpoint ----
-app.post("/ranch-webhook", (req, res) => {
-  const data = req.body;
-
-  let userId, action, amount, playerName;
-
-  // Syn County webhook (embeds)
-  if (data.embeds && data.embeds.length > 0) {
-    const desc = data.embeds[0].description; // "<@123456789> 10 GRAYAREA"
-    const match = desc.match(/<@(\d+)> (\d+) (\w+)/);
-    if (match) {
-      userId = match[1];
-      amount = parseInt(match[2]);
-      playerName = match[3];
-      action = data.embeds[0].title.toLowerCase().includes("egg") ? "eggs" : "milk";
-    }
-  }
-
-  // Manual JSON
-  if (data.userId && data.action && data.amount && data.playerName) {
-    userId = data.userId;
-    action = data.action.toLowerCase();
-    amount = parseInt(data.amount);
-    playerName = data.playerName;
-  }
-
-  if (!userId || !action || !amount || !playerName) {
-    return res.status(400).send("Bad Request: Missing required fields");
-  }
-
-  console.log(`Received ${action} update for ${playerName} (${userId}): ${amount}`);
-
-  // Update stats
-  if (!ranchStats[userId]) ranchStats[userId] = { eggs: 0, milk: 0 };
-  ranchStats[userId][action] += amount;
-
-  res.status(200).send("OK");
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}`);
 });
 
-// ---- Start server ----
+client.login(process.env.BOT_TOKEN);
+
+// ---------- PostgreSQL Connection ----------
+const pool = new Pool({
+    host: process.env.PGHOST,
+    user: process.env.PGUSER,
+    password: process.env.PGPASSWORD,
+    database: process.env.PGDATABASE,
+    port: process.env.PGPORT,
+    ssl: { rejectUnauthorized: false } // needed for Railway
+});
+
+// ---------- Create Table if Not Exists ----------
+(async () => {
+    const createTableQuery = `
+    CREATE TABLE IF NOT EXISTS ranch_stats (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        action TEXT NOT NULL,
+        amount INT NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );`;
+    await pool.query(createTableQuery);
+    console.log('Database table ready');
+})();
+
+// ---------- Webhook Endpoint ----------
+app.post('/ranch-webhook', async (req, res) => {
+    try {
+        const { userId, playerName, action, amount } = req.body;
+
+        if (!userId || !playerName || !action || !amount) {
+            return res.status(400).send('Missing required fields');
+        }
+
+        // Insert into database
+        await pool.query(
+            'INSERT INTO ranch_stats (user_id, player_name, action, amount) VALUES ($1, $2, $3, $4)',
+            [userId, playerName, action, amount]
+        );
+
+        console.log(`Ranch webhook received: ${JSON.stringify(req.body)}`);
+
+        // Send confirmation to Discord (optional)
+        const user = await client.users.fetch(userId);
+        user.send(`You added **${amount} ${action}** to your ranch!`);
+
+        res.status(200).send('Webhook received');
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Server error');
+    }
+});
+
+// ---------- Start Server ----------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Webhook server running on port ${PORT}`));
