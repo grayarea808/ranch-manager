@@ -1,49 +1,48 @@
 // index.js
 
-import 'dotenv/config';
-import { Client, GatewayIntentBits } from 'discord.js';
-import pkg from 'pg';
-const { Pool } = pkg;
+// ---------------------
+// PostgreSQL Setup
+// ---------------------
+const { Pool } = require('pg');
 
-// Load environment variables from .env
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const pool = new Pool({
+  connectionString: `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}`,
+  ssl: { rejectUnauthorized: false } // required for Railway
+});
+
+// ---------------------
+// Discord Setup
+// ---------------------
+const { Client, GatewayIntentBits } = require('discord.js');
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+});
+
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// PostgreSQL setup
-const pool = new Pool({
-  host: process.env.PGHOST,
-  user: process.env.PGUSER,
-  password: process.env.PGPASSWORD,
-  database: process.env.PGDATABASE,
-  port: process.env.PGPORT,
-  ssl: { rejectUnauthorized: false }
-});
-
-// Discord bot setup with only safe intents
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds // Only this is needed for sending messages
-  ]
-});
-
-// Bot ready
+// ---------------------
+// Bot Ready
+// ---------------------
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
   updateLeaderboard();
-  setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
+  // Update leaderboard every 5 minutes
+  setInterval(updateLeaderboard, 5 * 60 * 1000);
 });
 
-// Function to fetch leaderboard and post/update in Discord
+// ---------------------
+// Update Leaderboard
+// ---------------------
 async function updateLeaderboard() {
   try {
+    // Example query: top 10 players by total
     const result = await pool.query(`
       SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
       FROM ranch_data
       ORDER BY total DESC
       LIMIT 10
     `);
-
-    if (!result.rows.length) return;
 
     let leaderboardMessage = '🏆 Baba Yaga Ranch — Leaderboard\n\n';
     result.rows.forEach((row, i) => {
@@ -54,6 +53,7 @@ async function updateLeaderboard() {
       leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
     });
 
+    // Fetch the channel
     const channel = await client.channels.fetch(CHANNEL_ID);
     if (!channel) return console.error('Channel not found!');
 
@@ -66,12 +66,15 @@ async function updateLeaderboard() {
       await channel.send(leaderboardMessage);
     }
 
+    console.log('Leaderboard updated successfully!');
   } catch (err) {
     console.error('Error updating leaderboard:', err);
   }
 }
 
-// Login Discord bot
-client.login(DISCORD_TOKEN).catch(err => {
+// ---------------------
+// Login Discord Bot
+// ---------------------
+client.login(process.env.DISCORD_TOKEN).catch(err => {
   console.error('🚨 Failed to login Discord bot:', err);
 });
