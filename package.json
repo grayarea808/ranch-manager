@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Ranch stats bot",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
@@ -11,3 +12,4 @@
     "pg": "^8.11.0",
     "dotenv": "^16.3.1"
   }
+}
