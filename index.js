@@ -31,7 +31,7 @@ client.once('ready', () => {
 client.login(process.env.BOT_TOKEN);
 
 // -------- Leaderboard Logic --------
-const LEADERBOARD_CHANNEL_ID = 'YOUR_CHANNEL_ID'; // put your channel ID here
+const LEADERBOARD_CHANNEL_ID = '1465062014626824347'; // put your channel ID here
 const LEADERBOARD_INTERVAL = 60 * 1000; // 60 seconds
 
 async function startLeaderboardLoop() {
@@ -68,3 +68,4 @@ async function startLeaderboardLoop() {
     }
   }, LEADERBOARD_INTERVAL);
 }
+
