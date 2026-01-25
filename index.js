@@ -1,71 +1,70 @@
 // index.js
-import 'dotenv/config';
-import { Client, GatewayIntentBits } from 'discord.js';
-import pkg from 'pg';
-const { Pool } = pkg;
 
-// -------- PostgreSQL Connection --------
+// Load environment variables
+require('dotenv').config();
+
+// PostgreSQL setup
+const { Pool } = require('pg');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: false } // required for Railway
 });
 
-// Test DB connection
-try {
-  const res = await pool.query('SELECT NOW()');
-  console.log('PostgreSQL connected:', res.rows[0]);
-} catch (err) {
-  console.error('PostgreSQL connection error:', err);
-}
+// Discord setup
+const { Client, GatewayIntentBits } = require('discord.js');
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
-// -------- Discord Bot Setup --------
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-});
+// Your environment variables in Railway:
+// DISCORD_TOKEN = your bot token
+// GUILD_ID = your server ID
+// CHANNEL_ID = the channel where leaderboard messages will post
 
+const CHANNEL_ID = process.env.CHANNEL_ID;
+
+// Bot ready
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
-  startLeaderboardLoop();
+  updateLeaderboard();
+  // Update leaderboard every 5 minutes
+  setInterval(updateLeaderboard, 5 * 60 * 1000);
 });
 
-client.login(process.env.BOT_TOKEN);
+// Function to fetch leaderboard from PostgreSQL and post it
+async function updateLeaderboard() {
+  try {
+    // Example: get top players by total money
+    const result = await pool.query(`
+      SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
+      FROM ranch_data
+      ORDER BY total DESC
+      LIMIT 10
+    `);
 
-// -------- Leaderboard Logic --------
-const LEADERBOARD_CHANNEL_ID = '1465062014626824347'; // put your channel ID here
-const LEADERBOARD_INTERVAL = 60 * 1000; // 60 seconds
+    let leaderboardMessage = '🏆 Baba Yaga Ranch — Leaderboard\n\n';
+    result.rows.forEach((row, i) => {
+      leaderboardMessage += `${i + 1}. ${row.username}\n`;
+      leaderboardMessage += `🥛 Milk: ${row.milk}\n`;
+      leaderboardMessage += `🥚 Eggs: ${row.eggs}\n`;
+      leaderboardMessage += `🐄 Cattle: ${row.cattle}\n`;
+      leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
+    });
 
-async function startLeaderboardLoop() {
-  const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
+    const channel = await client.channels.fetch(CHANNEL_ID);
+    if (!channel) return console.error('Channel not found!');
 
-  setInterval(async () => {
-    try {
-      const res = await pool.query(`
-        SELECT player_name, milk, eggs, cattle,
-               (milk + eggs + cattle) AS total
-        FROM ranch_stats
-        ORDER BY total DESC
-        LIMIT 10
-      `);
-
-      if (!res.rows.length) return;
-
-      let leaderboard = `🏆 Baba Yaga Ranch — Page 1/1\n`;
-      leaderboard += `📅 Next Ranch Payout: Saturday, Jan 31\n\n`;
-      leaderboard += `💰 Ranch Payout\n`;
-
-      res.rows.forEach(player => {
-        leaderboard += `${player.player_name}\n`;
-        leaderboard += `🥛 Milk: ${player.milk}\n`;
-        leaderboard += `🥚 Eggs: ${player.eggs}\n`;
-        leaderboard += `🐄 Cattle: ${player.cattle}\n`;
-        leaderboard += `💰 Total: $${player.total}\n\n`;
-      });
-
-      await channel.send(leaderboard);
-      console.log('Leaderboard updated!');
-    } catch (err) {
-      console.error('Error updating leaderboard:', err);
+    // If you want it to **update existing message** instead of spamming:
+    const messages = await channel.messages.fetch({ limit: 10 });
+    const botMessage = messages.find(m => m.author.id === client.user.id);
+    if (botMessage) {
+      await botMessage.edit(leaderboardMessage);
+    } else {
+      await channel.send(leaderboardMessage);
     }
-  }, LEADERBOARD_INTERVAL);
+
+  } catch (err) {
+    console.error('Error updating leaderboard:', err);
+  }
 }
 
+// Login Discord bot
+client.login(process.env.DISCORD_TOKEN);
