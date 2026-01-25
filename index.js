@@ -3,17 +3,22 @@
 // ---------------------
 // PostgreSQL Setup
 // ---------------------
-const { Pool } = require('pg');
+import pkg from 'pg';
+const { Pool } = pkg;
 
 const pool = new Pool({
-  connectionString: `postgresql://${process.env.PGUSER}:${process.env.PGPASSWORD}@${process.env.PGHOST}:${process.env.PGPORT}/${process.env.PGDATABASE}`,
-  ssl: { rejectUnauthorized: false } // required for Railway
+  user: process.env.PGUSER,
+  host: process.env.PGHOST,
+  database: process.env.PGDATABASE,
+  password: process.env.PGPASSWORD,
+  port: Number(process.env.PGPORT),
+  ssl: { rejectUnauthorized: false } // Railway requires this
 });
 
 // ---------------------
 // Discord Setup
 // ---------------------
-const { Client, GatewayIntentBits } = require('discord.js');
+import { Client, GatewayIntentBits } from 'discord.js';
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
@@ -27,8 +32,7 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
   updateLeaderboard();
-  // Update leaderboard every 5 minutes
-  setInterval(updateLeaderboard, 5 * 60 * 1000);
+  setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
 });
 
 // ---------------------
@@ -36,7 +40,6 @@ client.once('ready', () => {
 // ---------------------
 async function updateLeaderboard() {
   try {
-    // Example query: top 10 players by total
     const result = await pool.query(`
       SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
       FROM ranch_data
@@ -53,11 +56,9 @@ async function updateLeaderboard() {
       leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
     });
 
-    // Fetch the channel
     const channel = await client.channels.fetch(CHANNEL_ID);
     if (!channel) return console.error('Channel not found!');
 
-    // Edit existing bot message if exists
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
     if (botMessage) {
