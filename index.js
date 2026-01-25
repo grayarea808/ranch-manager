@@ -1,14 +1,15 @@
 // index.js
-
-// Load environment variables (ES module syntax)
-import 'dotenv/config';
+import 'dotenv/config'; // Loads .env automatically
 
 // PostgreSQL setup
 import pkg from 'pg';
 const { Pool } = pkg;
-
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  host: process.env.PGHOST,
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  database: process.env.PGDATABASE,
+  port: process.env.PGPORT,
   ssl: { rejectUnauthorized: false } // required for Railway
 });
 
@@ -16,10 +17,19 @@ const pool = new Pool({
 import { Client, GatewayIntentBits } from 'discord.js';
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
-// Your environment variables in Railway:
-// DISCORD_TOKEN = your bot token
-// CHANNEL_ID = the channel where leaderboard messages will post
+// Discord environment variables
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+
+// Safety check
+if (!DISCORD_TOKEN) {
+  console.error("⚠️ DISCORD_TOKEN is missing!");
+  process.exit(1);
+}
+if (!CHANNEL_ID) {
+  console.error("⚠️ CHANNEL_ID is missing!");
+  process.exit(1);
+}
 
 // Bot ready
 client.once('ready', () => {
@@ -33,7 +43,6 @@ client.once('ready', () => {
 // Function to fetch leaderboard from PostgreSQL and post it
 async function updateLeaderboard() {
   try {
-    // Example: get top players by total money
     const result = await pool.query(`
       SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
       FROM ranch_data
@@ -53,7 +62,7 @@ async function updateLeaderboard() {
     const channel = await client.channels.fetch(CHANNEL_ID);
     if (!channel) return console.error('Channel not found!');
 
-    // Update existing message if it exists, otherwise send new
+    // Update existing message if exists
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
     if (botMessage) {
@@ -61,11 +70,10 @@ async function updateLeaderboard() {
     } else {
       await channel.send(leaderboardMessage);
     }
-
   } catch (err) {
     console.error('Error updating leaderboard:', err);
   }
 }
 
 // Login Discord bot
-client.login(process.env.DISCORD_TOKEN);
+client.login(DISCORD_TOKEN);
