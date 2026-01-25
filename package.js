@@ -1,14 +1,1 @@
-{
-  "name": "ranch-manager",
-  "version": "1.0.0",
-  "description": "Ranch stats bot",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "discord.js": "^14.11.0",
-    "pg": "^8.11.0",
-    "dotenv": "^16.3.1"
-  }
-}
+Remove package.js
