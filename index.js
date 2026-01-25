@@ -1,50 +1,41 @@
-// index.js
-import 'dotenv/config'; // Loads .env automatically
+import 'dotenv/config';  // <-- this auto-loads process.env from Railway or .env
 
-// PostgreSQL setup
+import { Client, GatewayIntentBits } from 'discord.js';
 import pkg from 'pg';
 const { Pool } = pkg;
+
+// PostgreSQL setup
 const pool = new Pool({
   host: process.env.PGHOST,
   user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
   port: process.env.PGPORT,
-  ssl: { rejectUnauthorized: false } // required for Railway
+  ssl: { rejectUnauthorized: false }
 });
 
-// Discord setup
-import { Client, GatewayIntentBits } from 'discord.js';
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+});
 
-// Discord environment variables
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
-// Safety check
 if (!DISCORD_TOKEN) {
-  console.error("⚠️ DISCORD_TOKEN is missing!");
-  process.exit(1);
-}
-if (!CHANNEL_ID) {
-  console.error("⚠️ CHANNEL_ID is missing!");
+  console.error("🚨 DISCORD_TOKEN not found in env vars!");
   process.exit(1);
 }
 
-// Bot ready
 client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
+  console.log(`✅ Logged in as ${client.user.tag}!`);
   updateLeaderboard();
-
-  // Update leaderboard every 5 minutes
   setInterval(updateLeaderboard, 5 * 60 * 1000);
 });
 
-// Function to fetch leaderboard from PostgreSQL and post it
 async function updateLeaderboard() {
   try {
     const result = await pool.query(`
-      SELECT username, milk, eggs, cattle, milk * 1.1 + eggs * 1.1 + cattle AS total
+      SELECT username, milk, eggs, cattle, milk*1.1 + eggs*1.1 + cattle AS total
       FROM ranch_data
       ORDER BY total DESC
       LIMIT 10
@@ -52,7 +43,7 @@ async function updateLeaderboard() {
 
     let leaderboardMessage = '🏆 Baba Yaga Ranch — Leaderboard\n\n';
     result.rows.forEach((row, i) => {
-      leaderboardMessage += `${i + 1}. ${row.username}\n`;
+      leaderboardMessage += `${i+1}. ${row.username}\n`;
       leaderboardMessage += `🥛 Milk: ${row.milk}\n`;
       leaderboardMessage += `🥚 Eggs: ${row.eggs}\n`;
       leaderboardMessage += `🐄 Cattle: ${row.cattle}\n`;
@@ -61,10 +52,9 @@ async function updateLeaderboard() {
 
     const channel = await client.channels.fetch(CHANNEL_ID);
     if (!channel) return console.error('Channel not found!');
-
-    // Update existing message if exists
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
+
     if (botMessage) {
       await botMessage.edit(leaderboardMessage);
     } else {
@@ -75,5 +65,6 @@ async function updateLeaderboard() {
   }
 }
 
-// Login Discord bot
-client.login(DISCORD_TOKEN);
+client.login(DISCORD_TOKEN).catch(err => {
+  console.error("🚨 Failed to login Discord bot:", err);
+});
