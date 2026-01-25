@@ -19,11 +19,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Discord bot setup (without disallowed intents)
+// Discord bot setup with only safe intents
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages
+    GatewayIntentBits.Guilds // Only this is needed for sending messages
   ]
 });
 
