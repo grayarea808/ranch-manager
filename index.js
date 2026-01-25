@@ -13,6 +13,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false } // Railway requires this
 });
 
+pool.connect()
+  .then(() => console.log('✅ Postgres connected successfully'))
+  .catch(err => console.error('🚨 Postgres connection failed:', err));
+
 // ---------------------
 // Discord Setup
 // ---------------------
@@ -28,7 +32,7 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 // Bot Ready
 // ---------------------
 client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
+  console.log(`✅ Logged in as ${client.user.tag}!`);
   updateLeaderboard();
   setInterval(updateLeaderboard, 5 * 60 * 1000); // update every 5 minutes
 });
@@ -45,6 +49,10 @@ async function updateLeaderboard() {
       LIMIT 10
     `);
 
+    if (result.rows.length === 0) {
+      console.log('ℹ️ No data in ranch_stats yet');
+    }
+
     let leaderboardMessage = '🏆 Baba Yaga Ranch — Leaderboard\n\n';
     result.rows.forEach((row, i) => {
       leaderboardMessage += `${i + 1}. ${row.username}\n`;
@@ -55,25 +63,30 @@ async function updateLeaderboard() {
     });
 
     const channel = await client.channels.fetch(CHANNEL_ID);
-    if (!channel) return console.error('Channel not found!');
-
-    const messages = await channel.messages.fetch({ limit: 10 });
-    const botMessage = messages.find(m => m.author.id === client.user.id);
-    if (botMessage) {
-      await botMessage.edit(leaderboardMessage);
-    } else {
-      await channel.send(leaderboardMessage);
+    if (!channel) {
+      console.error('🚨 Channel not found!');
+      return;
     }
 
-    console.log('Leaderboard updated successfully!');
+    // Try to find the last bot message
+    const messages = await channel.messages.fetch({ limit: 10 });
+    const botMessage = messages.find(m => m.author.id === client.user.id);
+
+    if (botMessage) {
+      await botMessage.edit(leaderboardMessage);
+      console.log('🔄 Leaderboard updated (edited existing message)');
+    } else {
+      await channel.send(leaderboardMessage);
+      console.log('🔄 Leaderboard updated (sent new message)');
+    }
   } catch (err) {
-    console.error('Error updating leaderboard:', err);
+    console.error('🚨 Error updating leaderboard:', err);
   }
 }
 
 // ---------------------
 // Login Discord Bot
 // ---------------------
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('🚨 Failed to login Discord bot:', err);
-});
+client.login(process.env.DISCORD_TOKEN)
+  .then(() => console.log('✅ Discord bot login successful'))
+  .catch(err => console.error('🚨 Failed to login Discord bot:', err));
