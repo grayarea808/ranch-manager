@@ -1,139 +1,124 @@
 // ---------------------
-// PostgreSQL Setup
+// Imports
 // ---------------------
+import express from 'express';
 import pkg from 'pg';
+import { Client, GatewayIntentBits } from 'discord.js';
+
 const { Pool } = pkg;
 
+// ---------------------
+// PostgreSQL (Railway)
+// ---------------------
 const pool = new Pool({
-  user: process.env.PGUSER,
-  host: process.env.PGHOST,
-  database: process.env.PGDATABASE,
-  password: process.env.PGPASSWORD,
-  port: Number(process.env.PGPORT),
-  ssl: { rejectUnauthorized: false } // Railway requires this
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// ---------------------
-// Discord Setup
-// ---------------------
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
+pool.connect()
+  .then(() => console.log('Postgres connected'))
+  .catch(err => console.error('Postgres connection failed:', err));
 
+// ---------------------
+// Discord Bot
+// ---------------------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+  intents: [GatewayIntentBits.Guilds]
 });
 
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const CLIENT_ID = process.env.CLIENT_ID; // your bot's client ID
-const GUILD_ID = process.env.GUILD_ID; // your test server ID
 
 // ---------------------
-// Bot Ready
+// Express Webhook Server
 // ---------------------
-client.once('clientReady', async () => {
-  console.log(`Logged in as ${client.user.tag}!`);
-  
-  // Deploy slash command
-  const commands = [
-    new SlashCommandBuilder()
-      .setName('addstats')
-      .setDescription('Add milk, eggs, and cattle for a user')
-      .addStringOption(option => option.setName('username').setDescription('User name').setRequired(true))
-      .addIntegerOption(option => option.setName('milk').setDescription('Milk amount').setRequired(false))
-      .addIntegerOption(option => option.setName('eggs').setDescription('Eggs amount').setRequired(false))
-      .addIntegerOption(option => option.setName('cattle').setDescription('Cattle amount').setRequired(false))
-      .toJSON()
-  ];
+const app = express();
+app.use(express.json());
 
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log('✅ Slash command deployed');
+const PORT = process.env.PORT || 3000;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-  // Initial leaderboard update + interval
-  updateLeaderboard();
-  setInterval(updateLeaderboard, 5 * 60 * 1000);
-});
+// Webhook endpoint
+app.post('/webhook/ranch', async (req, res) => {
+  const secret = req.headers['x-webhook-secret'];
+  if (secret !== WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
 
-// ---------------------
-// Upsert Function
-// ---------------------
-async function upsertRanchStats(username, milk = 0, eggs = 0, cattle = 0) {
+  const { username, milk = 0, eggs = 0, cattle = 0 } = req.body;
+
+  if (!username) {
+    return res.status(400).json({ error: 'Missing username' });
+  }
+
   try {
     await pool.query(`
       INSERT INTO ranch_stats (username, milk, eggs, cattle)
       VALUES ($1, $2, $3, $4)
-      ON CONFLICT (username) 
-      DO UPDATE SET 
+      ON CONFLICT (username)
+      DO UPDATE SET
         milk = ranch_stats.milk + EXCLUDED.milk,
         eggs = ranch_stats.eggs + EXCLUDED.eggs,
-        cattle = ranch_stats.cattle + EXCLUDED.cattle;
+        cattle = ranch_stats.cattle + EXCLUDED.cattle
     `, [username, milk, eggs, cattle]);
 
-    console.log(`✅ Stats updated for ${username}`);
+    res.json({ success: true });
   } catch (err) {
-    console.error('🚨 Error updating stats:', err);
+    console.error('Webhook DB error:', err);
+    res.status(500).json({ error: 'Database error' });
   }
-}
+});
+
+app.listen(PORT, () => {
+  console.log(`Webhook server listening on port ${PORT}`);
+});
 
 // ---------------------
-// Update Leaderboard
+// Leaderboard
 // ---------------------
 async function updateLeaderboard() {
   try {
     const result = await pool.query(`
-      SELECT username, milk, eggs, cattle, milk*1.1 + eggs*1.1 + cattle AS total
+      SELECT username, milk, eggs, cattle,
+             milk*1.1 + eggs*1.1 + cattle AS total
       FROM ranch_stats
       ORDER BY total DESC
       LIMIT 10
     `);
 
-    let leaderboardMessage = '🏆 Beaver Farms — Leaderboard\n\n';
-    result.rows.forEach((row, i) => {
-      leaderboardMessage += `${i + 1}. ${row.username}\n`;
-      leaderboardMessage += `🥛 Milk: ${row.milk}\n`;
-      leaderboardMessage += `🥚 Eggs: ${row.eggs}\n`;
-      leaderboardMessage += `🐄 Cattle: ${row.cattle}\n`;
-      leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
-    });
+    let msg = '🏆 **Beaver Farms — Leaderboard**\n\n';
 
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    if (!channel) return console.error('Channel not found!');
-
-    const messages = await channel.messages.fetch({ limit: 10 });
-    const botMessage = messages.find(m => m.author.id === client.user.id);
-    if (botMessage) {
-      await botMessage.edit(leaderboardMessage);
+    if (result.rows.length === 0) {
+      msg += '_No ranch data yet._';
     } else {
-      await channel.send(leaderboardMessage);
+      result.rows.forEach((r, i) => {
+        msg += `**${i + 1}. ${r.username}**\n`;
+        msg += `🥛 Milk: ${r.milk}\n`;
+        msg += `🥚 Eggs: ${r.eggs}\n`;
+        msg += `🐄 Cattle: ${r.cattle}\n`;
+        msg += `💰 Total: $${Number(r.total).toFixed(2)}\n\n`;
+      });
     }
 
-    console.log('Leaderboard updated successfully!');
+    const channel = await client.channels.fetch(CHANNEL_ID);
+    const messages = await channel.messages.fetch({ limit: 5 });
+    const botMsg = messages.find(m => m.author.id === client.user.id);
+
+    if (botMsg) await botMsg.edit(msg);
+    else await channel.send(msg);
+
+    console.log('Leaderboard updated');
   } catch (err) {
-    console.error('Error updating leaderboard:', err);
+    console.error('Leaderboard error:', err);
   }
 }
 
 // ---------------------
-// Handle Slash Commands
+// Discord Ready
 // ---------------------
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand()) return;
-
-  if (interaction.commandName === 'addstats') {
-    const username = interaction.options.getString('username');
-    const milk = interaction.options.getInteger('milk') || 0;
-    const eggs = interaction.options.getInteger('eggs') || 0;
-    const cattle = interaction.options.getInteger('cattle') || 0;
-
-    await upsertRanchStats(username, milk, eggs, cattle);
-    await updateLeaderboard();
-
-    await interaction.reply(`✅ Stats updated for ${username}: Milk ${milk}, Eggs ${eggs}, Cattle ${cattle}`);
-  }
+client.once('clientReady', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  updateLeaderboard();
+  setInterval(updateLeaderboard, 5 * 60 * 1000);
 });
 
-// ---------------------
-// Login Discord Bot
-// ---------------------
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('🚨 Failed to login Discord bot:', err);
-});
+client.login(process.env.DISCORD_TOKEN);
