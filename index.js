@@ -1,58 +1,85 @@
 // ---------------------
-// Imports
-// ---------------------
-import express from 'express';
-import pkg from 'pg';
-import { Client, GatewayIntentBits } from 'discord.js';
-const { Pool } = pkg;
-
-// ---------------------
 // PostgreSQL Setup
 // ---------------------
+import pkg from 'pg';
+const { Pool } = pkg;
+
 const pool = new Pool({
   user: process.env.PGUSER,
   host: process.env.PGHOST,
   database: process.env.PGDATABASE,
   password: process.env.PGPASSWORD,
   port: Number(process.env.PGPORT),
-  ssl: { rejectUnauthorized: false } // Required for Railway
+  ssl: { rejectUnauthorized: false } // Railway requires this
 });
 
 // ---------------------
 // Discord Setup
 // ---------------------
+import express from 'express';
+import bodyParser from 'body-parser';
+import { Client, GatewayIntentBits } from 'discord.js';
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
+
+const app = express();
+app.use(bodyParser.json());
+
+const PORT = process.env.PORT || 8080;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // ---------------------
-// Express Setup
+// Weekly Reset Setup
 // ---------------------
-const app = express();
-app.use(express.json());
-const PORT = process.env.PORT || 8080;
+function scheduleWeeklyReset() {
+  const now = new Date();
+  const dayOfWeek = now.getUTCDay(); // 0 = Sunday
+  const daysUntilSunday = (7 - dayOfWeek) % 7;
+  const nextSunday = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + daysUntilSunday,
+    0, 0, 0
+  ));
+  const timeout = nextSunday - now;
+
+  setTimeout(async () => {
+    try {
+      await pool.query('TRUNCATE ranch_log;');
+      console.log('Weekly ranch stats reset!');
+    } catch (err) {
+      console.error('Error resetting weekly stats:', err);
+    }
+    scheduleWeeklyReset(); // schedule next week
+  }, timeout);
+}
 
 // ---------------------
-// Update Leaderboard
+// Leaderboard Update
 // ---------------------
 async function updateLeaderboard() {
   try {
     const result = await pool.query(`
-      SELECT username, milk, eggs, cattle, 
-             (milk * 1.25 + eggs * 1.25 + cattle) AS total
-      FROM ranch_stats
+      SELECT username,
+             SUM(milk) AS milk,
+             SUM(eggs) AS eggs,
+             SUM(cattle) AS cattle,
+             SUM(milk*1.25 + eggs*1.25 + cattle) AS total
+      FROM ranch_log
+      GROUP BY username
       ORDER BY total DESC
-      LIMIT 10
+      LIMIT 10;
     `);
 
-    let leaderboardMessage = '🏆 Beaver Farms — Leaderboard\n\n';
+    let leaderboardMessage = '🏆 Beaver Farms — Weekly Leaderboard\n\n';
     result.rows.forEach((row, i) => {
       leaderboardMessage += `${i + 1}. ${row.username}\n`;
       leaderboardMessage += `🥛 Milk: ${row.milk}\n`;
       leaderboardMessage += `🥚 Eggs: ${row.eggs}\n`;
       leaderboardMessage += `🐄 Cattle: ${row.cattle}\n`;
-      leaderboardMessage += `💰 Total: $${Number(row.total).toFixed(2)}\n\n`;
+      leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
     });
 
     const channel = await client.channels.fetch(CHANNEL_ID);
@@ -73,56 +100,31 @@ async function updateLeaderboard() {
 }
 
 // ---------------------
-// Discord Bot Ready
-// ---------------------
-client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  updateLeaderboard();
-  setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
-});
-
-// ---------------------
 // Webhook Endpoint
 // ---------------------
 app.post('/webhook/ranch', async (req, res) => {
+  const data = req.body;
+  console.log('📩 Webhook received!', JSON.stringify(data, null, 2));
+
   try {
-    console.log('📩 Webhook received!', req.body);
+    // Extract username, milk, eggs, cattle from payload
+    const username = data.username;
+    const milkAdded = data.milk || 0;
+    const eggsAdded = data.eggs || 0;
+    const cattleAdded = data.cattle || 0;
 
-    const data = req.body;
-    // Extract username from format "<@ID> ID NAME"
-    const usernameParts = data.username.split(' ');
-    const username = usernameParts[usernameParts.length - 1];
+    await pool.query(
+      `INSERT INTO ranch_log (username, milk, eggs, cattle)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (username) DO UPDATE
+       SET milk = ranch_log.milk + EXCLUDED.milk,
+           eggs = ranch_log.eggs + EXCLUDED.eggs,
+           cattle = ranch_log.cattle + EXCLUDED.cattle;`,
+      [username, milkAdded, eggsAdded, cattleAdded]
+    );
 
-    // Extract numbers from description
-    const description = data.embeds?.[0]?.description || '';
-    let milkAdded = 0, eggsAdded = 0, cattleAdded = 0;
-
-    const milkMatch = description.match(/Milk.*?(\d+)/i);
-    const eggsMatch = description.match(/Eggs.*?(\d+)/i);
-    const cattleMatch = description.match(/Cattle.*?(\d+)/i);
-
-    if (milkMatch) milkAdded = parseInt(milkMatch[1]);
-    if (eggsMatch) eggsAdded = parseInt(eggsMatch[1]);
-    if (cattleMatch) cattleAdded = parseInt(cattleMatch[1]);
-
-    // Insert user if not exists
-    await pool.query(`
-      INSERT INTO ranch_stats(username, milk, eggs, cattle)
-      VALUES($1, 0, 0, 0)
-      ON CONFLICT (username) DO NOTHING
-    `, [username]);
-
-    // Update stats
-    await pool.query(`
-      UPDATE ranch_stats
-      SET milk = milk + $2,
-          eggs = eggs + $3,
-          cattle = cattle + $4
-      WHERE username = $1
-    `, [username, milkAdded, eggsAdded, cattleAdded]);
-
+    res.status(200).send('OK');
     await updateLeaderboard();
-    res.status(200).send('Webhook processed!');
   } catch (err) {
     console.error('Error processing webhook:', err);
     res.status(500).send('Error');
@@ -130,14 +132,18 @@ app.post('/webhook/ranch', async (req, res) => {
 });
 
 // ---------------------
-// Start Express Server
+// Start Servers & Bot
 // ---------------------
 app.listen(PORT, () => {
   console.log(`Webhook server listening on port ${PORT}`);
 });
 
-// ---------------------
-// Login Discord Bot
-// ---------------------
-client.login(process.env.DISCORD_TOKEN)
-  .catch(err => console.error('Failed to login Discord bot:', err));
+client.once('clientReady', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  updateLeaderboard();
+  scheduleWeeklyReset();
+});
+
+client.login(process.env.DISCORD_TOKEN).catch(err => {
+  console.error('Failed to login Discord bot:', err);
+});
