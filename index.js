@@ -1,10 +1,9 @@
 // ---------------------
 // Imports
 // ---------------------
-import pkg from 'pg';
 import express from 'express';
+import pkg from 'pg';
 import { Client, GatewayIntentBits } from 'discord.js';
-
 const { Pool } = pkg;
 
 // ---------------------
@@ -20,44 +19,51 @@ const pool = new Pool({
 });
 
 // ---------------------
-// Express Webhook Setup
+// Express / Webhook Setup
 // ---------------------
 const app = express();
 app.use(express.json());
-
 const PORT = process.env.PORT || 8080;
 
 app.post('/webhook/ranch', async (req, res) => {
   try {
-    console.log('📩 Webhook received!', req.body);
+    const data = req.body;
 
-    const { username, milkAdded, eggsAdded, cattleAdded } = parseWebhook(req.body);
+    // Example payload parsing
+    // Adjust these paths if your game payload differs
+    const description = data.embeds?.[0]?.description;
+    if (!description) return res.sendStatus(400);
 
-    // Upsert user into ranch_stats
-    await pool.query(
-      `
-      INSERT INTO ranch_stats (username, milk, eggs, cattle)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (username) DO UPDATE
-      SET milk = ranch_stats.milk + $2,
-          eggs = ranch_stats.eggs + $3,
-          cattle = ranch_stats.cattle + $4
-      `,
-      [username, milkAdded, eggsAdded, cattleAdded]
-    );
+    const match = description.match(/Added (\w+) to ranch id \d+ : (\d+)/i);
+    if (!match) return res.sendStatus(400);
 
-    await updateLeaderboard();
+    const [_, resource, amountStr] = match;
+    const amount = parseInt(amountStr, 10);
 
+    // Extract username from payload
+    const usernameMatch = description.match(/<@(\d+)>/);
+    const username = usernameMatch ? `<@${usernameMatch[1]}>` : data.username || 'Unknown';
+
+    // Upsert into ranch_stats
+    const column = resource.toLowerCase(); // milk, eggs, or cattle
+    await pool.query(`
+      INSERT INTO ranch_stats(username, ${column})
+      VALUES($1, $2)
+      ON CONFLICT(username) DO UPDATE
+      SET ${column} = ranch_stats.${column} + $2
+    `, [username, amount]);
+
+    console.log(`Webhook processed: ${username} +${amount} ${column}`);
+    updateLeaderboard(); // Update leaderboard immediately
     res.sendStatus(200);
+
   } catch (err) {
     console.error('Error processing webhook:', err);
     res.sendStatus(500);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Webhook server listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Webhook server listening on port ${PORT}`));
 
 // ---------------------
 // Discord Setup
@@ -68,30 +74,14 @@ const client = new Client({
 
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
+// ---------------------
+// Bot Ready
+// ---------------------
 client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
+  console.log(`Logged in as ${client.user.tag}`);
   updateLeaderboard();
-  setInterval(updateLeaderboard, 5 * 60 * 1000); // update every 5 minutes
+  setInterval(updateLeaderboard, 5 * 60 * 1000); // Update every 5 minutes
 });
-
-// ---------------------
-// Parse Webhook
-// ---------------------
-function parseWebhook(payload) {
-  // Adjust this based on your game’s exact payload
-  // Example based on your previous webhook:
-  const embed = payload.embeds?.[0]?.description || '';
-  const parts = embed.split('\n')[0].split(' ');
-  const username = parts.slice(1).join(' '); // "<@id> USERNAME" → "USERNAME"
-
-  // Extract numbers from description (milk, eggs, cattle)
-  let milkAdded = 0, eggsAdded = 0, cattleAdded = 0;
-  if (/Milk/i.test(embed)) milkAdded = Number(embed.match(/: (\d+)/)?.[1] || 0);
-  if (/Eggs/i.test(embed)) eggsAdded = Number(embed.match(/: (\d+)/)?.[1] || 0);
-  if (/Cattle/i.test(embed)) cattleAdded = Number(embed.match(/: (\d+)/)?.[1] || 0);
-
-  return { username, milkAdded, eggsAdded, cattleAdded };
-}
 
 // ---------------------
 // Update Leaderboard
@@ -99,11 +89,8 @@ function parseWebhook(payload) {
 async function updateLeaderboard() {
   try {
     const result = await pool.query(`
-      SELECT username,
-             COALESCE(milk,0) AS milk,
-             COALESCE(eggs,0) AS eggs,
-             COALESCE(cattle,0) AS cattle,
-             COALESCE(milk,0)*1.1 + COALESCE(eggs,0)*1.1 + COALESCE(cattle,0) AS total
+      SELECT username, milk, eggs, cattle, 
+             (COALESCE(milk,0)*1.1 + COALESCE(eggs,0)*1.1 + COALESCE(cattle,0)) AS total
       FROM ranch_stats
       ORDER BY total DESC
       LIMIT 10
@@ -112,9 +99,9 @@ async function updateLeaderboard() {
     let leaderboardMessage = '🏆 Beaver Farms — Leaderboard\n\n';
     result.rows.forEach((row, i) => {
       leaderboardMessage += `${i + 1}. ${row.username}\n`;
-      leaderboardMessage += `🥛 Milk: ${row.milk}\n`;
-      leaderboardMessage += `🥚 Eggs: ${row.eggs}\n`;
-      leaderboardMessage += `🐄 Cattle: ${row.cattle}\n`;
+      leaderboardMessage += `🥛 Milk: ${row.milk || 0}\n`;
+      leaderboardMessage += `🥚 Eggs: ${row.eggs || 0}\n`;
+      leaderboardMessage += `🐄 Cattle: ${row.cattle || 0}\n`;
       leaderboardMessage += `💰 Total: $${row.total.toFixed(2)}\n\n`;
     });
 
@@ -123,6 +110,7 @@ async function updateLeaderboard() {
 
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
+
     if (botMessage) {
       await botMessage.edit(leaderboardMessage);
     } else {
@@ -138,6 +126,3 @@ async function updateLeaderboard() {
 // ---------------------
 // Login Discord Bot
 // ---------------------
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('🚨 Failed to login Discord bot:', err);
-});
