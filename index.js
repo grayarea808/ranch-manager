@@ -1,141 +1,125 @@
-// index.js
-import express from "express";
-import { Pool } from "pg";
-import dotenv from "dotenv";
-import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
-
+import express from 'express';
+import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
+import pg from 'pg';
+import dotenv from 'dotenv';
 dotenv.config();
 
-// -----------------------------
-// PostgreSQL Setup
-// -----------------------------
-const pool = new Pool({
+const app = express();
+app.use(express.json());
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const pool = new pg.Pool({
   user: process.env.PGUSER,
   host: process.env.PGHOST,
   database: process.env.PGDATABASE,
   password: process.env.PGPASSWORD,
-  port: process.env.PGPORT,
+  port: process.env.PGPORT
 });
 
-await pool.connect();
-console.log("Postgres connected");
+const CHANNEL_ID = process.env.CHANNEL_ID;
+const LEADERBOARD_RESET_TABLE = 'leaderboard_reset'; // table to track weekly reset
+const RANCH_STATS_TABLE = 'ranch_stats';
 
-// -----------------------------
-// Discord Setup
-// -----------------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-await client.login(process.env.DISCORD_TOKEN);
-console.log(`Logged in as ${client.user.tag}`);
+// Ensure tables exist
+await pool.query(`
+CREATE TABLE IF NOT EXISTS ${RANCH_STATS_TABLE} (
+  username TEXT PRIMARY KEY,
+  milk INT DEFAULT 0,
+  eggs INT DEFAULT 0,
+  cattle INT DEFAULT 0
+);
+`);
+await pool.query(`
+CREATE TABLE IF NOT EXISTS ${LEADERBOARD_RESET_TABLE} (
+  last_reset TIMESTAMP
+);
+`);
+await pool.query(`
+INSERT INTO ${LEADERBOARD_RESET_TABLE}(last_reset)
+SELECT NOW() WHERE NOT EXISTS (SELECT 1 FROM ${LEADERBOARD_RESET_TABLE});
+`);
 
-// -----------------------------
-// Express Webhook Server
-// -----------------------------
-const app = express();
-app.use(express.json());
-const PORT = process.env.PORT || 8080;
-
-app.post("/webhook/ranch", async (req, res) => {
-  try {
-    const { username, milk = 0, eggs = 0, cattle = 0 } = parseWebhook(req.body);
-
-    // Insert or update user in ranch_stats
-    await pool.query(
-      `
-      INSERT INTO ranch_stats (username, milk, eggs, cattle)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (username)
-      DO UPDATE SET
-        milk = ranch_stats.milk + EXCLUDED.milk,
-        eggs = ranch_stats.eggs + EXCLUDED.eggs,
-        cattle = ranch_stats.cattle + EXCLUDED.cattle
-    `,
-      [username, milk, eggs, cattle]
-    );
-
-    console.log("Webhook received!", req.body);
-    await updateLeaderboard();
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.sendStatus(500);
-  }
+client.once('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await updateLeaderboard();
+  setInterval(updateLeaderboard, 60 * 1000); // refresh every minute
 });
 
-app.listen(PORT, () => console.log(`Webhook server listening on port ${PORT}`));
+app.post('/webhook/ranch', async (req, res) => {
+  const data = req.body;
+  console.log('📩 Webhook received!', data);
 
-// -----------------------------
-// Helper Functions
-// -----------------------------
+  if (!data.username) return res.sendStatus(400);
 
-function parseWebhook(payload) {
-  // Adjust this based on your game payload
-  const userString = payload.username || payload.user || "UNKNOWN";
-  const numbers = userString.match(/\d+/g) || [];
-  const username = `<@${numbers[0] || "0"}> ${userString.replace(/\d+/g, "").trim()}`;
+  // Extract counts
+  const milk = data.milk ?? 0;
+  const eggs = data.eggs ?? 0;
+  const cattle = data.cattle ?? 0;
 
-  let milk = 0, eggs = 0, cattle = 0;
+  // Upsert user
+  await pool.query(`
+    INSERT INTO ${RANCH_STATS_TABLE}(username, milk, eggs, cattle)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT(username) DO UPDATE
+    SET milk = ${RANCH_STATS_TABLE}.milk + EXCLUDED.milk,
+        eggs = ${RANCH_STATS_TABLE}.eggs + EXCLUDED.eggs,
+        cattle = ${RANCH_STATS_TABLE}.cattle + EXCLUDED.cattle
+  `, [data.username, milk, eggs, cattle]);
 
-  if (payload.embeds?.[0]?.description) {
-    const desc = payload.embeds[0].description;
-    const milkMatch = desc.match(/Milk.*?:\s*(\d+)/i);
-    const eggsMatch = desc.match(/Eggs.*?:\s*(\d+)/i);
-    const cattleMatch = desc.match(/Cattle.*?:\s*(\d+)/i);
+  res.sendStatus(200);
+});
 
-    milk = milkMatch ? parseInt(milkMatch[1], 10) : 0;
-    eggs = eggsMatch ? parseInt(eggsMatch[1], 10) : 0;
-    cattle = cattleMatch ? parseInt(cattleMatch[1], 10) : 0;
+async function resetLeaderboardIfNeeded() {
+  const { rows } = await pool.query(`SELECT last_reset FROM ${LEADERBOARD_RESET_TABLE} LIMIT 1`);
+  const lastReset = rows[0]?.last_reset ?? new Date(0);
+  const now = new Date();
+  const oneWeek = 7 * 24 * 60 * 60 * 1000;
+
+  if (now - new Date(lastReset) > oneWeek) {
+    await pool.query(`UPDATE ${RANCH_STATS_TABLE} SET milk=0, eggs=0, cattle=0`);
+    await pool.query(`UPDATE ${LEADERBOARD_RESET_TABLE} SET last_reset=NOW()`);
+    console.log('🕒 Leaderboard reset for new week!');
   }
-
-  return { username, milk, eggs, cattle };
 }
 
 async function updateLeaderboard() {
   try {
-    // Weekly reset check
     await resetLeaderboardIfNeeded();
 
-    const { rows } = await pool.query(`
-      SELECT username, milk, eggs, cattle,
-      (milk*1.25 + eggs*1.25 + cattle*160) AS total
-      FROM ranch_stats
-      ORDER BY total DESC
-      LIMIT 10
-    `);
+    const result = await pool.query(`SELECT * FROM ${RANCH_STATS_TABLE}`);
+    const channel = await client.channels.fetch(CHANNEL_ID);
+    if (!channel) return console.log('Channel not found');
 
-    const channel = await client.channels.fetch(process.env.CHANNEL_ID);
-    const embed = new EmbedBuilder()
-      .setTitle("🏆 Beaver Farms — Leaderboard")
-      .setColor(0xffd700)
-      .setDescription(
-        rows.map(r => 
-          `${r.username}\n🥛 Milk: ${r.milk}\n🥚 Eggs: ${r.eggs}\n🐄 Cattle: ${r.cattle}\n💰 Total: $${r.total.toFixed(2)}`
-        ).join("\n\n")
-      );
-
-    // Delete previous leaderboard messages
+    // Clear old leaderboard messages
     const messages = await channel.messages.fetch({ limit: 50 });
-    const old = messages.filter(m => m.embeds?.[0]?.title === "🏆 Beaver Farms — Leaderboard");
-    for (const m of old.values()) await m.delete();
+    messages.forEach(msg => {
+      if (msg.content.includes('🏆 Beaver Farms — Leaderboard')) msg.delete().catch(() => {});
+    });
+
+    let leaderboardText = '';
+    for (const row of result.rows) {
+      const milkValue = (row.milk ?? 0) * 1.25;
+      const eggsValue = (row.eggs ?? 0) * 1.25;
+      const cattleValue = (row.cattle ?? 0) * 160; // 200 - 20% ranch cut
+      const total = milkValue + eggsValue + cattleValue;
+
+      leaderboardText += `\n${row.username}\n🥛 Milk: ${row.milk ?? 0}\n🥚 Eggs: ${row.eggs ?? 0}\n🐄 Cattle: ${row.cattle ?? 0}\n💰 Total: $${total.toFixed(2)}\n`;
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle('🏆 Beaver Farms — Leaderboard')
+      .setDescription(leaderboardText)
+      .setColor(0x00ff00);
 
     await channel.send({ embeds: [embed] });
-    console.log("Leaderboard updated!");
+    console.log('Leaderboard updated!');
   } catch (err) {
-    console.error("Error updating leaderboard:", err);
+    console.error('Error updating leaderboard:', err);
   }
 }
 
-// Weekly reset
-async function resetLeaderboardIfNeeded() {
-  const { rows } = await pool.query(`SELECT last_reset FROM leaderboard_reset LIMIT 1`);
-  const now = new Date();
-  if (!rows.length || new Date(rows[0].last_reset) <= new Date(now.getTime() - 7*24*60*60*1000)) {
-    await pool.query(`UPDATE ranch_stats SET milk=0, eggs=0, cattle=0`);
-    await pool.query(`
-      INSERT INTO leaderboard_reset(last_reset)
-      VALUES($1)
-      ON CONFLICT (id)
-      DO UPDATE SET last_reset = EXCLUDED.last_reset
-    `, [now.toISOString()]);
-    console.log("Leaderboard reset for new week");
-  }
-}
+client.login(process.env.DISCORD_TOKEN);
+
+app.listen(8080, () => {
+  console.log('Webhook server listening on port 8080');
+});
