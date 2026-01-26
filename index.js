@@ -3,130 +3,112 @@ import pkg from 'pg';
 const { Pool } = pkg;
 
 // --- CONFIG ---
-const {
-  CHANNEL_ID,
-  GUILD_ID,
-  DISCORD_TOKEN,
-  PGHOST,
-  PGUSER,
-  PGPASSWORD,
-  PGDATABASE,
-  PGPORT
-} = process.env;
+const CHANNEL_ID = '1465062014626824347';
+const GUILD_ID = '1463920085155446930';
+const DISCORD_TOKEN = 'MTQ2NTAyMTUzMzkyNjk4MTg1OQ.Gnl20w.W4CHBZRgFirMqNAFbJUdbdwyQGNh_p4qChpg0s';
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-
+// Postgres (Railway) config
 const pool = new Pool({
-  host: PGHOST,
-  user: PGUSER,
-  password: PGPASSWORD,
-  database: PGDATABASE,
-  port: PGPORT,
-  ssl: false
+  host: 'postgres.railway.internal',
+  user: 'postgres',
+  password: 'nZgFXhBgBmJxTXfqLDFrhhMOJyNQpOLA',
+  database: 'railway',
+  port: 5432
 });
 
-// --- CONSTANTS ---
-const MILK_PRICE = 1.25;
-const EGG_PRICE = 1.25;
-const CATTLE_PRICE = 200;
-const RANCH_CUT = 0.2; // 20% cut
-const RESET_INTERVAL_DAYS = 7;
+// Prices
+const PRICES = {
+  milk: 1.25,
+  eggs: 1.25,
+  cattle: 160 // after 20% cut
+};
 
-// --- STATE ---
-let leaderboardMessageId = null;
+// Leaderboard message ID (store after first post)
+let LEADERBOARD_MESSAGE_ID = null;
 
-// --- DATABASE SETUP ---
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS leaderboard (
-      id SERIAL PRIMARY KEY,
-      username TEXT NOT NULL,
-      milk INT DEFAULT 0,
-      eggs INT DEFAULT 0,
-      cattle INT DEFAULT 0
-    )
-  `);
+// --- DISCORD CLIENT ---
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS leaderboard_reset (
-      id SERIAL PRIMARY KEY,
-      last_reset TIMESTAMP NOT NULL
-    )
-  `);
+client.on('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
 
-  // ensure there’s a row in leaderboard_reset
-  const res = await pool.query('SELECT * FROM leaderboard_reset LIMIT 1');
-  if (res.rows.length === 0) {
-    await pool.query(`INSERT INTO leaderboard_reset(last_reset) VALUES($1)`, [new Date()]);
-  }
-}
+  const channel = await client.channels.fetch(CHANNEL_ID);
 
-// --- LEADERBOARD HELPERS ---
-async function resetLeaderboardIfNeeded() {
-  const res = await pool.query('SELECT last_reset FROM leaderboard_reset LIMIT 1');
-  const lastReset = new Date(res.rows[0].last_reset);
-  const now = new Date();
-  const diffDays = (now - lastReset) / (1000 * 60 * 60 * 24);
+  // Fetch existing leaderboard message
+  const messages = await channel.messages.fetch({ limit: 50 });
+  const lbMessage = messages.find(m => m.author.id === client.user.id && m.content.startsWith('🏆 Beaver Farms'));
 
-  if (diffDays >= RESET_INTERVAL_DAYS) {
-    await pool.query('UPDATE leaderboard SET milk = 0, eggs = 0, cattle = 0');
-    await pool.query('UPDATE leaderboard_reset SET last_reset = $1', [now]);
-    console.log('Leaderboard reset for new week!');
-  }
-}
+  if (lbMessage) LEADERBOARD_MESSAGE_ID = lbMessage.id;
 
-async function fetchLeaderboard() {
-  const result = await pool.query('SELECT * FROM leaderboard ORDER BY (milk*$1 + eggs*$2 + cattle*($3*(1-$4))) DESC', [MILK_PRICE, EGG_PRICE, CATTLE_PRICE, RANCH_CUT]);
-  return result.rows;
+  // Update leaderboard immediately
+  await updateLeaderboard(channel);
+
+  // Then update every 30 seconds (or adjust)
+  setInterval(() => updateLeaderboard(channel), 30000);
+});
+
+client.login(DISCORD_TOKEN);
+
+// --- FUNCTIONS ---
+async function getLeaderboardData() {
+  const res = await pool.query('SELECT username, milk, eggs, cattle FROM leaderboard ORDER BY username');
+  return res.rows;
 }
 
 function formatLeaderboard(rows) {
-  return ['🏆 Beaver Farms — Leaderboard', ...rows.map(row => {
-    const milkTotal = row.milk * MILK_PRICE;
-    const eggsTotal = row.eggs * EGG_PRICE;
-    const cattleTotal = row.cattle * (CATTLE_PRICE * (1 - RANCH_CUT));
-    const total = milkTotal + eggsTotal + cattleTotal;
-
-    return `@${row.username} ${row.username.toUpperCase()}
-🥛 Milk: ${row.milk}
-🥚 Eggs: ${row.eggs}
-🐄 Cattle: ${row.cattle}
-💰 Total: $${total.toFixed(2)}`;
-  })].join('\n\n');
+  let text = '🏆 Beaver Farms — Leaderboard\n\n';
+  for (const row of rows) {
+    const total = (row.milk * PRICES.milk) + (row.eggs * PRICES.eggs) + (row.cattle * PRICES.cattle);
+    text += `@${row.username} ${row.username.toUpperCase()}\n`;
+    text += `🥛 Milk: ${row.milk}\n`;
+    text += `🥚 Eggs: ${row.eggs}\n`;
+    text += `🐄 Cattle: ${row.cattle}\n`;
+    text += `💰 Total: $${total.toFixed(2)}\n\n`;
+  }
+  return text.trim();
 }
 
-async function updateLeaderboard() {
-  try {
-    await resetLeaderboardIfNeeded();
-    const rows = await fetchLeaderboard();
-    if (!rows.length) return;
+async function updateLeaderboard(channel) {
+  const rows = await getLeaderboardData();
+  const content = formatLeaderboard(rows);
 
-    const formatted = formatLeaderboard(rows);
-    const channel = await client.channels.fetch(CHANNEL_ID);
-
-    if (leaderboardMessageId) {
-      const msg = await channel.messages.fetch(leaderboardMessageId).catch(() => null);
-      if (msg) {
-        await msg.edit({ content: formatted });
-        return;
-      }
+  if (LEADERBOARD_MESSAGE_ID) {
+    try {
+      const msg = await channel.messages.fetch(LEADERBOARD_MESSAGE_ID);
+      await msg.edit({ content });
+    } catch {
+      // If the old message was deleted
+      const newMsg = await channel.send({ content });
+      LEADERBOARD_MESSAGE_ID = newMsg.id;
     }
-
-    const sentMsg = await channel.send(formatted);
-    leaderboardMessageId = sentMsg.id;
-
-  } catch (err) {
-    console.error('Error updating leaderboard:', err);
+  } else {
+    const msg = await channel.send({ content });
+    LEADERBOARD_MESSAGE_ID = msg.id;
   }
 }
 
-// --- CLIENT EVENTS ---
-client.once('clientReady', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  await initDB();
-  updateLeaderboard();
-  setInterval(updateLeaderboard, 60 * 1000); // update every 60s
-});
+// --- DATABASE UPSERT ---
+export async function upsertUser(username, milk, eggs, cattle) {
+  const query = `
+    INSERT INTO leaderboard (username, milk, eggs, cattle)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (username)
+    DO UPDATE SET
+      milk = EXCLUDED.milk,
+      eggs = EXCLUDED.eggs,
+      cattle = EXCLUDED.cattle;
+  `;
+  await pool.query(query, [username, milk, eggs, cattle]);
+}
 
-// --- LOGIN ---
-client.login(DISCORD_TOKEN);
+// --- WEEKLY RESET ---
+async function resetLeaderboard() {
+  const today = new Date();
+  if (today.getDay() === 0) { // Sunday reset
+    await pool.query('UPDATE leaderboard SET milk = 0, eggs = 0, cattle = 0');
+    console.log('Leaderboard reset!');
+  }
+}
+
+// Check for weekly reset every hour
+setInterval(resetLeaderboard, 3600000);
