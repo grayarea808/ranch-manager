@@ -2,7 +2,6 @@ import express from 'express';
 import { Client, GatewayIntentBits } from 'discord.js';
 import pg from 'pg';
 import dotenv from 'dotenv';
-import crypto from 'crypto';
 
 dotenv.config();
 
@@ -20,93 +19,80 @@ const pool = new pg.Pool({
 
 const channelId = process.env.CHANNEL_ID;
 
-let lastLeaderboardHash = '';
+// Store the leaderboard message ID
+let leaderboardMessageId = process.env.LEADERBOARD_MESSAGE_ID || null;
 
 async function resetLeaderboardIfNeeded() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS leaderboard_reset (
-        id SERIAL PRIMARY KEY,
-        last_reset TIMESTAMP NOT NULL
-      )
-    `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS leaderboard_reset (
+      id SERIAL PRIMARY KEY,
+      last_reset TIMESTAMP NOT NULL
+    )
+  `);
 
-    const res = await pool.query('SELECT last_reset FROM leaderboard_reset ORDER BY last_reset DESC LIMIT 1');
-    const now = new Date();
+  const res = await pool.query('SELECT last_reset FROM leaderboard_reset ORDER BY last_reset DESC LIMIT 1');
+  const now = new Date();
 
-    if (!res.rows[0] || (now - new Date(res.rows[0].last_reset)) > 7 * 24 * 60 * 60 * 1000) {
-      console.log('Resetting leaderboard for new week...');
-      await pool.query('UPDATE ranch_stats SET milk = 0, eggs = 0, cattle = 0');
-      if (res.rows[0]) {
-        await pool.query('UPDATE leaderboard_reset SET last_reset = $1 WHERE id = $2', [now, res.rows[0].id]);
-      } else {
-        await pool.query('INSERT INTO leaderboard_reset(last_reset) VALUES($1)', [now]);
-      }
-    }
-  } catch (err) {
-    console.error('Error in resetLeaderboardIfNeeded:', err);
-  }
-}
-
-async function updateLeaderboard() {
-  try {
-    await resetLeaderboardIfNeeded();
-
-    const result = await pool.query('SELECT username, milk, eggs, cattle FROM ranch_stats ORDER BY (milk*1.25 + eggs*1.25 + cattle*160) DESC');
-
-    const leaderboardArray = result.rows.map(row => {
-      const total = (row.milk * 1.25) + (row.eggs * 1.25) + (row.cattle * 160);
-      return {
-        username: row.username,
-        stats: {
-          milk: row.milk,
-          eggs: row.eggs,
-          cattle: row.cattle
-        },
-        total
-      };
-    });
-
-    let leaderboardText = '🏆 Beaver Farms — Leaderboard\n\n';
-    leaderboardArray.forEach(entry => {
-      leaderboardText += `${entry.username}\n🥛 Milk: ${entry.stats.milk}\n🥚 Eggs: ${entry.stats.eggs}\n🐄 Cattle: ${entry.stats.cattle}\n💰 Total: $${entry.total.toFixed(2)}\n\n`;
-    });
-
-    // Hash the current leaderboard
-    const hash = crypto.createHash('md5').update(leaderboardText).digest('hex');
-
-    // Only send if it changed
-    if (hash !== lastLeaderboardHash) {
-      const channel = await client.channels.fetch(channelId);
-      await channel.send(leaderboardText);
-      lastLeaderboardHash = hash;
-      console.log('Leaderboard updated!');
+  if (!res.rows[0] || (now - new Date(res.rows[0].last_reset)) > 7 * 24 * 60 * 60 * 1000) {
+    console.log('Resetting leaderboard for new week...');
+    await pool.query('UPDATE ranch_stats SET milk = 0, eggs = 0, cattle = 0');
+    if (res.rows[0]) {
+      await pool.query('UPDATE leaderboard_reset SET last_reset = $1 WHERE id = $2', [now, res.rows[0].id]);
     } else {
-      console.log('Leaderboard unchanged — not posting.');
+      await pool.query('INSERT INTO leaderboard_reset(last_reset) VALUES($1)', [now]);
     }
-  } catch (err) {
-    console.error('Error updating leaderboard:', err);
   }
 }
 
-// Webhook endpoint
+async function updateLeaderboardMessage() {
+  await resetLeaderboardIfNeeded();
+
+  const result = await pool.query('SELECT username, milk, eggs, cattle FROM ranch_stats ORDER BY (milk*1.25 + eggs*1.25 + cattle*160) DESC');
+
+  let leaderboardText = '🏆 Beaver Farms — Leaderboard\n\n';
+  result.rows.forEach(row => {
+    const total = (row.milk * 1.25) + (row.eggs * 1.25) + (row.cattle * 160);
+    leaderboardText += `${row.username}\n🥛 Milk: ${row.milk}\n🥚 Eggs: ${row.eggs}\n🐄 Cattle: ${row.cattle}\n💰 Total: $${total.toFixed(2)}\n\n`;
+  });
+
+  const channel = await client.channels.fetch(channelId);
+
+  if (leaderboardMessageId) {
+    try {
+      const message = await channel.messages.fetch(leaderboardMessageId);
+      await message.edit(leaderboardText);
+      console.log('Leaderboard updated (edited existing message)!');
+      return;
+    } catch (err) {
+      console.log('Previous message not found, sending new one...');
+    }
+  }
+
+  // If no message ID, send a new message and store its ID
+  const message = await channel.send(leaderboardText);
+  leaderboardMessageId = message.id;
+  console.log('Leaderboard posted for the first time!');
+}
+
 app.post('/webhook/ranch', async (req, res) => {
   try {
     const data = req.body;
+    const username = data.username.split(' ')[2] || data.username;
 
-    // Parse webhook payload (example)
-    const username = data.username.split(' ')[2] || data.username; // adjust if needed
     const eggsAdded = data.embeds?.[0]?.description.match(/Added Eggs.*: (\d+)/)?.[1] || 0;
+    const milkAdded = data.embeds?.[0]?.description.match(/Added Milk.*: (\d+)/)?.[1] || 0;
+    const cattleAdded = data.embeds?.[0]?.description.match(/Added Cattle.*: (\d+)/)?.[1] || 0;
 
-    // Update DB
-    await pool.query('UPDATE ranch_stats SET eggs = eggs + $1 WHERE username = $2', [eggsAdded, username]);
+    await pool.query(
+      'UPDATE ranch_stats SET milk = milk + $1, eggs = eggs + $2, cattle = cattle + $3 WHERE username = $4',
+      [milkAdded, eggsAdded, cattleAdded, username]
+    );
 
-    console.log('Webhook received!', data);
-    await updateLeaderboard();
+    await updateLeaderboardMessage();
 
     res.status(200).send('OK');
   } catch (err) {
-    console.error('Error handling webhook:', err);
+    console.error('Webhook error:', err);
     res.status(500).send('Error');
   }
 });
