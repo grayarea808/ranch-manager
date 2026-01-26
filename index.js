@@ -1,32 +1,30 @@
+import express from 'express';
 import { Client, GatewayIntentBits, Events } from 'discord.js';
 import pkg from 'pg';
+import cron from 'node-cron';
+
 const { Pool } = pkg;
 
-// --------------------
-// RAILWAY VARIABLES
-// --------------------
-const CHANNEL_ID = '1465062014626824347'; // Discord channel ID
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN; // Railway token variable
-const PGHOST = 'postgres.railway.internal';
-const PGUSER = 'postgres';
-const PGPASSWORD = 'nZgFXhBgBmJxTXfqLDFrhhMOJyNQpOLA';
-const PGDATABASE = 'railway';
-const PGPORT = 5432;
+/* ======================
+   CONFIG
+====================== */
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const CHANNEL_ID = '1465062014626824347';
+const PORT = process.env.PORT || 3000;
 
-// --------------------
-// POSTGRES SETUP
-// --------------------
+/* ======================
+   DATABASE
+====================== */
 const pool = new Pool({
-  host: PGHOST,
-  user: PGUSER,
-  password: PGPASSWORD,
-  database: PGDATABASE,
-  port: PGPORT,
+  host: 'postgres.railway.internal',
+  user: 'postgres',
+  password: 'YOUR_DB_PASSWORD',
+  database: 'railway',
+  port: 5432,
 });
 
-// Ensure leaderboard table exists
 await pool.query(`
-  CREATE TABLE IF NOT EXISTS leaderboard (
+  CREATE TABLE IF NOT EXISTS ranch (
     username TEXT PRIMARY KEY,
     milk INT DEFAULT 0,
     eggs INT DEFAULT 0,
@@ -35,109 +33,105 @@ await pool.query(`
   );
 `);
 
-// --------------------
-// DISCORD SETUP
-// --------------------
+/* ======================
+   DISCORD
+====================== */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages], // allowed intents only
+  intents: [GatewayIntentBits.Guilds],
 });
 
 let leaderboardMessageId = null;
 
-// --------------------
-// UPDATE LEADERBOARD
-// --------------------
+/* ======================
+   LEADERBOARD
+====================== */
 async function updateLeaderboard() {
-  try {
-    const res = await pool.query(`
-      SELECT username, milk, eggs, cattle, total
-      FROM leaderboard
-      ORDER BY total DESC
-      LIMIT 10
-    `);
+  const res = await pool.query(`
+    SELECT * FROM ranch
+    ORDER BY total DESC
+  `);
 
-    let content = '🏆 Beaver Farms — Leaderboard\n\n';
-    if (res.rows.length === 0) {
-      content += 'No data yet.';
-    } else {
-      for (const row of res.rows) {
-        const total = Number(row.total) || 0; // safe number
-        content += `${row.username.toUpperCase()}\n`;
-        content += `🥛 Milk: ${row.milk}\n`;
-        content += `🥚 Eggs: ${row.eggs}\n`;
-        content += `🐄 Cattle: ${row.cattle}\n`;
-        content += `💰 Total: $${total.toFixed(2)}\n\n`;
-      }
+  let text = '🏆 **Beaver Farms — Weekly Leaderboard**\n\n';
+
+  if (res.rows.length === 0) {
+    text += 'No activity yet.';
+  } else {
+    for (const row of res.rows) {
+      text += `**${row.username}**\n`;
+      text += `🥛 Milk: ${row.milk}\n`;
+      text += `🥚 Eggs: ${row.eggs}\n`;
+      text += `🐄 Cattle: ${row.cattle}\n`;
+      text += `💰 Total: $${Number(row.total)}\n\n`;
     }
+  }
 
-    const channel = await client.channels.fetch(CHANNEL_ID);
+  const channel = await client.channels.fetch(CHANNEL_ID);
 
-    if (leaderboardMessageId) {
-      // edit existing message
-      const msg = await channel.messages.fetch(leaderboardMessageId);
-      await msg.edit(content);
-    } else {
-      // create new message
-      const msg = await channel.send(content);
-      leaderboardMessageId = msg.id;
-    }
-  } catch (err) {
-    console.error('Error updating leaderboard:', err);
+  if (leaderboardMessageId) {
+    const msg = await channel.messages.fetch(leaderboardMessageId);
+    await msg.edit(text);
+  } else {
+    const msg = await channel.send(text);
+    leaderboardMessageId = msg.id;
   }
 }
 
-// --------------------
-// HANDLE WEBHOOK UPDATES
-// --------------------
-// Example: webhook sends { username, item, amount }
-async function handleWebhook(data) {
-  const { username, item, amount } = data;
-  if (!['milk', 'eggs', 'cattle'].includes(item)) return;
-  if (!username || isNaN(amount)) return;
+/* ======================
+   WEBHOOK SERVER
+====================== */
+const app = express();
+app.use(express.json());
+
+app.post('/webhook', async (req, res) => {
+  const { username, item, amount } = req.body;
+
+  if (!username || !['milk', 'eggs', 'cattle'].includes(item)) {
+    return res.status(400).send('Invalid payload');
+  }
+
+  const qty = Number(amount) || 0;
 
   await pool.query(`
-    INSERT INTO leaderboard (username, ${item}, total)
+    INSERT INTO ranch (username, ${item}, total)
     VALUES ($1, $2, $2)
     ON CONFLICT (username)
     DO UPDATE SET
-      ${item} = leaderboard.${item} + EXCLUDED.${item},
-      total = (COALESCE(leaderboard.milk,0) + COALESCE(leaderboard.eggs,0) + COALESCE(leaderboard.cattle,0) +
-               CASE WHEN $3 = 'milk' THEN $2 ELSE 0 END +
-               CASE WHEN $3 = 'eggs' THEN $2 ELSE 0 END +
-               CASE WHEN $3 = 'cattle' THEN $2 ELSE 0 END
-              );
-  `, [username, amount, item]);
+      ${item} = ranch.${item} + $2,
+      total = ranch.total + $2;
+  `, [username, qty]);
 
   await updateLeaderboard();
-}
+  res.send('OK');
+});
 
-// --------------------
-// CLIENT READY
-// --------------------
+/* ======================
+   WEEKLY RESET (SUNDAYS 12AM)
+====================== */
+cron.schedule('0 0 * * 0', async () => {
+  console.log('Weekly reset running...');
+  await pool.query(`TRUNCATE TABLE ranch;`);
+  await updateLeaderboard();
+});
+
+/* ======================
+   READY
+====================== */
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   const channel = await client.channels.fetch(CHANNEL_ID);
   const messages = await channel.messages.fetch({ limit: 10 });
-  const lastLeaderboard = messages.find(
-    msg => msg.author.id === client.user.id && msg.content.startsWith('🏆 Beaver Farms — Leaderboard')
+
+  const old = messages.find(
+    m => m.author.id === client.user.id && m.content.includes('Beaver Farms')
   );
-  if (lastLeaderboard) leaderboardMessageId = lastLeaderboard.id;
 
-  if (!leaderboardMessageId) {
-    const msg = await channel.send('🏆 Beaver Farms — Leaderboard\nFetching data...');
-    leaderboardMessageId = msg.id;
-  }
-
+  if (old) leaderboardMessageId = old.id;
   await updateLeaderboard();
 });
 
-// --------------------
-// LOGIN
-// --------------------
+/* ======================
+   START
+====================== */
 client.login(DISCORD_TOKEN);
-
-// --------------------
-// EXPORT FOR WEBHOOK
-// --------------------
-export { handleWebhook };
+app.listen(PORT, () => console.log(`Webhook listening on ${PORT}`));
