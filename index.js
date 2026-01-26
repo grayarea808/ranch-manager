@@ -6,7 +6,7 @@ import pkg from 'pg';
 import { Client, GatewayIntentBits } from 'discord.js';
 
 // ---------------------
-// PostgreSQL Setup
+// PostgreSQL
 // ---------------------
 const { Pool } = pkg;
 
@@ -17,10 +17,10 @@ const pool = new Pool({
 
 pool.connect()
   .then(() => console.log('Postgres connected'))
-  .catch(err => console.error('Postgres connection error:', err));
+  .catch(err => console.error('Postgres error:', err));
 
 // ---------------------
-// Discord Setup
+// Discord
 // ---------------------
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
@@ -29,21 +29,72 @@ const client = new Client({
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // ---------------------
-// Express (Webhook Server)
+// Express
 // ---------------------
 const app = express();
 app.use(express.json());
 
-// 🔔 WEBHOOK ENDPOINT
+// ---------------------
+// WEBHOOK HANDLER
+// ---------------------
 app.post('/webhook/ranch', async (req, res) => {
-  console.log('📩 Webhook received!');
-  console.log(JSON.stringify(req.body, null, 2));
+  try {
+    console.log('📩 Webhook received!');
+    console.log(JSON.stringify(req.body, null, 2));
 
-  // TEMP response so the game is happy
-  res.status(200).json({ ok: true });
+    const rawUsername = req.body.username || 'Unknown';
+    const embed = req.body.embeds?.[0];
+
+    if (!embed) {
+      return res.status(200).json({ ok: true });
+    }
+
+    // Clean username (take last word)
+    const username = rawUsername.split(' ').pop();
+
+    const title = embed.title || '';
+    const description = embed.description || '';
+
+    // Extract number at end of string
+    const amountMatch = description.match(/:\s*(\d+)/);
+    const amount = amountMatch ? parseInt(amountMatch[1]) : 0;
+
+    let column = null;
+
+    if (title.includes('Egg')) column = 'eggs';
+    if (title.includes('Milk')) column = 'milk';
+    if (title.includes('Cattle')) column = 'cattle';
+
+    if (!column || amount === 0) {
+      console.log('⚠️ No valid stat found');
+      return res.status(200).json({ ok: true });
+    }
+
+    // Upsert
+    await pool.query(
+      `
+      INSERT INTO ranch_stats (username, ${column})
+      VALUES ($1, $2)
+      ON CONFLICT (username)
+      DO UPDATE SET ${column} = ranch_stats.${column} + EXCLUDED.${column}
+      `,
+      [username, amount]
+    );
+
+    console.log(`✅ Updated ${username}: +${amount} ${column}`);
+
+    await updateLeaderboard();
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('Webhook error:', err);
+    res.status(500).json({ error: 'Webhook failed' });
+  }
 });
 
-// Health check
+// ---------------------
+// Health Check
+// ---------------------
 app.get('/', (req, res) => {
   res.send('Ranch Manager online');
 });
@@ -54,16 +105,7 @@ app.listen(PORT, () => {
 });
 
 // ---------------------
-// Discord Ready
-// ---------------------
-client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  updateLeaderboard();
-  setInterval(updateLeaderboard, 5 * 60 * 1000);
-});
-
-// ---------------------
-// Update Leaderboard
+// Leaderboard
 // ---------------------
 async function updateLeaderboard() {
   try {
@@ -92,11 +134,17 @@ async function updateLeaderboard() {
     botMsg ? await botMsg.edit(msg) : await channel.send(msg);
     console.log('Leaderboard updated');
   } catch (err) {
-    console.error('Error updating leaderboard:', err);
+    console.error('Leaderboard error:', err);
   }
 }
 
 // ---------------------
-// Login
+// Discord Login
 // ---------------------
+client.once('clientReady', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  updateLeaderboard();
+  setInterval(updateLeaderboard, 5 * 60 * 1000);
+});
+
 client.login(process.env.DISCORD_TOKEN);
