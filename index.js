@@ -24,7 +24,6 @@ const pool = new Pool({
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
-
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // ---------------------
@@ -89,16 +88,15 @@ app.post('/webhook/ranch', async (req, res) => {
   try {
     console.log('📩 Webhook received!', req.body);
 
-    // Example payload parsing
     const data = req.body;
-    const username = data.username.split(' ')[2] || 'Unknown'; // adjust based on your webhook payload
+    // Extract username from format "<@ID> ID NAME"
+    const usernameParts = data.username.split(' ');
+    const username = usernameParts[usernameParts.length - 1];
+
+    // Extract numbers from description
     const description = data.embeds?.[0]?.description || '';
+    let milkAdded = 0, eggsAdded = 0, cattleAdded = 0;
 
-    let milkAdded = 0;
-    let eggsAdded = 0;
-    let cattleAdded = 0;
-
-    // Parse amounts from description
     const milkMatch = description.match(/Milk.*?(\d+)/i);
     const eggsMatch = description.match(/Eggs.*?(\d+)/i);
     const cattleMatch = description.match(/Cattle.*?(\d+)/i);
@@ -107,14 +105,14 @@ app.post('/webhook/ranch', async (req, res) => {
     if (eggsMatch) eggsAdded = parseInt(eggsMatch[1]);
     if (cattleMatch) cattleAdded = parseInt(cattleMatch[1]);
 
-    // Insert new row if username doesn't exist
+    // Insert user if not exists
     await pool.query(`
       INSERT INTO ranch_stats(username, milk, eggs, cattle)
       VALUES($1, 0, 0, 0)
       ON CONFLICT (username) DO NOTHING
     `, [username]);
 
-    // Update totals
+    // Update stats
     await pool.query(`
       UPDATE ranch_stats
       SET milk = milk + $2,
