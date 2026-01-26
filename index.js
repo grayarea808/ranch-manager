@@ -1,35 +1,42 @@
 import express from 'express';
 import { Client, GatewayIntentBits } from 'discord.js';
 import pg from 'pg';
-import dotenv from 'dotenv';
-
-dotenv.config();
 
 const app = express();
 app.use(express.json());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const pool = new pg.Pool({
-  user: process.env.PGUSER,
-  host: process.env.PGHOST,
-  database: process.env.PGDATABASE,
-  password: process.env.PGPASSWORD,
-  port: process.env.PGPORT,
+  user: 'YOUR_PG_USER',
+  host: 'YOUR_PG_HOST',
+  database: 'YOUR_PG_DATABASE',
+  password: 'YOUR_PG_PASSWORD',
+  port: 5432,
 });
 
-const channelId = process.env.CHANNEL_ID;
+const channelId = 'YOUR_CHANNEL_ID'; // Discord channel where leaderboard is posted
 
-// Store the leaderboard message ID
-let leaderboardMessageId = process.env.LEADERBOARD_MESSAGE_ID || null;
+// -------------------------
+// Ensure table exists to store leaderboard message ID
+// -------------------------
+await pool.query(`
+CREATE TABLE IF NOT EXISTS leaderboard_meta (
+  id SERIAL PRIMARY KEY,
+  message_id TEXT
+);
+`);
+
+// -------------------------
+// Reset leaderboard weekly
+// -------------------------
+await pool.query(`
+CREATE TABLE IF NOT EXISTS leaderboard_reset (
+  id SERIAL PRIMARY KEY,
+  last_reset TIMESTAMP NOT NULL
+);
+`);
 
 async function resetLeaderboardIfNeeded() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS leaderboard_reset (
-      id SERIAL PRIMARY KEY,
-      last_reset TIMESTAMP NOT NULL
-    )
-  `);
-
   const res = await pool.query('SELECT last_reset FROM leaderboard_reset ORDER BY last_reset DESC LIMIT 1');
   const now = new Date();
 
@@ -44,6 +51,9 @@ async function resetLeaderboardIfNeeded() {
   }
 }
 
+// -------------------------
+// Update leaderboard message
+// -------------------------
 async function updateLeaderboardMessage() {
   await resetLeaderboardIfNeeded();
 
@@ -57,6 +67,10 @@ async function updateLeaderboardMessage() {
 
   const channel = await client.channels.fetch(channelId);
 
+  // Fetch the stored leaderboard message ID from DB
+  let msgRes = await pool.query('SELECT message_id FROM leaderboard_meta ORDER BY id DESC LIMIT 1');
+  let leaderboardMessageId = msgRes.rows[0]?.message_id;
+
   if (leaderboardMessageId) {
     try {
       const message = await channel.messages.fetch(leaderboardMessageId);
@@ -64,16 +78,20 @@ async function updateLeaderboardMessage() {
       console.log('Leaderboard updated (edited existing message)!');
       return;
     } catch (err) {
-      console.log('Previous message not found, sending new one...');
+      console.log('Previous message not found, creating new one...');
     }
   }
 
-  // If no message ID, send a new message and store its ID
+  // Post a new message and store its ID
   const message = await channel.send(leaderboardText);
-  leaderboardMessageId = message.id;
-  console.log('Leaderboard posted for the first time!');
+  await message.pin();
+  await pool.query('INSERT INTO leaderboard_meta(message_id) VALUES($1)', [message.id]);
+  console.log('New leaderboard posted and pinned!');
 }
 
+// -------------------------
+// Webhook endpoint
+// -------------------------
 app.post('/webhook/ranch', async (req, res) => {
   try {
     const data = req.body;
@@ -97,12 +115,10 @@ app.post('/webhook/ranch', async (req, res) => {
   }
 });
 
-app.listen(8080, () => {
-  console.log('Webhook server listening on port 8080');
-});
+app.listen(8080, () => console.log('Webhook server listening on port 8080'));
 
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login('YOUR_DISCORD_TOKEN');
