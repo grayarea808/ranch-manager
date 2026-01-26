@@ -1,14 +1,24 @@
 {
   "name": "ranch-manager",
   "version": "1.0.0",
+  "description": "Discord bot + webhook server for Beaver Farms ranch leaderboard",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
-    "discord.js": "^14.14.1",
-    "pg": "^8.11.5",
-    "express": "^4.19.2"
-  }
+    "discord.js": "^15.7.0",
+    "express": "^4.18.2",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "Bradley Davis",
+  "license": "MIT"
 }
