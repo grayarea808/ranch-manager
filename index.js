@@ -1,6 +1,6 @@
 import { Client, GatewayIntentBits } from 'discord.js';
 import pkg from 'pg';
-import fetch from 'node-fetch';
+import express from 'express';
 const { Pool } = pkg;
 
 // -------------------- POSTGRES CONNECTION --------------------
@@ -16,13 +16,9 @@ const pool = new Pool({
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const CHANNEL_ID = '1465062014626824347';
 const WEBHOOK_SECRET = 'some-long-random-string';
-
-// Track the message ID of the leaderboard
-let leaderboardMessageId = null;
+let leaderboardMessageId = null; // track the single leaderboard message
 
 // -------------------- UTILITY FUNCTIONS --------------------
-
-// Calculate total for a row
 function calculateTotal(row) {
   const milkTotal = (row.milk || 0) * 1.25;
   const eggsTotal = (row.eggs || 0) * 1.25;
@@ -30,10 +26,9 @@ function calculateTotal(row) {
   return milkTotal + eggsTotal + cattleTotal;
 }
 
-// Reset leaderboard weekly
 async function resetLeaderboardIfNeeded() {
   const now = new Date();
-  const weekStart = new Date('2026-01-26T00:00:00Z'); // start date
+  const weekStart = new Date('2026-01-26T00:00:00Z');
   const weeksSince = Math.floor((now - weekStart) / (7 * 24 * 60 * 60 * 1000));
 
   const res = await pool.query('SELECT last_reset_week FROM leaderboard_reset LIMIT 1');
@@ -49,55 +44,40 @@ async function resetLeaderboardIfNeeded() {
   }
 }
 
-// Update leaderboard message
 async function updateLeaderboard() {
   await resetLeaderboardIfNeeded();
-
   const result = await pool.query('SELECT username, milk, eggs, cattle FROM ranch_stats ORDER BY username ASC');
-  const rows = result.rows;
-
   let content = '🏆 Beaver Farms — Leaderboard\n\n';
-  rows.forEach(row => {
+  result.rows.forEach(row => {
     const total = calculateTotal(row);
     content += `${row.username}\n🥛 Milk: ${row.milk}\n🥚 Eggs: ${row.eggs}\n🐄 Cattle: ${row.cattle}\n💰 Total: $${total.toFixed(2)}\n\n`;
   });
 
   const channel = await client.channels.fetch(CHANNEL_ID);
-
   if (leaderboardMessageId) {
-    // edit existing message
     const message = await channel.messages.fetch(leaderboardMessageId);
     await message.edit({ content });
   } else {
-    // send new message and store its ID
     const message = await channel.send({ content });
     leaderboardMessageId = message.id;
   }
 }
 
 // -------------------- WEBHOOK --------------------
-import express from 'express';
 const app = express();
 app.use(express.json());
 
 app.post('/webhook/ranch', async (req, res) => {
-  const payload = req.body;
-
-  // Basic secret check
-  if (req.headers['x-webhook-secret'] !== WEBHOOK_SECRET) {
-    return res.status(401).send('Unauthorized');
-  }
+  if (req.headers['x-webhook-secret'] !== WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
 
   try {
-    const username = payload.username.split(' ')[1]; // adjust as needed
-    const items = payload.embeds[0]?.description || '';
-    const milkMatch = items.match(/Milk: (\d+)/i);
-    const eggsMatch = items.match(/Eggs: (\d+)/i);
-    const cattleMatch = items.match(/Cattle: (\d+)/i);
+    const payload = req.body;
+    const username = payload.username.split(' ')[1]; // adjust if needed
+    const description = payload.embeds[0]?.description || '';
 
-    const milk = milkMatch ? parseInt(milkMatch[1], 10) : 0;
-    const eggs = eggsMatch ? parseInt(eggsMatch[1], 10) : 0;
-    const cattle = cattleMatch ? parseInt(cattleMatch[1], 10) : 0;
+    const milk = parseInt((description.match(/Milk: (\d+)/i) || [0,0])[1], 10);
+    const eggs = parseInt((description.match(/Eggs: (\d+)/i) || [0,0])[1], 10);
+    const cattle = parseInt((description.match(/Cattle: (\d+)/i) || [0,0])[1], 10);
 
     await pool.query(
       `INSERT INTO ranch_stats(username, milk, eggs, cattle)
