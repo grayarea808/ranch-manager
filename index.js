@@ -1,9 +1,14 @@
 // ---------------------
-// PostgreSQL Setup
+// Imports
 // ---------------------
+import express from 'express';
 import pkg from 'pg';
+import { Client, GatewayIntentBits } from 'discord.js';
 const { Pool } = pkg;
 
+// ---------------------
+// PostgreSQL Setup
+// ---------------------
 const pool = new Pool({
   user: process.env.PGUSER,
   host: process.env.PGHOST,
@@ -14,19 +19,8 @@ const pool = new Pool({
 });
 
 // ---------------------
-// Express / Webhook Setup
-// ---------------------
-import express from 'express';
-const app = express();
-app.use(express.json());
-
-const WEBHOOK_PORT = process.env.PORT || 8080;
-
-// ---------------------
 // Discord Setup
 // ---------------------
-import { Client, GatewayIntentBits } from 'discord.js';
-
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
@@ -34,21 +28,20 @@ const client = new Client({
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // ---------------------
-// Bot Ready
+// Express Setup
 // ---------------------
-client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  updateLeaderboard();
-  setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
-});
+const app = express();
+app.use(express.json());
+const PORT = process.env.PORT || 8080;
 
 // ---------------------
-// Leaderboard Update
+// Update Leaderboard
 // ---------------------
 async function updateLeaderboard() {
   try {
     const result = await pool.query(`
-      SELECT username, milk, eggs, cattle, (milk*1.1 + eggs*1.1 + cattle)::numeric AS total
+      SELECT username, milk, eggs, cattle, 
+             (milk * 1.25 + eggs * 1.25 + cattle) AS total
       FROM ranch_stats
       ORDER BY total DESC
       LIMIT 10
@@ -56,12 +49,11 @@ async function updateLeaderboard() {
 
     let leaderboardMessage = '🏆 Beaver Farms — Leaderboard\n\n';
     result.rows.forEach((row, i) => {
-      const total = Number(row.total);
       leaderboardMessage += `${i + 1}. ${row.username}\n`;
       leaderboardMessage += `🥛 Milk: ${row.milk}\n`;
       leaderboardMessage += `🥚 Eggs: ${row.eggs}\n`;
       leaderboardMessage += `🐄 Cattle: ${row.cattle}\n`;
-      leaderboardMessage += `💰 Total: $${total.toFixed(2)}\n\n`;
+      leaderboardMessage += `💰 Total: $${Number(row.total).toFixed(2)}\n\n`;
     });
 
     const channel = await client.channels.fetch(CHANNEL_ID);
@@ -69,7 +61,6 @@ async function updateLeaderboard() {
 
     const messages = await channel.messages.fetch({ limit: 10 });
     const botMessage = messages.find(m => m.author.id === client.user.id);
-
     if (botMessage) {
       await botMessage.edit(leaderboardMessage);
     } else {
@@ -83,66 +74,72 @@ async function updateLeaderboard() {
 }
 
 // ---------------------
+// Discord Bot Ready
+// ---------------------
+client.once('clientReady', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  updateLeaderboard();
+  setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
+});
+
+// ---------------------
 // Webhook Endpoint
 // ---------------------
 app.post('/webhook/ranch', async (req, res) => {
-  console.log('📩 Webhook received!');
-  console.log(req.body);
-
   try {
+    console.log('📩 Webhook received!', req.body);
+
+    // Example payload parsing
     const data = req.body;
+    const username = data.username.split(' ')[2] || 'Unknown'; // adjust based on your webhook payload
+    const description = data.embeds?.[0]?.description || '';
 
-    // Parse username
-    const username = data.username.split(' ')[2]; // Adjust if format differs
+    let milkAdded = 0;
+    let eggsAdded = 0;
+    let cattleAdded = 0;
 
-    // Check what item was added
-    if (data.embeds && data.embeds.length) {
-      const desc = data.embeds[0].description.toLowerCase();
-      let field = null;
-      let amount = 0;
+    // Parse amounts from description
+    const milkMatch = description.match(/Milk.*?(\d+)/i);
+    const eggsMatch = description.match(/Eggs.*?(\d+)/i);
+    const cattleMatch = description.match(/Cattle.*?(\d+)/i);
 
-      if (desc.includes('milk')) field = 'milk';
-      else if (desc.includes('eggs')) field = 'eggs';
-      else if (desc.includes('cattle')) field = 'cattle';
+    if (milkMatch) milkAdded = parseInt(milkMatch[1]);
+    if (eggsMatch) eggsAdded = parseInt(eggsMatch[1]);
+    if (cattleMatch) cattleAdded = parseInt(cattleMatch[1]);
 
-      const match = desc.match(/: (\d+)/);
-      if (match) amount = parseInt(match[1]);
+    // Insert new row if username doesn't exist
+    await pool.query(`
+      INSERT INTO ranch_stats(username, milk, eggs, cattle)
+      VALUES($1, 0, 0, 0)
+      ON CONFLICT (username) DO NOTHING
+    `, [username]);
 
-      if (field && amount) {
-        await pool.query(`
-          INSERT INTO ranch_stats(username, milk, eggs, cattle)
-          VALUES ($1, 0, 0, 0)
-          ON CONFLICT (username) DO NOTHING
-        `, [username]);
+    // Update totals
+    await pool.query(`
+      UPDATE ranch_stats
+      SET milk = milk + $2,
+          eggs = eggs + $3,
+          cattle = cattle + $4
+      WHERE username = $1
+    `, [username, milkAdded, eggsAdded, cattleAdded]);
 
-        await pool.query(`
-          UPDATE ranch_stats
-          SET ${field} = ${field} + $1
-          WHERE username = $2
-        `, [amount, username]);
-
-        console.log(`✅ Updated ${field} for ${username} by ${amount}`);
-        updateLeaderboard(); // refresh after each update
-      }
-    }
-
-    res.sendStatus(200);
+    await updateLeaderboard();
+    res.status(200).send('Webhook processed!');
   } catch (err) {
-    console.error('Webhook processing error:', err);
-    res.sendStatus(500);
+    console.error('Error processing webhook:', err);
+    res.status(500).send('Error');
   }
 });
 
 // ---------------------
-// Start Webhook Server
+// Start Express Server
 // ---------------------
-app.listen(WEBHOOK_PORT, () => {
-  console.log(`Webhook server listening on port ${WEBHOOK_PORT}`);
+app.listen(PORT, () => {
+  console.log(`Webhook server listening on port ${PORT}`);
 });
 
 // ---------------------
 // Login Discord Bot
 // ---------------------
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('🚨 Failed to login Discord bot:', err);
-});
+client.login(process.env.DISCORD_TOKEN)
+  .catch(err => console.error('Failed to login Discord bot:', err));
