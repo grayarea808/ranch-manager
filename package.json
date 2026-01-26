@@ -1,13 +1,20 @@
 {
   "name": "ranch-manager",
   "version": "1.0.0",
+  "description": "Discord bot for Beaver Farms leaderboard",
+  "main": "index.js",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.11.0",
-    "pg": "^8.11.1",
-    "express": "^4.18.2"
+    "discord.js": "^14.14.0",
+    "express": "^4.18.2",
+    "pg": "^8.12.0",
+    "body-parser": "^1.20.2",
+    "node-cron": "^3.0.2"
   }
 }
