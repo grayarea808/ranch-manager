@@ -1,137 +1,135 @@
-import express from 'express';
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 import pkg from 'pg';
-import cron from 'node-cron';
+import express from 'express';
 
 const { Pool } = pkg;
 
-/* ======================
-   CONFIG
-====================== */
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID = '1465062014626824347';
-const PORT = process.env.PORT || 3000;
-
-/* ======================
+/* =======================
    DATABASE
-====================== */
+======================= */
 const pool = new Pool({
-  host: 'postgres.railway.internal',
-  user: 'postgres',
-  password: 'YOUR_DB_PASSWORD',
-  database: 'railway',
-  port: 5432,
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS ranch (
-    username TEXT PRIMARY KEY,
-    milk INT DEFAULT 0,
-    eggs INT DEFAULT 0,
-    cattle INT DEFAULT 0,
-    total INT DEFAULT 0
-  );
-`);
-
-/* ======================
-   DISCORD
-====================== */
+/* =======================
+   DISCORD CLIENT
+======================= */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds]
 });
 
-let leaderboardMessageId = null;
-
-/* ======================
-   LEADERBOARD
-====================== */
-async function updateLeaderboard() {
-  const res = await pool.query(`
-    SELECT * FROM ranch
-    ORDER BY total DESC
-  `);
-
-  let text = '🏆 **Beaver Farms — Weekly Leaderboard**\n\n';
-
-  if (res.rows.length === 0) {
-    text += 'No activity yet.';
-  } else {
-    for (const row of res.rows) {
-      text += `**${row.username}**\n`;
-      text += `🥛 Milk: ${row.milk}\n`;
-      text += `🥚 Eggs: ${row.eggs}\n`;
-      text += `🐄 Cattle: ${row.cattle}\n`;
-      text += `💰 Total: $${Number(row.total)}\n\n`;
-    }
-  }
-
-  const channel = await client.channels.fetch(CHANNEL_ID);
-
-  if (leaderboardMessageId) {
-    const msg = await channel.messages.fetch(leaderboardMessageId);
-    await msg.edit(text);
-  } else {
-    const msg = await channel.send(text);
-    leaderboardMessageId = msg.id;
-  }
-}
-
-/* ======================
-   WEBHOOK SERVER
-====================== */
+/* =======================
+   EXPRESS (WEBHOOK)
+======================= */
 const app = express();
 app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
+/* =======================
+   LEADERBOARD UPDATE
+======================= */
+async function updateLeaderboard() {
+  const { rows } = await pool.query(`
+    SELECT username, total
+    FROM leaderboard
+    ORDER BY total DESC
+    LIMIT 10
+  `);
+
+  const description = rows.length
+    ? rows.map((r, i) => `**${i + 1}. ${r.username}** — ${Number(r.total)}`).join('\n')
+    : 'No data yet.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('🐮 Beaver Farms — Leaderboard')
+    .setDescription(description)
+    .setColor(0x8b4513)
+    .setTimestamp();
+
+  const channel = await client.channels.fetch(process.env.LEADERBOARD_CHANNEL_ID);
+  const message = await channel.messages.fetch(process.env.LEADERBOARD_MESSAGE_ID);
+
+  await message.edit({ embeds: [embed] });
+  console.log('📊 Leaderboard updated');
+}
+
+/* =======================
+   WEBHOOK ENDPOINT
+======================= */
 app.post('/webhook', async (req, res) => {
-  const { username, item, amount } = req.body;
+  try {
+    const { user_id, username, milk = 0, eggs = 0, cattle = 0 } = req.body;
 
-  if (!username || !['milk', 'eggs', 'cattle'].includes(item)) {
-    return res.status(400).send('Invalid payload');
+    await pool.query(`
+      INSERT INTO leaderboard (user_id, username, milk, eggs, cattle, total)
+      VALUES ($1, $2, $3, $4, $5, $3+$4+$5)
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        milk = leaderboard.milk + EXCLUDED.milk,
+        eggs = leaderboard.eggs + EXCLUDED.eggs,
+        cattle = leaderboard.cattle + EXCLUDED.cattle,
+        total = leaderboard.total + EXCLUDED.total,
+        last_updated = NOW()
+    `, [user_id, username, milk, eggs, cattle]);
+
+    await updateLeaderboard();
+    res.sendStatus(200);
+  } catch (err) {
+    console.error(err);
+    res.sendStatus(500);
   }
-
-  const qty = Number(amount) || 0;
-
-  await pool.query(`
-    INSERT INTO ranch (username, ${item}, total)
-    VALUES ($1, $2, $2)
-    ON CONFLICT (username)
-    DO UPDATE SET
-      ${item} = ranch.${item} + $2,
-      total = ranch.total + $2;
-  `, [username, qty]);
-
-  await updateLeaderboard();
-  res.send('OK');
 });
 
-/* ======================
-   WEEKLY RESET (SUNDAYS 12AM)
-====================== */
-cron.schedule('0 0 * * 0', async () => {
-  console.log('Weekly reset running...');
-  await pool.query(`TRUNCATE TABLE ranch;`);
-  await updateLeaderboard();
-});
+/* =======================
+   WEEKLY RESET (NO CRON)
+======================= */
+async function checkWeeklyReset() {
+  const now = new Date();
 
-/* ======================
-   READY
-====================== */
-client.once(Events.ClientReady, async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+  const isSunday = now.getDay() === 0;
+  const isMidnight = now.getHours() === 0 && now.getMinutes() === 0;
+  if (!isSunday || !isMidnight) return;
 
-  const channel = await client.channels.fetch(CHANNEL_ID);
-  const messages = await channel.messages.fetch({ limit: 10 });
-
-  const old = messages.find(
-    m => m.author.id === client.user.id && m.content.includes('Beaver Farms')
+  const { rows } = await pool.query(
+    `SELECT value FROM system_state WHERE key='last_reset'`
   );
 
-  if (old) leaderboardMessageId = old.id;
+  const lastReset = new Date(rows[0].value);
+  const diffDays = (now - lastReset) / (1000 * 60 * 60 * 24);
+  if (diffDays < 6) return;
+
+  console.log('🔁 WEEKLY RESET');
+
+  await pool.query(`
+    UPDATE leaderboard
+    SET milk=0, eggs=0, cattle=0, total=0
+  `);
+
+  await pool.query(`
+    UPDATE system_state
+    SET value=$1
+    WHERE key='last_reset'
+  `, [now.toISOString().slice(0, 10)]);
+
+  await updateLeaderboard();
+}
+
+setInterval(checkWeeklyReset, 60 * 1000);
+
+/* =======================
+   BOT READY
+======================= */
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
   await updateLeaderboard();
 });
 
-/* ======================
+/* =======================
    START
-====================== */
-client.login(DISCORD_TOKEN);
-app.listen(PORT, () => console.log(`Webhook listening on ${PORT}`));
+======================= */
+client.login(process.env.DISCORD_TOKEN);
+
+app.listen(PORT, () => {
+  console.log(`🚜 Ranch Manager running on port ${PORT}`);
+});
