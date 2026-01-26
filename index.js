@@ -162,3 +162,36 @@ client.on('clientReady', async () => {
 // --------------------
 client.login(DISCORD_TOKEN);
 app.listen(8080, () => console.log('🚜 Ranch Manager running on port 8080'));
+
+// --- Weekly Reset System (no node-cron needed) ---
+function scheduleWeeklyReset() {
+  // Run every minute and check if it's Sunday midnight
+  setInterval(async () => {
+    const now = new Date();
+    // Sunday is 0, midnight is 0 hours
+    if (now.getDay() === 0 && now.getHours() === 0 && now.getMinutes() === 0) {
+      console.log("🔄 Weekly reset triggered");
+
+      try {
+        // Reset all user stats in your database
+        await pool.query(`
+          UPDATE users
+          SET eggs = 0, milk = 0, cattle = 0, total = 0
+        `);
+
+        console.log("✅ All ranch stats reset for the new week");
+
+        // Optional: update the Discord leaderboard immediately
+        updateLeaderboard();
+
+      } catch (err) {
+        console.error("❌ Error during weekly reset:", err);
+      }
+    }
+  }, 60 * 1000); // check every minute
+}
+
+// Call it once at startup
+scheduleWeeklyReset();
+
+
