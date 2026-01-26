@@ -1,105 +1,103 @@
 import { Client, GatewayIntentBits } from 'discord.js';
-import pkg from 'pg';
-import express from 'express';
-const { Pool } = pkg;
+import pg from 'pg';
 
-// -------------------- POSTGRES CONNECTION --------------------
+const { Pool } = pg;
+
+// PostgreSQL connection using Railway environment variables
 const pool = new Pool({
-  host: 'postgres.railway.internal',
-  user: 'postgres',
-  password: 'nZgFXhBgBmJxTXfqLDFrhhMOJyNQpOLA',
-  database: 'railway',
-  port: 5432,
+  host: process.env.PGHOST,
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  database: process.env.PGDATABASE,
+  port: parseInt(process.env.PGPORT || '5432', 10),
+  ssl: { rejectUnauthorized: false },
 });
 
-// -------------------- DISCORD CLIENT --------------------
+// Discord setup
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-const CHANNEL_ID = '1465062014626824347';
-const WEBHOOK_SECRET = 'some-long-random-string';
-let leaderboardMessageId = null; // track the single leaderboard message
+const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// -------------------- UTILITY FUNCTIONS --------------------
-function calculateTotal(row) {
-  const milkTotal = (row.milk || 0) * 1.25;
-  const eggsTotal = (row.eggs || 0) * 1.25;
-  const cattleTotal = (row.cattle || 0) * 160; // $200 minus 20% ranch cut
-  return milkTotal + eggsTotal + cattleTotal;
-}
+// Prices
+const PRICES = {
+  milk: 1.25,
+  eggs: 1.25,
+  cattle: 200,
+};
+const FARM_CUT = 0.2; // 20% cut
 
+let leaderboardMessageId = null; // will store ID of the message to edit
+
+// Weekly leaderboard reset
 async function resetLeaderboardIfNeeded() {
+  const res = await pool.query('SELECT last_reset FROM leaderboard_reset LIMIT 1');
   const now = new Date();
-  const weekStart = new Date('2026-01-26T00:00:00Z');
-  const weeksSince = Math.floor((now - weekStart) / (7 * 24 * 60 * 60 * 1000));
+  let lastReset = res.rows[0]?.last_reset ? new Date(res.rows[0].last_reset) : new Date(0);
 
-  const res = await pool.query('SELECT last_reset_week FROM leaderboard_reset LIMIT 1');
-  const lastWeek = res.rows[0]?.last_reset_week ?? -1;
-
-  if (lastWeek < weeksSince) {
-    await pool.query('UPDATE ranch_stats SET milk=0, eggs=0, cattle=0');
-    if (lastWeek === -1) {
-      await pool.query('INSERT INTO leaderboard_reset(last_reset_week) VALUES ($1)', [weeksSince]);
-    } else {
-      await pool.query('UPDATE leaderboard_reset SET last_reset_week=$1', [weeksSince]);
-    }
+  // Reset if more than 7 days
+  if ((now - lastReset) / (1000 * 60 * 60 * 24) >= 7) {
+    await pool.query('UPDATE leaderboard_reset SET last_reset = NOW()');
+    await pool.query('UPDATE leaderboard SET milk = 0, eggs = 0, cattle = 0, total = 0');
   }
 }
 
-async function updateLeaderboard() {
-  await resetLeaderboardIfNeeded();
-  const result = await pool.query('SELECT username, milk, eggs, cattle FROM ranch_stats ORDER BY username ASC');
-  let content = '🏆 Beaver Farms — Leaderboard\n\n';
-  result.rows.forEach(row => {
-    const total = calculateTotal(row);
-    content += `${row.username}\n🥛 Milk: ${row.milk}\n🥚 Eggs: ${row.eggs}\n🐄 Cattle: ${row.cattle}\n💰 Total: $${total.toFixed(2)}\n\n`;
+// Calculate totals and update database
+async function updateTotals() {
+  const res = await pool.query('SELECT id, milk, eggs, cattle FROM leaderboard');
+
+  const updates = res.rows.map(row => {
+    const cattleTotal = PRICES.cattle * row.cattle * (1 - FARM_CUT);
+    const total = PRICES.milk * row.milk + PRICES.eggs * row.eggs + cattleTotal;
+
+    return pool.query('UPDATE leaderboard SET total = $1 WHERE id = $2', [total, row.id]);
   });
 
-  const channel = await client.channels.fetch(CHANNEL_ID);
-  if (leaderboardMessageId) {
-    const message = await channel.messages.fetch(leaderboardMessageId);
-    await message.edit({ content });
-  } else {
-    const message = await channel.send({ content });
-    leaderboardMessageId = message.id;
+  await Promise.all(updates);
+}
+
+// Build leaderboard message content
+async function buildLeaderboardMessage() {
+  const res = await pool.query('SELECT discord_id, username, milk, eggs, cattle, total FROM leaderboard ORDER BY total DESC');
+  let message = '🏆 Beaver Farms — Leaderboard\n\n';
+
+  res.rows.forEach(row => {
+    message += `@${row.username} ${row.username}\n`;
+    message += `🥛 Milk: ${row.milk}\n`;
+    message += `🥚 Eggs: ${row.eggs}\n`;
+    message += `🐄 Cattle: ${row.cattle}\n`;
+    message += `💰 Total: $${row.total.toFixed(2)}\n\n`;
+  });
+
+  return message;
+}
+
+// Update leaderboard in Discord
+async function updateLeaderboard() {
+  try {
+    await resetLeaderboardIfNeeded();
+    await updateTotals();
+    const channel = await client.channels.fetch(CHANNEL_ID);
+    const content = await buildLeaderboardMessage();
+
+    if (!leaderboardMessageId) {
+      const msg = await channel.send(content);
+      leaderboardMessageId = msg.id;
+    } else {
+      const msg = await channel.messages.fetch(leaderboardMessageId);
+      await msg.edit(content);
+    }
+
+    console.log('Leaderboard updated!');
+  } catch (err) {
+    console.error('Error updating leaderboard:', err);
   }
 }
 
-// -------------------- WEBHOOK --------------------
-const app = express();
-app.use(express.json());
-
-app.post('/webhook/ranch', async (req, res) => {
-  if (req.headers['x-webhook-secret'] !== WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
-
-  try {
-    const payload = req.body;
-    const username = payload.username.split(' ')[1]; // adjust if needed
-    const description = payload.embeds[0]?.description || '';
-
-    const milk = parseInt((description.match(/Milk: (\d+)/i) || [0,0])[1], 10);
-    const eggs = parseInt((description.match(/Eggs: (\d+)/i) || [0,0])[1], 10);
-    const cattle = parseInt((description.match(/Cattle: (\d+)/i) || [0,0])[1], 10);
-
-    await pool.query(
-      `INSERT INTO ranch_stats(username, milk, eggs, cattle)
-       VALUES($1, $2, $3, $4)
-       ON CONFLICT (username)
-       DO UPDATE SET milk=ranch_stats.milk+$2, eggs=ranch_stats.eggs+$3, cattle=ranch_stats.cattle+$4`,
-      [username, milk, eggs, cattle]
-    );
-
-    await updateLeaderboard();
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error');
-  }
-});
-
-// -------------------- START BOT --------------------
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Update leaderboard every 5 minutes
   updateLeaderboard();
+  setInterval(updateLeaderboard, 5 * 60 * 1000);
 });
 
-client.login('MTQ2NTAyMTUzMzkyNjk4MTg1OQ.Gnl20w.W4CHBZRgFirMqNAFbJUdbdwyQGNh_p4qChpg0s');
-app.listen(8080, () => console.log('Webhook server listening on port 8080'));
+client.login(process.env.DISCORD_TOKEN);
