@@ -2,29 +2,7 @@ import { Client, GatewayIntentBits, Events } from 'discord.js';
 import pkg from 'pg';
 const { Pool } = pkg;
 
-// --------------------
-// RAILWAY VARIABLES
-// --------------------
-const CHANNEL_ID = '1465062014626824347';
-const DISCORD_TOKEN = 'YOUR_DISCORD_TOKEN_HERE'; // replace with your current Railway token
-const PGHOST = 'postgres.railway.internal';
-const PGUSER = 'postgres';
-const PGPASSWORD = 'nZgFXhBgBmJxTXfqLDFrhhMOJyNQpOLA';
-const PGDATABASE = 'railway';
-const PGPORT = 5432;
-
-// --------------------
-// POSTGRES SETUP
-// --------------------
-const pool = new Pool({
-  host: PGHOST,
-  user: PGUSER,
-  password: PGPASSWORD,
-  database: PGDATABASE,
-  port: PGPORT,
-});
-
-// Make sure the leaderboard table exists
+// Ensure the leaderboard table exists
 await pool.query(`
   CREATE TABLE IF NOT EXISTS leaderboard (
     username TEXT PRIMARY KEY,
@@ -98,17 +76,28 @@ client.on(Events.MessageCreate, async (message) => {
 
   const username = message.author.username;
 
-  // Upsert the user in the database
+  // Upsert the user in the database safely
   await pool.query(`
-    INSERT INTO leaderboard (username, ${item}, total)
-    VALUES ($1, $2, $2 * 1)
+    INSERT INTO leaderboard (username, milk, eggs, cattle)
+    VALUES ($1, $2, $3, $4)
     ON CONFLICT (username)
     DO UPDATE SET
-      ${item} = leaderboard.${item} + EXCLUDED.${item},
-      total = (leaderboard.milk + CASE WHEN $3='milk' THEN $2 ELSE 0 END) +
-              (leaderboard.eggs + CASE WHEN $3='eggs' THEN $2 ELSE 0 END) +
-              (leaderboard.cattle + CASE WHEN $3='cattle' THEN $2 ELSE 0 END);
-  `, [username, amount, item]);
+      milk = leaderboard.milk + EXCLUDED.milk,
+      eggs = leaderboard.eggs + EXCLUDED.eggs,
+      cattle = leaderboard.cattle + EXCLUDED.cattle;
+  `, [
+    username,
+    item === 'milk' ? amount : 0,
+    item === 'eggs' ? amount : 0,
+    item === 'cattle' ? amount : 0
+  ]);
+
+  // Update total separately
+  await pool.query(`
+    UPDATE leaderboard
+    SET total = milk + eggs + cattle
+    WHERE username = $1
+  `, [username]);
 
   await updateLeaderboard();
 });
@@ -134,9 +123,6 @@ client.on('clientReady', async () => {
   }
 
   await updateLeaderboard();
-
-  // Poll every 10 seconds in case DB changes outside Discord
-  setInterval(updateLeaderboard, 10000);
 });
 
 // --------------------
