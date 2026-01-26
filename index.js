@@ -2,130 +2,146 @@ import { Client, GatewayIntentBits, Events } from 'discord.js';
 import pkg from 'pg';
 const { Pool } = pkg;
 
-// Ensure the leaderboard table exists
-await pool.query(`
-  CREATE TABLE IF NOT EXISTS leaderboard (
-    username TEXT PRIMARY KEY,
-    milk INT DEFAULT 0,
-    eggs INT DEFAULT 0,
-    cattle INT DEFAULT 0,
-    total NUMERIC DEFAULT 0
-  );
-`);
+// --------------------
+// RAILWAY VARIABLES
+// --------------------
+const CHANNEL_ID = '1465062014626824347';
+const DISCORD_TOKEN = 'YOUR_DISCORD_TOKEN_HERE'; // <-- paste your real bot token here
+const PGHOST = 'postgres.railway.internal';
+const PGUSER = 'postgres';
+const PGPASSWORD = 'nZgFXhBgBmJxTXfqLDFrhhMOJyNQpOLA';
+const PGDATABASE = 'railway';
+const PGPORT = 5432;
 
 // --------------------
-// DISCORD SETUP
+// POSTGRES SETUP
 // --------------------
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-let leaderboardMessageId = null;
+const pool = new Pool({
+  host: PGHOST,
+  user: PGUSER,
+  password: PGPASSWORD,
+  database: PGDATABASE,
+  port: PGPORT,
+});
 
-// --------------------
-// UPDATE LEADERBOARD
-// --------------------
-async function updateLeaderboard() {
-  try {
-    const res = await pool.query(`
-      SELECT username, milk, eggs, cattle, total
-      FROM leaderboard
-      ORDER BY total DESC
-      LIMIT 10
-    `);
+// Wrap everything in an async main function
+async function main() {
+  // Ensure leaderboard table exists
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS leaderboard (
+      username TEXT PRIMARY KEY,
+      milk INT DEFAULT 0,
+      eggs INT DEFAULT 0,
+      cattle INT DEFAULT 0,
+      total NUMERIC DEFAULT 0
+    );
+  `);
 
-    let content = '🏆 Beaver Farms — Leaderboard\n';
-    if (res.rows.length === 0) {
-      content += 'No data yet.';
-    } else {
-      for (const row of res.rows) {
-        content += `${row.username.toUpperCase()}\n`;
-        content += `🥛 Milk: ${row.milk}\n`;
-        content += `🥚 Eggs: ${row.eggs}\n`;
-        content += `🐄 Cattle: ${row.cattle}\n`;
-        content += `💰 Total: $${row.total.toFixed(2)}\n\n`;
+  // --------------------
+  // DISCORD SETUP
+  // --------------------
+  const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+  let leaderboardMessageId = null;
+
+  // --------------------
+  // UPDATE LEADERBOARD
+  // --------------------
+  async function updateLeaderboard() {
+    try {
+      const res = await pool.query(`
+        SELECT username, milk, eggs, cattle, total
+        FROM leaderboard
+        ORDER BY total DESC
+        LIMIT 10
+      `);
+
+      let content = '🏆 Beaver Farms — Leaderboard\n';
+      if (res.rows.length === 0) {
+        content += 'No data yet.';
+      } else {
+        for (const row of res.rows) {
+          content += `${row.username.toUpperCase()}\n`;
+          content += `🥛 Milk: ${row.milk}\n`;
+          content += `🥚 Eggs: ${row.eggs}\n`;
+          content += `🐄 Cattle: ${row.cattle}\n`;
+          content += `💰 Total: $${row.total.toFixed(2)}\n\n`;
+        }
       }
+
+      const channel = await client.channels.fetch(CHANNEL_ID);
+      if (leaderboardMessageId) {
+        const msg = await channel.messages.fetch(leaderboardMessageId);
+        await msg.edit(content);
+      } else {
+        const msg = await channel.send(content);
+        leaderboardMessageId = msg.id;
+      }
+    } catch (err) {
+      console.error('Error updating leaderboard:', err);
     }
+  }
+
+  // --------------------
+  // HANDLE NEW ENTRIES
+  // --------------------
+  client.on(Events.MessageCreate, async (message) => {
+    if (message.author.bot) return;
+    if (!message.content.startsWith('!add')) return;
+
+    const parts = message.content.split(' ');
+    if (parts.length !== 3) return;
+
+    const item = parts[1].toLowerCase();
+    const amount = parseInt(parts[2]);
+    if (!['milk', 'eggs', 'cattle'].includes(item)) return;
+    if (isNaN(amount)) return;
+
+    const username = message.author.username;
+
+    // Upsert
+    await pool.query(`
+      INSERT INTO leaderboard (username, ${item}, total)
+      VALUES ($1, $2, $2)
+      ON CONFLICT (username)
+      DO UPDATE SET
+        ${item} = leaderboard.${item} + EXCLUDED.${item},
+        total = leaderboard.milk + leaderboard.eggs + leaderboard.cattle + EXCLUDED.${item};
+    `, [username, amount]);
+
+    await updateLeaderboard();
+  });
+
+  // --------------------
+  // CLIENT READY
+  // --------------------
+  client.on('clientReady', async () => {
+    console.log(`Logged in as ${client.user.tag}`);
 
     const channel = await client.channels.fetch(CHANNEL_ID);
+    const messages = await channel.messages.fetch({ limit: 10 });
+    const lastLeaderboard = messages.find(
+      (msg) =>
+        msg.author.id === client.user.id &&
+        msg.content.startsWith('🏆 Beaver Farms — Leaderboard')
+    );
+    if (lastLeaderboard) leaderboardMessageId = lastLeaderboard.id;
 
-    if (leaderboardMessageId) {
-      const msg = await channel.messages.fetch(leaderboardMessageId);
-      await msg.edit(content);
-    } else {
-      const msg = await channel.send(content);
+    if (!leaderboardMessageId) {
+      const msg = await channel.send('🏆 Beaver Farms — Leaderboard\nFetching data...');
       leaderboardMessageId = msg.id;
     }
-  } catch (err) {
-    console.error('Error updating leaderboard:', err);
-  }
+
+    await updateLeaderboard();
+
+    // Poll every 10 seconds just in case
+    setInterval(updateLeaderboard, 10000);
+  });
+
+  // --------------------
+  // LOGIN
+  // --------------------
+  client.login(DISCORD_TOKEN);
 }
 
-// --------------------
-// HANDLE NEW ENTRIES
-// --------------------
-// Example command format: "!add milk 5" or "!add eggs 3"
-client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) return;
-  if (!message.content.startsWith('!add')) return;
-
-  const parts = message.content.split(' ');
-  if (parts.length !== 3) return;
-
-  const item = parts[1].toLowerCase();
-  const amount = parseInt(parts[2]);
-  if (!['milk', 'eggs', 'cattle'].includes(item)) return;
-  if (isNaN(amount)) return;
-
-  const username = message.author.username;
-
-  // Upsert the user in the database safely
-  await pool.query(`
-    INSERT INTO leaderboard (username, milk, eggs, cattle)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (username)
-    DO UPDATE SET
-      milk = leaderboard.milk + EXCLUDED.milk,
-      eggs = leaderboard.eggs + EXCLUDED.eggs,
-      cattle = leaderboard.cattle + EXCLUDED.cattle;
-  `, [
-    username,
-    item === 'milk' ? amount : 0,
-    item === 'eggs' ? amount : 0,
-    item === 'cattle' ? amount : 0
-  ]);
-
-  // Update total separately
-  await pool.query(`
-    UPDATE leaderboard
-    SET total = milk + eggs + cattle
-    WHERE username = $1
-  `, [username]);
-
-  await updateLeaderboard();
-});
-
-// --------------------
-// CLIENT READY
-// --------------------
-client.on('clientReady', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-
-  const channel = await client.channels.fetch(CHANNEL_ID);
-  const messages = await channel.messages.fetch({ limit: 10 });
-  const lastLeaderboard = messages.find(
-    (msg) =>
-      msg.author.id === client.user.id &&
-      msg.content.startsWith('🏆 Beaver Farms — Leaderboard')
-  );
-  if (lastLeaderboard) leaderboardMessageId = lastLeaderboard.id;
-
-  if (!leaderboardMessageId) {
-    const msg = await channel.send('🏆 Beaver Farms — Leaderboard\nFetching data...');
-    leaderboardMessageId = msg.id;
-  }
-
-  await updateLeaderboard();
-});
-
-// --------------------
-// LOGIN
-// --------------------
-client.login(DISCORD_TOKEN);
+// Call main
+main().catch(err => console.error(err));
