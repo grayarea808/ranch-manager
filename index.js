@@ -10,7 +10,7 @@ const pool = new Pool({
   database: process.env.PGDATABASE,
   password: process.env.PGPASSWORD,
   port: Number(process.env.PGPORT),
-  ssl: { rejectUnauthorized: false } // Railway requires this
+  ssl: { rejectUnauthorized: false } // Required on Railway
 });
 
 // ---------------------
@@ -18,35 +18,45 @@ const pool = new Pool({
 // ---------------------
 import express from 'express';
 import { Client, GatewayIntentBits } from 'discord.js';
-
-const app = express();
-app.use(express.json());
+import bodyParser from 'body-parser';
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
+const app = express();
+app.use(bodyParser.json());
+
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
 // ---------------------
-// Weekly Reset Setup
+// Helper: Reset Leaderboard Weekly
 // ---------------------
 async function resetLeaderboardIfNeeded() {
-  const result = await pool.query(`SELECT last_reset FROM leaderboard_reset LIMIT 1`);
-  const now = new Date();
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS leaderboard_reset (
+        id SERIAL PRIMARY KEY,
+        last_reset TIMESTAMP NOT NULL
+      );
+    `);
 
-  if (!result.rows[0]) {
-    await pool.query(`INSERT INTO leaderboard_reset(last_reset) VALUES($1)`, [now]);
-    return;
-  }
+    const { rows } = await pool.query(`SELECT last_reset FROM leaderboard_reset ORDER BY last_reset DESC LIMIT 1`);
+    const lastReset = rows[0]?.last_reset;
+    const now = new Date();
 
-  const lastReset = new Date(result.rows[0].last_reset);
-  const diffDays = Math.floor((now - lastReset) / (1000 * 60 * 60 * 24));
-
-  if (diffDays >= 7) {
-    await pool.query(`UPDATE ranch_stats SET milk = 0, eggs = 0, cattle = 0`);
-    await pool.query(`UPDATE leaderboard_reset SET last_reset = $1`, [now]);
-    console.log('Leaderboard reset for new week!');
+    if (!lastReset || now - new Date(lastReset) > 7 * 24 * 60 * 60 * 1000) {
+      // Reset ranch stats
+      await pool.query(`UPDATE ranch_stats SET milk = 0, eggs = 0, cattle = 0`);
+      if (lastReset) {
+        await pool.query(`UPDATE leaderboard_reset SET last_reset = $1 WHERE id = 1`, [now]);
+      } else {
+        await pool.query(`INSERT INTO leaderboard_reset(last_reset) VALUES ($1)`, [now]);
+      }
+      console.log('Leaderboard reset for the week!');
+    }
+  } catch (err) {
+    console.error('Error resetting leaderboard:', err);
   }
 }
 
@@ -54,12 +64,12 @@ async function resetLeaderboardIfNeeded() {
 // Update Leaderboard
 // ---------------------
 async function updateLeaderboard() {
-  try {
-    await resetLeaderboardIfNeeded();
+  await resetLeaderboardIfNeeded();
 
+  try {
     const result = await pool.query(`
       SELECT username, milk, eggs, cattle,
-        (milk * 1.25 + eggs * 1.25 + cattle * 160) AS total
+      (milk*1.25 + eggs*1.25 + cattle*160) AS total
       FROM ranch_stats
       ORDER BY total DESC
       LIMIT 10
@@ -77,8 +87,9 @@ async function updateLeaderboard() {
     const channel = await client.channels.fetch(CHANNEL_ID);
     if (!channel) return console.error('Channel not found!');
 
+    // Fetch last 10 messages and edit the one from this bot
     const messages = await channel.messages.fetch({ limit: 10 });
-    const botMessage = messages.find(m => m.author.id === client.user.id);
+    const botMessage = messages.find(m => m.author.id === client.user.id && m.content.startsWith('🏆 Beaver Farms'));
     if (botMessage) {
       await botMessage.edit(leaderboardMessage);
     } else {
@@ -92,61 +103,61 @@ async function updateLeaderboard() {
 }
 
 // ---------------------
-// Webhook Endpoint
+// Webhook Listener
 // ---------------------
 app.post('/webhook/ranch', async (req, res) => {
-  const data = req.body;
-  console.log('📩 Webhook received!', data);
-
   try {
-    // Example payload parsing
-    // Adjust this mapping depending on your game's webhook
-    const username = data.username || 'Unknown';
+    const data = req.body;
+
+    // Example payload parsing: add eggs/milk/cattle automatically
+    const username = data.username;
     let milk = 0, eggs = 0, cattle = 0;
 
-    if (data.embeds?.length) {
-      const desc = data.embeds[0].description || '';
-      const milkMatch = desc.match(/Added Milk.*?: (\d+)/);
-      const eggsMatch = desc.match(/Added Eggs.*?: (\d+)/);
-      const cattleMatch = desc.match(/Added Cattle.*?: (\d+)/);
-
-      if (milkMatch) milk = parseInt(milkMatch[1]);
-      if (eggsMatch) eggs = parseInt(eggsMatch[1]);
-      if (cattleMatch) cattle = parseInt(cattleMatch[1]);
+    if (data.embeds?.[0]?.title?.includes('Eggs Added')) {
+      eggs = Number(data.embeds[0].description.split(':').pop().trim());
+    }
+    if (data.embeds?.[0]?.title?.includes('Milk Added')) {
+      milk = Number(data.embeds[0].description.split(':').pop().trim());
+    }
+    if (data.embeds?.[0]?.title?.includes('Cattle Sold')) {
+      cattle = Number(data.embeds[0].description.split(':').pop().trim());
     }
 
-    // Upsert into ranch_stats
+    // Upsert user in ranch_stats
     await pool.query(`
       INSERT INTO ranch_stats(username, milk, eggs, cattle)
       VALUES ($1, $2, $3, $4)
-      ON CONFLICT (username)
-      DO UPDATE SET
-        milk = ranch_stats.milk + EXCLUDED.milk,
-        eggs = ranch_stats.eggs + EXCLUDED.eggs,
-        cattle = ranch_stats.cattle + EXCLUDED.cattle
+      ON CONFLICT (username) DO UPDATE
+      SET milk = ranch_stats.milk + $2,
+          eggs = ranch_stats.eggs + $3,
+          cattle = ranch_stats.cattle + $4
     `, [username, milk, eggs, cattle]);
 
+    console.log('📩 Webhook received!', data);
     await updateLeaderboard();
-    res.status(200).send('Webhook processed');
+    res.status(200).send('OK');
   } catch (err) {
-    console.error('Webhook error:', err);
-    res.status(500).send('Error processing webhook');
+    console.error('Error processing webhook:', err);
+    res.status(500).send('Error');
   }
 });
 
 // ---------------------
-// Start Servers
+// Start Webhook Server
 // ---------------------
-app.listen(8080, () => {
-  console.log('Webhook server listening on port 8080');
-});
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Webhook server listening on port ${PORT}`));
 
+// ---------------------
+// Discord Bot Ready
+// ---------------------
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
   updateLeaderboard();
-  setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 minutes
+  setInterval(updateLeaderboard, 5 * 60 * 1000); // every 5 min
 });
 
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-  console.error('🚨 Failed to login Discord bot:', err);
-});
+// ---------------------
+// Login Discord Bot
+// ---------------------
+client.login(process.env.DISCORD_TOKEN).catch(err => console.error('Failed to login Discord bot:', err));
