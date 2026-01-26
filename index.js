@@ -16,7 +16,7 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
-const DISCORD_CHANNEL_ID = "YOUR_DISCORD_CHANNEL_ID"; // leaderboard channel
+const DISCORD_CHANNEL_ID = 1465062014626824347; // leaderboard channel
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
 client.on("clientReady", () => {
@@ -118,3 +118,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚜 Ranch Manager running on port ${PORT}`);
 });
+
