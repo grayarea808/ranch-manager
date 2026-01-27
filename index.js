@@ -100,9 +100,3 @@ app.listen(PORT, () => {
     console.log(`🚀 Webhook running on port ${PORT}`);
 });
 
-// Discord login
-client.once("ready", () => {
-    console.log(`🚜 Ranch Manager running as ${client.user.tag}`);
-});
-
-client.login("YOUR_DISCORD_BOT_TOKEN");
