@@ -1,67 +1,79 @@
 import express from 'express';
-import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
-import dotenv from 'dotenv';
-
-dotenv.config();
+import { Client, GatewayIntentBits, Partials } from 'discord.js';
 
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
-const BOT_TOKEN = process.env.BOT_TOKEN;
+// ----- CONFIG -----
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const LEADERBOARD_CHANNEL_ID = '1465062014626824347';
 
 // Prices
 const PRICE_MILK = 1.25;
 const PRICE_EGGS = 1.25;
 const PRICE_CATTLE = 160;
 
-// In-memory storage for ranch data
-let ranchData = {};
-let leaderboardMessageId = null;
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-
-client.once('clientReady', async () => {
-  console.log(`🚜 Ranch Manager running as ${client.user.tag}`);
-
-  // Fetch the channel and existing message if stored
-  try {
-    const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
-    if (channel && channel.isTextBased()) {
-      const messages = await channel.messages.fetch({ limit: 50 });
-      const existing = messages.find(m => m.author.id === client.user.id);
-      if (existing) leaderboardMessageId = existing.id;
-      updateLeaderboard(); // initial render
-    }
-  } catch (err) {
-    console.error('Error fetching leaderboard channel:', err);
-  }
+// ----- DISCORD CLIENT -----
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  partials: [Partials.Channel]
 });
 
-// Function to update or send the single leaderboard message
-async function updateLeaderboard() {
-  const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) return;
+// ----- RANCH DATA -----
+let ranchData = {}; // { username: { milk: 0, eggs: 0, cattle: 0 } }
+let leaderboardMessageId = null;
 
-  // Build leaderboard content
-  let content = '🏆 Beaver Farms — Leaderboard\n\n';
-  for (const [username, data] of Object.entries(ranchData)) {
-    const total =
-      data.milk * PRICE_MILK +
-      data.eggs * PRICE_EGGS +
-      data.cattle * PRICE_CATTLE;
-    content += `@${username} ${username}\n`;
-    content += `🥛 Milk: ${data.milk}\n`;
-    content += `🥚 Eggs: ${data.eggs}\n`;
-    content += `🐄 Cattle: ${data.cattle}\n`;
-    content += `💰 Total: $${total.toFixed(2)}\n\n`;
+// ----- WEBHOOK -----
+app.post('/webhook', (req, res) => {
+  const { username, milk = 0, eggs = 0, cattle = 0 } = req.body;
+
+  if (!ranchData[username]) {
+    ranchData[username] = { milk: 0, eggs: 0, cattle: 0 };
   }
 
+  ranchData[username].milk += milk;
+  ranchData[username].eggs += eggs;
+  ranchData[username].cattle += cattle;
+
+  updateLeaderboard();
+
+  res.sendStatus(200);
+});
+
+// ----- UPDATE LEADERBOARD -----
+async function updateLeaderboard() {
   try {
+    const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
+    if (!channel || !channel.isTextBased()) return;
+
+    // Build leaderboard content
+    let content = '🏆 Beaver Farms — Leaderboard\n\n';
+    for (const [username, data] of Object.entries(ranchData)) {
+      const total =
+        data.milk * PRICE_MILK +
+        data.eggs * PRICE_EGGS +
+        data.cattle * PRICE_CATTLE;
+
+      content += `@${username} ${username}\n`;
+      content += `🥛 Milk: ${data.milk}\n`;
+      content += `🥚 Eggs: ${data.eggs}\n`;
+      content += `🐄 Cattle: ${data.cattle}\n`;
+      content += `💰 Total: $${total.toFixed(2)}\n\n`;
+    }
+
+    // Edit existing message if possible
     if (leaderboardMessageId) {
-      const message = await channel.messages.fetch(leaderboardMessageId);
-      await message.edit(content);
+      try {
+        const message = await channel.messages.fetch(leaderboardMessageId);
+        await message.edit(content);
+      } catch (err) {
+        if (err.code === 10008) { // Message deleted
+          const message = await channel.send(content);
+          leaderboardMessageId = message.id;
+        } else {
+          throw err;
+        }
+      }
     } else {
       const message = await channel.send(content);
       leaderboardMessageId = message.id;
@@ -71,20 +83,9 @@ async function updateLeaderboard() {
   }
 }
 
-// Webhook endpoint for adding milk, eggs, cattle
-app.post('/webhook', (req, res) => {
-  const { username, milk = 0, eggs = 0, cattle = 0 } = req.body;
-  if (!username) return res.status(400).send('Missing username');
+// ----- START SERVER & DISCORD -----
+app.listen(8080, () => console.log('🚀 Webhook running on port 8080'));
 
-  if (!ranchData[username]) ranchData[username] = { milk: 0, eggs: 0, cattle: 0 };
-  ranchData[username].milk += milk;
-  ranchData[username].eggs += eggs;
-  ranchData[username].cattle += cattle;
-
-  updateLeaderboard();
-  res.send('Ranch data updated');
-});
-
-app.listen(PORT, () => console.log(`🚀 Webhook running on port ${PORT}`));
-
-client.login(BOT_TOKEN);
+client.login(DISCORD_TOKEN)
+  .then(() => console.log(`🚜 Ranch Manager running as ${client.user.tag}`))
+  .catch(console.error);
