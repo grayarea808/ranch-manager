@@ -1,106 +1,108 @@
-import express from 'express';
-import { Client, GatewayIntentBits, Partials } from 'discord.js';
+import express from "express";
+import bodyParser from "body-parser";
+import { Client, GatewayIntentBits, Partials } from "discord.js";
 
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-// ----- CONFIG -----
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const LEADERBOARD_CHANNEL_ID = '1465062014626824347';
+const PORT = 8080;
 
 // Prices
-const PRICE_MILK = 1.25;
-const PRICE_EGGS = 1.25;
-const PRICE_CATTLE = 160;
+const MILK_PRICE = 1.25;
+const EGGS_PRICE = 1.25;
+const CATTLE_PRICE = 160;
 
-// ----- DISCORD CLIENT -----
+// Discord setup
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-  partials: [Partials.Channel]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+    partials: [Partials.Channel]
 });
 
-// ----- RANCH DATA -----
-// Track harvested and sold amounts separately
-let ranchData = {}; 
-// Structure: { username: { milk: 0, eggs: 0, cattle: 0, soldCattle: 0 } }
+const LEADERBOARD_CHANNEL_ID = "1465062014626824347"; // Your channel ID
+let leaderboardMessageId = null; // We'll store the message ID here
+const players = {}; // userID => stats
 
-let leaderboardMessageId = null;
-
-// ----- WEBHOOK -----
-// Receive updates automatically
-app.post('/webhook', (req, res) => {
-  const { username, milk = 0, eggs = 0, cattle = 0, soldCattle = 0 } = req.body;
-
-  if (!ranchData[username]) {
-    ranchData[username] = { milk: 0, eggs: 0, cattle: 0, soldCattle: 0 };
-  }
-
-  // Add harvested milk and eggs
-  ranchData[username].milk += milk;
-  ranchData[username].eggs += eggs;
-
-  // Add new cattle
-  ranchData[username].cattle += cattle;
-
-  // Handle sold cattle
-  ranchData[username].cattle -= soldCattle;
-  ranchData[username].soldCattle += soldCattle;
-
-  if (ranchData[username].cattle < 0) ranchData[username].cattle = 0;
-
-  res.sendStatus(200);
-});
-
-// ----- UPDATE LEADERBOARD -----
-async function updateLeaderboard() {
-  try {
-    const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
-    if (!channel || !channel.isTextBased()) return;
-
-    // Build leaderboard
-    let content = '🏆 Beaver Farms — Leaderboard\n\n';
-    for (const [username, data] of Object.entries(ranchData)) {
-      const total =
-        data.milk * PRICE_MILK +
-        data.eggs * PRICE_EGGS +
-        data.cattle * PRICE_CATTLE +
-        data.soldCattle * PRICE_CATTLE;
-
-      content += `@${username} ${username}\n`;
-      content += `🥛 Milk: ${data.milk}\n`;
-      content += `🥚 Eggs: ${data.eggs}\n`;
-      content += `🐄 Cattle: ${data.cattle} (+${data.soldCattle} sold)\n`;
-      content += `💰 Total: $${total.toFixed(2)}\n\n`;
-    }
-
-    // Edit existing message if possible
-    if (leaderboardMessageId) {
-      try {
-        const message = await channel.messages.fetch(leaderboardMessageId);
-        await message.edit(content);
-      } catch (err) {
-        if (err.code === 10008) { // message deleted
-          const message = await channel.send(content);
-          leaderboardMessageId = message.id;
-        } else {
-          throw err;
-        }
-      }
-    } else {
-      const message = await channel.send(content);
-      leaderboardMessageId = message.id;
-    }
-  } catch (err) {
-    console.error('❌ Error updating leaderboard:', err);
-  }
+// Helper to calculate total value
+function calculateTotal(player) {
+    return (player.milk * MILK_PRICE) +
+           (player.eggs * EGGS_PRICE) +
+           (player.soldCattle * CATTLE_PRICE);
 }
 
-// ----- AUTO UPDATE TIMER -----
-setInterval(updateLeaderboard, 5000);
+// Build leaderboard text
+function buildLeaderboard() {
+    let text = "🏆 Beaver Farms — Leaderboard\n\n";
+    for (const id in players) {
+        const p = players[id];
+        text += `<@${id}> ${p.username}\n`;
+        text += `🥛 Milk: ${p.milk}\n`;
+        text += `🥚 Eggs: ${p.eggs}\n`;
+        text += `🐄 Cattle: ${p.cattle} (+${p.soldCattle} sold)\n`;
+        text += `💰 Total: $${calculateTotal(p).toFixed(2)}\n\n`;
+    }
+    return text;
+}
 
-// ----- START SERVER & DISCORD -----
-app.listen(8080, () => console.log('🚀 Webhook running on port 8080'));
+// Update leaderboard message (send if first time, edit if exists)
+async function updateLeaderboard() {
+    try {
+        const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
+        const content = buildLeaderboard();
 
-client.login(DISCORD_TOKEN)
-  .then(() => console.log(`🚜 Ranch Manager running as ${client.user.tag}`))
-  .catch(console.error);
+        if (!leaderboardMessageId) {
+            const msg = await channel.send(content);
+            leaderboardMessageId = msg.id;
+        } else {
+            const msg = await channel.messages.fetch(leaderboardMessageId);
+            await msg.edit(content);
+        }
+
+        console.log("✅ Leaderboard updated!");
+    } catch (err) {
+        console.error("❌ Error updating leaderboard:", err);
+    }
+}
+
+// Webhook endpoint
+app.post("/webhook", async (req, res) => {
+    const data = req.body;
+    if (!data.id || !data.username) {
+        return res.status(400).send("Missing id or username");
+    }
+
+    // Initialize player if new
+    if (!players[data.id]) {
+        players[data.id] = {
+            username: data.username,
+            milk: 0,
+            eggs: 0,
+            cattle: 0,
+            soldCattle: 0
+        };
+    }
+
+    // Update stats
+    if (data.milk) players[data.id].milk += data.milk;
+    if (data.eggs) players[data.id].eggs += data.eggs;
+    if (data.cattle) players[data.id].cattle += data.cattle;
+    if (data.soldCattle) {
+        players[data.id].soldCattle += data.soldCattle;
+        players[data.id].cattle -= data.soldCattle;
+        if (players[data.id].cattle < 0) players[data.id].cattle = 0;
+    }
+
+    await updateLeaderboard();
+    res.sendStatus(200);
+});
+
+// Start Express
+app.listen(PORT, () => {
+    console.log(`🚀 Webhook running on port ${PORT}`);
+});
+
+// Discord login
+client.once("ready", () => {
+    console.log(`🚜 Ranch Manager running as ${client.user.tag}`);
+});
+
+client.login("YOUR_DISCORD_BOT_TOKEN");
