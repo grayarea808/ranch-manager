@@ -1,122 +1,103 @@
-import express from "express";
-import bodyParser from "body-parser";
-import { Client, GatewayIntentBits } from "discord.js";
-import pg from "pg";
+// index.js
+import express from 'express';
+import dotenv from 'dotenv';
+import { Client, GatewayIntentBits, TextChannel } from 'discord.js';
+import cron from 'node-cron';
 
-const { Pool } = pg;
+dotenv.config();
 
-// ---- DATABASE SETUP ----
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // Railway Postgres
-  ssl: { rejectUnauthorized: false }
-});
+const app = express();
+app.use(express.json());
 
-// ---- DISCORD SETUP ----
+// Discord bot setup
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
+  intents: [
+    GatewayIntentBits.Guilds,          // Needed to access channels
+    GatewayIntentBits.GuildMembers,    // Needed to track new users
+    GatewayIntentBits.GuildMessages    // Needed to send messages
+  ]
 });
 
-const DISCORD_CHANNEL_ID = 1465062014626824347; // leaderboard channel
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
+const PORT = process.env.PORT || 8080;
 
-client.on("clientReady", () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+// In-memory leaderboard (use DB in production)
+let leaderboard = {};
+
+// Helper to calculate total value (example)
+function calculateTotal(user) {
+  const milk = user.milk || 0;
+  const eggs = user.eggs || 0;
+  const cattle = user.cattle || 0;
+  return milk * 2 + eggs * 1 + cattle * 10; // simple pricing
+}
+
+// Update leaderboard message in Discord
+async function updateLeaderboard() {
+  try {
+    const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
+    if (!channel || !(channel instanceof TextChannel)) {
+      console.error('Leaderboard channel is invalid.');
+      return;
+    }
+
+    let message = '🏆 Beaver Farms — Leaderboard\n\n';
+    for (const username in leaderboard) {
+      const user = leaderboard[username];
+      const total = calculateTotal(user);
+      message += `**${username}**\n`;
+      message += `🥛 Milk: ${user.milk || 0}\n`;
+      message += `🥚 Eggs: ${user.eggs || 0}\n`;
+      message += `🐄 Cattle: ${user.cattle || 0}\n`;
+      message += `💰 Total: $${total}\n\n`;
+    }
+
+    // Send message
+    await channel.send(message);
+    console.log('📊 Leaderboard updated');
+  } catch (err) {
+    console.error('❌ Error updating leaderboard:', err);
+  }
+}
+
+// Webhook endpoint to update leaderboard
+app.post('/webhook', (req, res) => {
+  const { username, milk = 0, eggs = 0, cattle = 0 } = req.body;
+  if (!username) return res.status(400).send('Username required');
+
+  if (!leaderboard[username]) {
+    leaderboard[username] = { milk: 0, eggs: 0, cattle: 0 };
+  }
+
+  leaderboard[username].milk += milk;
+  leaderboard[username].eggs += eggs;
+  leaderboard[username].cattle += cattle;
+
+  updateLeaderboard(); // update Discord immediately
+  res.send('Leaderboard updated');
+});
+
+// Track new guild members automatically
+client.on('guildMemberAdd', member => {
+  if (!leaderboard[member.user.username]) {
+    leaderboard[member.user.username] = { milk: 0, eggs: 0, cattle: 0 };
+    updateLeaderboard();
+  }
+});
+
+// Weekly reset: every Sunday at 00:00
+cron.schedule('0 0 * * 0', () => {
+  console.log('🔄 Resetting leaderboard for new week');
+  leaderboard = {};
   updateLeaderboard();
 });
 
-client.login(BOT_TOKEN);
+// Start Express server
+app.listen(PORT, () => console.log(`🚜 Ranch Manager running on port ${PORT}`));
 
-// ---- EXPRESS SETUP ----
-const app = express();
-app.use(bodyParser.json());
-
-app.post("/webhook", async (req, res) => {
-  try {
-    const { username, eggs = 0, milk = 0, cattle = 0 } = req.body;
-
-    // Check if user exists
-    const userResult = await pool.query(
-      "SELECT * FROM users WHERE username=$1",
-      [username]
-    );
-
-    if (userResult.rows.length === 0) {
-      // New user, insert
-      await pool.query(
-        "INSERT INTO users(username, eggs, milk, cattle, total) VALUES($1,$2,$3,$4,$5)",
-        [username, eggs, milk, cattle, eggs + milk + cattle]
-      );
-    } else {
-      // Existing user, update
-      const user = userResult.rows[0];
-      const newEggs = user.eggs + eggs;
-      const newMilk = user.milk + milk;
-      const newCattle = user.cattle + cattle;
-      const total = newEggs + newMilk + newCattle;
-
-      await pool.query(
-        "UPDATE users SET eggs=$1, milk=$2, cattle=$3, total=$4 WHERE username=$5",
-        [newEggs, newMilk, newCattle, total, username]
-      );
-    }
-
-    // Update Discord leaderboard
-    await updateLeaderboard();
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message });
-  }
+// Login Discord bot
+client.once('ready', () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-// ---- LEADERBOARD FUNCTION ----
-async function updateLeaderboard() {
-  try {
-    const result = await pool.query(
-      "SELECT username, eggs, milk, cattle, total FROM users ORDER BY total DESC"
-    );
-
-    const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
-    if (!channel) return;
-
-    let leaderboardText = "🏆 Beaver Farms — Leaderboard\n\n";
-
-    result.rows.forEach((row) => {
-      leaderboardText += `${row.username}\n🥛 Milk: ${row.milk}\n🥚 Eggs: ${row.eggs}\n🐄 Cattle: ${row.cattle}\n💰 Total: $${row.total.toFixed(2)}\n\n`;
-    });
-
-    await channel.send(leaderboardText);
-    console.log("📊 Leaderboard updated");
-  } catch (err) {
-    console.error("❌ Error updating leaderboard:", err);
-  }
-}
-
-// ---- WEEKLY RESET ----
-function scheduleWeeklyReset() {
-  setInterval(async () => {
-    const now = new Date();
-    if (now.getDay() === 0 && now.getHours() === 0 && now.getMinutes() === 0) {
-      console.log("🔄 Weekly reset triggered");
-
-      try {
-        await pool.query("UPDATE users SET eggs=0, milk=0, cattle=0, total=0");
-        console.log("✅ All ranch stats reset for the new week");
-        await updateLeaderboard();
-      } catch (err) {
-        console.error("❌ Error during weekly reset:", err);
-      }
-    }
-  }, 60 * 1000);
-}
-
-scheduleWeeklyReset();
-
-// ---- START SERVER ----
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚜 Ranch Manager running on port ${PORT}`);
-});
-
-
+client.login(process.env.DISCORD_TOKEN);
