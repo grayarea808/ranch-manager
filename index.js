@@ -2,48 +2,55 @@ import express from "express";
 import bodyParser from "body-parser";
 import { Client, GatewayIntentBits, Partials } from "discord.js";
 
-const app = express();
-app.use(bodyParser.json());
-
+// ================== CONFIG ==================
 const PORT = 8080;
+const LEADERBOARD_CHANNEL_ID = "1465062014626824347";
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
 // Prices
 const MILK_PRICE = 1.25;
 const EGGS_PRICE = 1.25;
 const CATTLE_PRICE = 160;
 
-// Discord setup
+// ================== EXPRESS ==================
+const app = express();
+app.use(bodyParser.json());
+
+// ================== DISCORD ==================
 const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
     partials: [Partials.Channel]
 });
 
-const LEADERBOARD_CHANNEL_ID = "1465062014626824347"; // Your channel ID
-let leaderboardMessageId = null; // We'll store the message ID here
-const players = {}; // userID => stats
+let leaderboardMessageId = null;
+const players = {}; // discordId => stats
 
-// Helper to calculate total value
-function calculateTotal(player) {
-    return (player.milk * MILK_PRICE) +
-           (player.eggs * EGGS_PRICE) +
-           (player.soldCattle * CATTLE_PRICE);
+client.once("clientReady", () => {
+    console.log(`🚜 Ranch Manager running as ${client.user.tag}`);
+});
+
+// ================== HELPERS ==================
+function calculateTotal(p) {
+    return (p.milk * MILK_PRICE) +
+           (p.eggs * EGGS_PRICE) +
+           (p.soldCattle * CATTLE_PRICE);
 }
 
-// Build leaderboard text
 function buildLeaderboard() {
-    let text = "🏆 Beaver Farms — Leaderboard\n\n";
+    let text = "🏆 **Beaver Farms — Leaderboard**\n\n";
+
     for (const id in players) {
         const p = players[id];
-        text += `<@${id}> ${p.username}\n`;
+        text += `<@${id}> **${p.username}**\n`;
         text += `🥛 Milk: ${p.milk}\n`;
         text += `🥚 Eggs: ${p.eggs}\n`;
         text += `🐄 Cattle: ${p.cattle} (+${p.soldCattle} sold)\n`;
         text += `💰 Total: $${calculateTotal(p).toFixed(2)}\n\n`;
     }
+
     return text;
 }
 
-// Update leaderboard message (send if first time, edit if exists)
 async function updateLeaderboard() {
     try {
         const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
@@ -57,26 +64,43 @@ async function updateLeaderboard() {
             await msg.edit(content);
         }
 
-        console.log("✅ Leaderboard updated!");
+        console.log("✅ Leaderboard updated");
     } catch (err) {
-        console.error("❌ Error updating leaderboard:", err);
+        console.error("❌ Error updating leaderboard:", err.code || err.message);
     }
 }
 
-// Webhook endpoint
+// ================== WEBHOOK ==================
 app.post("/webhook", async (req, res) => {
-    const data = req.body;
+    let data = req.body;
 
-    // Log the raw webhook for debugging
-    console.log("⚡ Incoming webhook data:", data);
+    // 🔴 RedM often sends stringified JSON
+    if (typeof data.data === "string") {
+        try {
+            data = JSON.parse(data.data);
+        } catch {
+            console.error("❌ Failed to parse RedM payload");
+        }
+    }
 
-    // Attempt to map fields from different possible keys
-    const id = data.id ?? data.userId ?? data.discordId;
-    const username = data.username ?? data.name ?? "Unknown";
+    console.log("⚡ RedM webhook:", data);
 
-    if (!id) return res.status(400).send("Missing player id");
+    const id =
+        data.id ||
+        data.playerId ||
+        data.discord ||
+        data.discordId;
 
-    // Initialize player if new
+    const username =
+        data.username ||
+        data.playerName ||
+        data.name;
+
+    if (!id || !username) {
+        console.warn("⚠️ Missing Discord ID or username");
+        return res.sendStatus(200);
+    }
+
     if (!players[id]) {
         players[id] = {
             username,
@@ -87,31 +111,39 @@ app.post("/webhook", async (req, res) => {
         };
     }
 
-    // Update stats using flexible keys
-    players[id].milk += data.milk ?? data.milkCount ?? 0;
-    players[id].eggs += data.eggs ?? data.eggCount ?? 0;
-    players[id].cattle += data.cattle ?? data.cattleCount ?? 0;
+    const amount = Number(data.amount || data.count || 1);
 
-    // Sold cattle handling
-    const sold = data.soldCattle ?? data.cattleSold ?? 0;
-    if (sold > 0) {
-        players[id].soldCattle += sold;
-        players[id].cattle -= sold;
-        if (players[id].cattle < 0) players[id].cattle = 0;
+    // 🥛 MILK
+    if (data.item === "milk" || data.event === "cow_milked") {
+        players[id].milk += amount;
+    }
+
+    // 🥚 EGGS
+    if (data.item === "egg" || data.event === "chicken_eggs") {
+        players[id].eggs += amount;
+    }
+
+    // 🐄 BUY CATTLE
+    if (data.event === "buy_cattle") {
+        players[id].cattle += amount;
+    }
+
+    // 🐄 SELL CATTLE
+    if (data.event === "sell_cattle") {
+        players[id].soldCattle += amount;
+        players[id].cattle = Math.max(
+            0,
+            players[id].cattle - amount
+        );
     }
 
     await updateLeaderboard();
     res.sendStatus(200);
 });
 
-// Start Express
+// ================== START ==================
 app.listen(PORT, () => {
-    console.log(`🚀 Webhook running on port ${PORT}`);
+    console.log(`🚀 Webhook listening on port ${PORT}`);
 });
 
-// Discord login
-client.once("ready", () => {
-    console.log(`🚜 Ranch Manager running as ${client.user.tag}`);
-});
-
-client.login(process.env.BOT_TOKEN);
+client.login(DISCORD_TOKEN);
