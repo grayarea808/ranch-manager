@@ -72,9 +72,14 @@ async function updateLeaderboard() {
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
   if (!channel || !channel.isTextBased()) throw new Error('Invalid channel');
 
+  // Sort players by total value descending
+  const sortedPlayers = Object.entries(ranchData).sort((a, b) => {
+    return calculateTotal(b[1]) - calculateTotal(a[1]);
+  });
+
   let leaderboardText = `🏆 Beaver Farms — Leaderboard\n\n`;
   
-  for (const [username, data] of Object.entries(ranchData)) {
+  for (const [username, data] of sortedPlayers) {
     leaderboardText += `${username}\n`;
     leaderboardText += `🥛 Milk: ${data.milk}\n`;
     leaderboardText += `🥚 Eggs: ${data.eggs}\n`;
