@@ -66,14 +66,20 @@ async function updateLeaderboard() {
 // Webhook endpoint
 app.post("/webhook", async (req, res) => {
     const data = req.body;
-    if (!data.id || !data.username) {
-        return res.status(400).send("Missing id or username");
-    }
+
+    // Log the raw webhook for debugging
+    console.log("⚡ Incoming webhook data:", data);
+
+    // Attempt to map fields from different possible keys
+    const id = data.id ?? data.userId ?? data.discordId;
+    const username = data.username ?? data.name ?? "Unknown";
+
+    if (!id) return res.status(400).send("Missing player id");
 
     // Initialize player if new
-    if (!players[data.id]) {
-        players[data.id] = {
-            username: data.username,
+    if (!players[id]) {
+        players[id] = {
+            username,
             milk: 0,
             eggs: 0,
             cattle: 0,
@@ -81,14 +87,17 @@ app.post("/webhook", async (req, res) => {
         };
     }
 
-    // Update stats
-    if (data.milk) players[data.id].milk += data.milk;
-    if (data.eggs) players[data.id].eggs += data.eggs;
-    if (data.cattle) players[data.id].cattle += data.cattle;
-    if (data.soldCattle) {
-        players[data.id].soldCattle += data.soldCattle;
-        players[data.id].cattle -= data.soldCattle;
-        if (players[data.id].cattle < 0) players[data.id].cattle = 0;
+    // Update stats using flexible keys
+    players[id].milk += data.milk ?? data.milkCount ?? 0;
+    players[id].eggs += data.eggs ?? data.eggCount ?? 0;
+    players[id].cattle += data.cattle ?? data.cattleCount ?? 0;
+
+    // Sold cattle handling
+    const sold = data.soldCattle ?? data.cattleSold ?? 0;
+    if (sold > 0) {
+        players[id].soldCattle += sold;
+        players[id].cattle -= sold;
+        if (players[id].cattle < 0) players[id].cattle = 0;
     }
 
     await updateLeaderboard();
@@ -100,3 +109,9 @@ app.listen(PORT, () => {
     console.log(`🚀 Webhook running on port ${PORT}`);
 });
 
+// Discord login
+client.once("ready", () => {
+    console.log(`🚜 Ranch Manager running as ${client.user.tag}`);
+});
+
+client.login(process.env.BOT_TOKEN);
