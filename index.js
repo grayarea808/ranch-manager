@@ -6,8 +6,10 @@ dotenv.config();
 
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 8080;
-const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
-const INPUT_CHANNEL_ID = process.env.INPUT_CHANNEL_ID;
+
+// Your channels
+const INPUT_CHANNEL_ID = process.env.INPUT_CHANNEL_ID; // 1465062014626824347
+const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID; // 1466170240949026878
 
 const PRICES = {
   eggs: 1.25,
@@ -19,54 +21,62 @@ const PRICES = {
 const app = express();
 app.use(express.json());
 
-// ---------- DISCORD CLIENT ----------
+app.get("/", (req, res) => res.status(200).send("Ranch Manager online ✅"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+
+// IMPORTANT: Railway needs this to stay alive
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Web server listening on port ${PORT}`);
+});
+
+// ---------- DISCORD ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.MessageContent, // MUST ALSO be enabled in Dev Portal
   ],
 });
 
-// ---------- IN-MEMORY DB ----------
+// ---------- IN-MEMORY STORAGE ----------
 let leaderboard = {};
 let leaderboardMessageId = null;
 
-// ---------- BOT READY ----------
+// ---------- READY ----------
 client.once("ready", async () => {
   console.log(`🚜 Ranch Manager online as ${client.user.tag}`);
+
+  if (!INPUT_CHANNEL_ID || !LEADERBOARD_CHANNEL_ID) {
+    console.log("❌ Missing INPUT_CHANNEL_ID or LEADERBOARD_CHANNEL_ID in env");
+    return;
+  }
+
   await ensureLeaderboardMessage();
+  await bootstrapFromHistory(); // <-- pulls existing dump logs on startup
+  await updateLeaderboardMessage();
+
   scheduleWeeklyReset();
 });
 
-// ---------- MESSAGE LISTENER ----------
+// ---------- LIVE MESSAGE LISTENER ----------
 client.on("messageCreate", async (message) => {
+  // Only parse messages in the input channel
   if (message.channel.id !== INPUT_CHANNEL_ID) return;
+
+  // Only parse bot/webhook messages
   if (!message.author.bot) return;
 
-  const parsed = parseRanchMessage(message);
+  const parsed = parseRanchMessage(message.content);
   if (!parsed) return;
 
-  const { userId, eggs, milk, cattle } = parsed;
-
-  if (!leaderboard[userId]) {
-    leaderboard[userId] = { eggs: 0, milk: 0, cattle: 0 };
-  }
-
-  leaderboard[userId].eggs += eggs;
-  leaderboard[userId].milk += milk;
-  leaderboard[userId].cattle += cattle;
-
-  console.log(`✅ Logged for ${userId}`, leaderboard[userId]);
+  applyParsed(parsed);
 
   await updateLeaderboardMessage();
 });
 
 // ---------- PARSER (YOUR FORMAT) ----------
-function parseRanchMessage(message) {
-  const content = message.content;
-
-  // Grab mentioned user ID
+function parseRanchMessage(content) {
+  // Must have a mention like <@3164...>
   const userMatch = content.match(/<@(\d+)>/);
   if (!userMatch) return null;
 
@@ -76,49 +86,77 @@ function parseRanchMessage(message) {
   let milk = 0;
   let cattle = 0;
 
-  // Eggs
-  if (/Added Eggs/i.test(content)) {
-    const amount = content.match(/:\s*(\d+)/);
-    eggs = amount ? Number(amount[1]) : 0;
-  }
+  // Pull number after ": 33"
+  const amountMatch = content.match(/:\s*(\d+)/);
+  const amount = amountMatch ? Number(amountMatch[1]) : 0;
 
-  // Milk
-  if (/Added Milk/i.test(content)) {
-    const amount = content.match(/:\s*(\d+)/);
-    milk = amount ? Number(amount[1]) : 0;
-  }
-
-  // Cattle (future-proof)
-  if (/Added Cattle/i.test(content)) {
-    const amount = content.match(/:\s*(\d+)/);
-    cattle = amount ? Number(amount[1]) : 0;
-  }
+  if (/Added Eggs/i.test(content)) eggs = amount;
+  if (/Added Milk/i.test(content)) milk = amount;
+  if (/Added Cattle/i.test(content)) cattle = amount;
 
   if (eggs === 0 && milk === 0 && cattle === 0) return null;
 
   return { userId, eggs, milk, cattle };
 }
 
-// ---------- ENSURE STATIC LEADERBOARD ----------
+function applyParsed({ userId, eggs, milk, cattle }) {
+  if (!leaderboard[userId]) {
+    leaderboard[userId] = { eggs: 0, milk: 0, cattle: 0 };
+  }
+
+  leaderboard[userId].eggs += eggs;
+  leaderboard[userId].milk += milk;
+  leaderboard[userId].cattle += cattle;
+
+  console.log(`✅ Applied -> ${userId}:`, leaderboard[userId]);
+}
+
+// ---------- BOOTSTRAP FROM HISTORY ----------
+async function bootstrapFromHistory() {
+  try {
+    const channel = await client.channels.fetch(INPUT_CHANNEL_ID);
+    if (!channel) throw new Error("Input channel not found");
+
+    // Pull the last 100 messages (adjust if you want more)
+    const messages = await channel.messages.fetch({ limit: 100 });
+
+    let count = 0;
+
+    // Oldest to newest so totals apply in order
+    const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    for (const msg of sorted) {
+      if (!msg.author.bot) continue;
+
+      const parsed = parseRanchMessage(msg.content);
+      if (!parsed) continue;
+
+      applyParsed(parsed);
+      count++;
+    }
+
+    console.log(`📥 Bootstrapped ${count} ranch log entries from history`);
+  } catch (err) {
+    console.error("❌ bootstrapFromHistory failed:", err);
+  }
+}
+
+// ---------- ENSURE STATIC LEADERBOARD MESSAGE ----------
 async function ensureLeaderboardMessage() {
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
   const messages = await channel.messages.fetch({ limit: 10 });
 
-  const existing = messages.find(
-    (m) => m.author.id === client.user.id
-  );
+  const existing = messages.find((m) => m.author.id === client.user.id);
 
   if (existing) {
     leaderboardMessageId = existing.id;
   } else {
-    const msg = await channel.send("🏆 Beaver Farms Ledger\nLoading...");
+    const msg = await channel.send("🏆 Beaver Farms — Weekly Ledger\nLoading...");
     leaderboardMessageId = msg.id;
   }
-
-  await updateLeaderboardMessage();
 }
 
-// ---------- UPDATE LEADERBOARD (EDIT MESSAGE) ----------
+// ---------- UPDATE (EDIT) LEADERBOARD ----------
 async function updateLeaderboardMessage() {
   if (!leaderboardMessageId) return;
 
@@ -126,6 +164,7 @@ async function updateLeaderboardMessage() {
   const message = await channel.messages.fetch(leaderboardMessageId);
 
   let output = "🏆 **Beaver Farms — Weekly Ledger**\n\n";
+
   let ranchTotal = 0;
 
   for (const [userId, data] of Object.entries(leaderboard)) {
@@ -163,11 +202,6 @@ function scheduleWeeklyReset() {
     await updateLeaderboardMessage();
   }, oneWeek);
 }
-
-// ---------- EXPRESS KEEP-ALIVE ----------
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
 
 // ---------- LOGIN ----------
 client.login(process.env.BOT_TOKEN);
