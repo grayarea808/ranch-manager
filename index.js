@@ -15,20 +15,20 @@ const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
 const DEBUG = process.env.DEBUG === "true";
 const LEADERBOARD_DEBOUNCE_MS = Number(process.env.LEADERBOARD_DEBOUNCE_MS || 3000);
 
+// Backfill controls (QoL)
+const BACKFILL_ON_START = (process.env.BACKFILL_ON_START || "true") === "true";
+const BACKFILL_EVERY_MS = Number(process.env.BACKFILL_EVERY_MS || 300000); // 5 min
+const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 1000); // how many to scan
+
 const PRICES = { eggs: 1.25, milk: 1.25, cattle: 800 };
 
-// ---------- CRASH LOGGING (SUPER IMPORTANT ON RAILWAY) ----------
-process.on("unhandledRejection", (reason) => {
-  console.error("❌ unhandledRejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("❌ uncaughtException:", err);
-});
+// ---------- CRASH LOGGING ----------
+process.on("unhandledRejection", (reason) => console.error("❌ unhandledRejection:", reason));
+process.on("uncaughtException", (err) => console.error("❌ uncaughtException:", err));
 
 // ---------- POSTGRES ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Railway Postgres often requires SSL
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
 });
 
@@ -46,18 +46,13 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// KEEP A HANDLE so we can close it on SIGTERM
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Web server listening on port ${PORT}`);
 });
 
 // ---------- DISCORD ----------
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
 let leaderboardMessageId = null;
@@ -66,7 +61,6 @@ let leaderboardMessageId = null;
 let updateTimer = null;
 let updateQueued = false;
 
-// ---------- READY ----------
 client.once("ready", async () => {
   try {
     console.log(`🚜 Ranch Manager online as ${client.user.tag}`);
@@ -76,22 +70,38 @@ client.once("ready", async () => {
       return;
     }
 
-    // Quick DB sanity check at startup
     await pool.query("SELECT 1");
     console.log("✅ DB connection OK");
 
     await ensureLeaderboardMessage();
+
+    // Backfill history so totals are not wiped after restarts
+    if (BACKFILL_ON_START) {
+      console.log(`📥 Backfill on start: scanning up to ${BACKFILL_MAX_MESSAGES} messages...`);
+      await backfillFromChannelHistory(BACKFILL_MAX_MESSAGES);
+    }
+
     await scheduleLeaderboardUpdate(true);
+
+    // Periodic backfill (catch missed messages, restarts, etc.)
+    setInterval(async () => {
+      try {
+        console.log("🔁 Periodic backfill running...");
+        await backfillFromChannelHistory(300); // small/fast backfill window
+        await scheduleLeaderboardUpdate(true);
+      } catch (e) {
+        console.error("❌ Periodic backfill failed:", e);
+      }
+    }, BACKFILL_EVERY_MS);
 
     console.log("✅ Startup complete. Listening for ranch logs…");
   } catch (err) {
     console.error("❌ Startup failed:", err);
-    // If startup fails, exit so Railway restarts us cleanly
     process.exit(1);
   }
 });
 
-// ---------- MESSAGE LISTENER ----------
+// ---------- LIVE LISTENER ----------
 client.on("messageCreate", async (message) => {
   try {
     if (message.channel.id !== INPUT_CHANNEL_ID) return;
@@ -167,7 +177,7 @@ function parseRanchMessageFromDiscordMessage(message) {
   return { userId, ranchId, item, amount };
 }
 
-// ---------- DB: insert event + totals upsert ----------
+// ---------- DB WRITE (dedupe by message id) ----------
 async function storeEventAndUpdateTotals({ discordMessageId, userId, ranchId, item, amount }) {
   const clientDb = await pool.connect();
   try {
@@ -208,7 +218,7 @@ async function storeEventAndUpdateTotals({ discordMessageId, userId, ranchId, it
     );
 
     await clientDb.query("COMMIT");
-    console.log(`✅ Stored ${item} +${amount} for ${userId}`);
+    if (DEBUG) console.log(`✅ Stored ${item} +${amount} for ${userId}`);
     return true;
   } catch (err) {
     await clientDb.query("ROLLBACK");
@@ -219,7 +229,49 @@ async function storeEventAndUpdateTotals({ discordMessageId, userId, ranchId, it
   }
 }
 
-// ---------- STATIC LEADERBOARD MESSAGE ----------
+// ---------- HISTORY BACKFILL (PAGINATED) ----------
+async function backfillFromChannelHistory(maxMessages = 1000) {
+  const channel = await client.channels.fetch(INPUT_CHANNEL_ID);
+  if (!channel) throw new Error("Input channel not found");
+
+  let fetched = 0;
+  let lastId = null;
+  let inserted = 0;
+
+  while (fetched < maxMessages) {
+    const batchSize = Math.min(100, maxMessages - fetched);
+    const opts = lastId ? { limit: batchSize, before: lastId } : { limit: batchSize };
+
+    const messages = await channel.messages.fetch(opts);
+    if (messages.size === 0) break;
+
+    // Process oldest->newest in this batch
+    const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    for (const msg of sorted) {
+      fetched++;
+
+      const isWebhookOrBot = Boolean(msg.webhookId) || Boolean(msg.author?.bot);
+      if (!isWebhookOrBot) continue;
+
+      const parsed = parseRanchMessageFromDiscordMessage(msg);
+      if (!parsed) continue;
+
+      const ok = await storeEventAndUpdateTotals({
+        discordMessageId: msg.id,
+        ...parsed,
+      });
+
+      if (ok) inserted++;
+    }
+
+    lastId = sorted[0].id; // oldest message id becomes "before" cursor
+  }
+
+  console.log(`📥 Backfill scanned ${fetched} msgs, inserted ${inserted} new events`);
+}
+
+// ---------- LEADERBOARD MESSAGE ----------
 async function ensureLeaderboardMessage() {
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
   const messages = await channel.messages.fetch({ limit: 10 });
@@ -234,6 +286,7 @@ async function ensureLeaderboardMessage() {
   }
 }
 
+// ---------- DEBOUNCED EDIT ----------
 async function scheduleLeaderboardUpdate(immediate = false) {
   if (immediate) {
     await updateLeaderboardMessage();
@@ -298,24 +351,18 @@ async function updateLeaderboardMessage() {
   console.log("📊 Leaderboard updated");
 }
 
-// ---------- GRACEFUL SHUTDOWN (prevents weird Railway kills) ----------
+// ---------- GRACEFUL SHUTDOWN ----------
 async function shutdown(signal) {
   console.log(`🛑 Received ${signal}. Shutting down gracefully...`);
   try {
     await client.destroy().catch(() => {});
     await pool.end().catch(() => {});
-    server.close(() => {
-      console.log("✅ HTTP server closed");
-      process.exit(0);
-    });
-
-    // hard-exit safety after 10s
+    server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 10000).unref();
-  } catch (e) {
+  } catch {
     process.exit(1);
   }
 }
-
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
