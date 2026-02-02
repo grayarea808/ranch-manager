@@ -4,9 +4,7 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const app = express();
-app.use(express.json());
-
+// ---------- CONFIG ----------
 const PORT = process.env.PORT || 8080;
 const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
 const INPUT_CHANNEL_ID = process.env.INPUT_CHANNEL_ID;
@@ -17,6 +15,11 @@ const PRICES = {
   cattle: 800,
 };
 
+// ---------- EXPRESS ----------
+const app = express();
+app.use(express.json());
+
+// ---------- DISCORD CLIENT ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -25,63 +28,81 @@ const client = new Client({
   ],
 });
 
+// ---------- IN-MEMORY DB ----------
 let leaderboard = {};
 let leaderboardMessageId = null;
 
-// ---------- Discord Ready ----------
+// ---------- BOT READY ----------
 client.once("ready", async () => {
   console.log(`🚜 Ranch Manager online as ${client.user.tag}`);
   await ensureLeaderboardMessage();
   scheduleWeeklyReset();
 });
 
-// ---------- Parse Incoming Ranch Messages ----------
+// ---------- MESSAGE LISTENER ----------
 client.on("messageCreate", async (message) => {
   if (message.channel.id !== INPUT_CHANNEL_ID) return;
-  if (message.author.bot === false) return;
+  if (!message.author.bot) return;
 
-  const parsed = parseRanchMessage(message.content);
+  const parsed = parseRanchMessage(message);
   if (!parsed) return;
 
-  const { username, eggs, milk, cattle } = parsed;
+  const { userId, eggs, milk, cattle } = parsed;
 
-  if (!leaderboard[username]) {
-    leaderboard[username] = { eggs: 0, milk: 0, cattle: 0 };
+  if (!leaderboard[userId]) {
+    leaderboard[userId] = { eggs: 0, milk: 0, cattle: 0 };
   }
 
-  leaderboard[username].eggs += eggs;
-  leaderboard[username].milk += milk;
-  leaderboard[username].cattle += cattle;
+  leaderboard[userId].eggs += eggs;
+  leaderboard[userId].milk += milk;
+  leaderboard[userId].cattle += cattle;
 
-  console.log(`✅ Logged sale for ${username}`, leaderboard[username]);
+  console.log(`✅ Logged for ${userId}`, leaderboard[userId]);
+
   await updateLeaderboardMessage();
 });
 
-// ---------- Message Parser ----------
-function parseRanchMessage(content) {
-  try {
-    const userMatch = content.match(/User:\s*(.+)/i);
-    if (!userMatch) return null;
+// ---------- PARSER (YOUR FORMAT) ----------
+function parseRanchMessage(message) {
+  const content = message.content;
 
-    const eggs = Number(content.match(/Eggs:\s*(\d+)/i)?.[1] || 0);
-    const milk = Number(content.match(/Milk:\s*(\d+)/i)?.[1] || 0);
-    const cattle = Number(content.match(/Cattle:\s*(\d+)/i)?.[1] || 0);
+  // Grab mentioned user ID
+  const userMatch = content.match(/<@(\d+)>/);
+  if (!userMatch) return null;
 
-    return {
-      username: userMatch[1].trim(),
-      eggs,
-      milk,
-      cattle,
-    };
-  } catch {
-    return null;
+  const userId = userMatch[1];
+
+  let eggs = 0;
+  let milk = 0;
+  let cattle = 0;
+
+  // Eggs
+  if (/Added Eggs/i.test(content)) {
+    const amount = content.match(/:\s*(\d+)/);
+    eggs = amount ? Number(amount[1]) : 0;
   }
+
+  // Milk
+  if (/Added Milk/i.test(content)) {
+    const amount = content.match(/:\s*(\d+)/);
+    milk = amount ? Number(amount[1]) : 0;
+  }
+
+  // Cattle (future-proof)
+  if (/Added Cattle/i.test(content)) {
+    const amount = content.match(/:\s*(\d+)/);
+    cattle = amount ? Number(amount[1]) : 0;
+  }
+
+  if (eggs === 0 && milk === 0 && cattle === 0) return null;
+
+  return { userId, eggs, milk, cattle };
 }
 
-// ---------- Ensure Static Leaderboard ----------
+// ---------- ENSURE STATIC LEADERBOARD ----------
 async function ensureLeaderboardMessage() {
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
-  const messages = await channel.messages.fetch({ limit: 5 });
+  const messages = await channel.messages.fetch({ limit: 10 });
 
   const existing = messages.find(
     (m) => m.author.id === client.user.id
@@ -90,14 +111,14 @@ async function ensureLeaderboardMessage() {
   if (existing) {
     leaderboardMessageId = existing.id;
   } else {
-    const msg = await channel.send("🏆 Beaver Farms Leaderboard\nLoading...");
+    const msg = await channel.send("🏆 Beaver Farms Ledger\nLoading...");
     leaderboardMessageId = msg.id;
   }
 
   await updateLeaderboardMessage();
 }
 
-// ---------- Update (EDIT) Leaderboard ----------
+// ---------- UPDATE LEADERBOARD (EDIT MESSAGE) ----------
 async function updateLeaderboardMessage() {
   if (!leaderboardMessageId) return;
 
@@ -105,32 +126,34 @@ async function updateLeaderboardMessage() {
   const message = await channel.messages.fetch(leaderboardMessageId);
 
   let output = "🏆 **Beaver Farms — Weekly Ledger**\n\n";
+  let ranchTotal = 0;
 
-  let grandTotal = 0;
+  for (const [userId, data] of Object.entries(leaderboard)) {
+    const user = await client.users.fetch(userId).catch(() => null);
+    const name = user ? user.username : userId;
 
-  for (const [user, data] of Object.entries(leaderboard)) {
     const payout =
       data.eggs * PRICES.eggs +
       data.milk * PRICES.milk +
       data.cattle * PRICES.cattle;
 
-    grandTotal += payout;
+    ranchTotal += payout;
 
     output +=
-      `**${user}**\n` +
+      `**${name}**\n` +
       `🥚 Eggs: ${data.eggs}\n` +
       `🥛 Milk: ${data.milk}\n` +
       `🐄 Cattle: ${data.cattle}\n` +
-      `💰 Payout: **$${payout.toFixed(2)}**\n\n`;
+      `💰 **$${payout.toFixed(2)}**\n\n`;
   }
 
-  output += `---\n💼 **Total Ranch Payout:** $${grandTotal.toFixed(2)}`;
+  output += `---\n💼 **Total Ranch Payroll:** $${ranchTotal.toFixed(2)}`;
 
   await message.edit(output);
-  console.log("📊 Leaderboard refreshed");
+  console.log("📊 Leaderboard updated");
 }
 
-// ---------- Weekly Reset ----------
+// ---------- WEEKLY RESET ----------
 function scheduleWeeklyReset() {
   const oneWeek = 7 * 24 * 60 * 60 * 1000;
 
@@ -141,10 +164,10 @@ function scheduleWeeklyReset() {
   }, oneWeek);
 }
 
-// ---------- Express (kept alive for Railway) ----------
+// ---------- EXPRESS KEEP-ALIVE ----------
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
-// ---------- Discord Login ----------
+// ---------- LOGIN ----------
 client.login(process.env.BOT_TOKEN);
