@@ -15,16 +15,26 @@ const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
 const DEBUG = process.env.DEBUG === "true";
 const LEADERBOARD_DEBOUNCE_MS = Number(process.env.LEADERBOARD_DEBOUNCE_MS || 3000);
 
-// Backfill controls (QoL)
+// Backfill
 const BACKFILL_ON_START = (process.env.BACKFILL_ON_START || "true") === "true";
 const BACKFILL_EVERY_MS = Number(process.env.BACKFILL_EVERY_MS || 300000); // 5 min
-const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 1000); // how many to scan
+const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 1000);
 
-const PRICES = { eggs: 1.25, milk: 1.25, cattle: 800 };
+// Prices
+const PRICES = {
+  eggs: 1.25,
+  milk: 1.25,
+};
+
+// Cattle deductions
+const CATTLE_DEDUCTION = {
+  bison: Number(process.env.CATTLE_BISON_DEDUCTION || 400),
+  default: Number(process.env.CATTLE_DEFAULT_DEDUCTION || 300),
+};
 
 // ---------- CRASH LOGGING ----------
-process.on("unhandledRejection", (reason) => console.error("❌ unhandledRejection:", reason));
-process.on("uncaughtException", (err) => console.error("❌ uncaughtException:", err));
+process.on("unhandledRejection", (r) => console.error("❌ unhandledRejection:", r));
+process.on("uncaughtException", (e) => console.error("❌ uncaughtException:", e));
 
 // ---------- POSTGRES ----------
 const pool = new Pool({
@@ -36,13 +46,13 @@ const pool = new Pool({
 const app = express();
 app.use(express.json());
 
-app.get("/", (req, res) => res.status(200).send("Ranch Manager online ✅"));
-app.get("/health", async (req, res) => {
+app.get("/", (_, res) => res.send("Ranch Manager online ✅"));
+app.get("/health", async (_, res) => {
   try {
     await pool.query("SELECT 1");
-    res.status(200).json({ ok: true, db: true });
+    res.json({ ok: true, db: true });
   } catch (e) {
-    res.status(500).json({ ok: false, db: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, db: false });
   }
 });
 
@@ -52,106 +62,71 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
 // ---------- DISCORD ----------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 let leaderboardMessageId = null;
-
-// debounce state
 let updateTimer = null;
 let updateQueued = false;
 
+// ---------- READY ----------
 client.once("ready", async () => {
   try {
     console.log(`🚜 Ranch Manager online as ${client.user.tag}`);
-
-    if (!INPUT_CHANNEL_ID || !LEADERBOARD_CHANNEL_ID) {
-      console.log("❌ Missing INPUT_CHANNEL_ID or LEADERBOARD_CHANNEL_ID in Railway variables");
-      return;
-    }
-
     await pool.query("SELECT 1");
-    console.log("✅ DB connection OK");
 
     await ensureLeaderboardMessage();
 
-    // Backfill history so totals are not wiped after restarts
     if (BACKFILL_ON_START) {
-      console.log(`📥 Backfill on start: scanning up to ${BACKFILL_MAX_MESSAGES} messages...`);
+      console.log("📥 Backfilling history…");
       await backfillFromChannelHistory(BACKFILL_MAX_MESSAGES);
     }
 
     await scheduleLeaderboardUpdate(true);
 
-    // Periodic backfill (catch missed messages, restarts, etc.)
     setInterval(async () => {
-      try {
-        console.log("🔁 Periodic backfill running...");
-        await backfillFromChannelHistory(300); // small/fast backfill window
-        await scheduleLeaderboardUpdate(true);
-      } catch (e) {
-        console.error("❌ Periodic backfill failed:", e);
-      }
+      await backfillFromChannelHistory(300);
+      await scheduleLeaderboardUpdate(true);
     }, BACKFILL_EVERY_MS);
 
-    console.log("✅ Startup complete. Listening for ranch logs…");
+    console.log("✅ Listening for ranch activity");
   } catch (err) {
     console.error("❌ Startup failed:", err);
     process.exit(1);
   }
 });
 
-// ---------- LIVE LISTENER ----------
+// ---------- MESSAGE LISTENER ----------
 client.on("messageCreate", async (message) => {
-  try {
-    if (message.channel.id !== INPUT_CHANNEL_ID) return;
+  if (message.channel.id !== INPUT_CHANNEL_ID) return;
 
-    const isWebhookOrBot = Boolean(message.webhookId) || Boolean(message.author?.bot);
-    if (!isWebhookOrBot) return;
+  const isWebhookOrBot = Boolean(message.webhookId) || Boolean(message.author?.bot);
+  if (!isWebhookOrBot) return;
 
-    if (DEBUG) {
-      console.log("INCOMING:", {
-        id: message.id,
-        content: message.content,
-        webhookId: message.webhookId,
-        embeds: message.embeds?.map((e) => ({
-          title: e.title,
-          description: e.description,
-          fields: e.fields?.map((f) => ({ name: f.name, value: f.value })),
-        })),
-      });
-    }
+  const parsed = parseRanchMessage(message);
+  if (!parsed) return;
 
-    const parsed = parseRanchMessageFromDiscordMessage(message);
-    if (!parsed) return;
+  const stored = await storeEventAndUpdateTotals({
+    discordMessageId: message.id,
+    ...parsed,
+  });
 
-    const stored = await storeEventAndUpdateTotals({
-      discordMessageId: message.id,
-      ...parsed,
-    });
-
-    if (!stored) return;
-
-    await scheduleLeaderboardUpdate();
-  } catch (err) {
-    console.error("❌ messageCreate handler failed:", err);
-  }
+  if (stored) await scheduleLeaderboardUpdate();
 });
 
-// ---------- PARSER (EMBEDS + CONTENT) ----------
-function parseRanchMessageFromDiscordMessage(message) {
+// ---------- PARSER ----------
+function parseRanchMessage(message) {
   let text = (message.content || "").trim();
 
   if (message.embeds?.length) {
-    for (const emb of message.embeds) {
-      if (emb.title) text += `\n${emb.title}`;
-      if (emb.description) text += `\n${emb.description}`;
-      if (emb.fields?.length) {
-        for (const f of emb.fields) {
-          if (f.name) text += `\n${f.name}`;
-          if (f.value) text += `\n${f.value}`;
-        }
-      }
+    for (const e of message.embeds) {
+      if (e.title) text += `\n${e.title}`;
+      if (e.description) text += `\n${e.description}`;
+      if (e.fields) for (const f of e.fields) text += `\n${f.name}\n${f.value}`;
     }
   }
 
@@ -162,136 +137,127 @@ function parseRanchMessageFromDiscordMessage(message) {
   if (!userMatch) return null;
   const userId = BigInt(userMatch[1]).toString();
 
-  const ranchIdMatch = text.match(/ranch id\s*(\d+)/i);
+  const ranchIdMatch = text.match(/Ranch ID:\s*(\d+)/i) || text.match(/ranch id\s*(\d+)/i);
   const ranchId = ranchIdMatch ? Number(ranchIdMatch[1]) : null;
 
-  const amountMatch = text.match(/:\s*(\d+)\s*$/m);
-  const amount = amountMatch ? Number(amountMatch[1]) : 0;
+  // Eggs / Milk
+  const addedMatch = text.match(/:\s*(\d+)\s*$/m);
+  const qty = addedMatch ? Number(addedMatch[1]) : 0;
 
-  let item = null;
-  if (/Eggs Added/i.test(text) || /Added Eggs/i.test(text)) item = "eggs";
-  if (/Milk Added/i.test(text) || /Added Milk/i.test(text)) item = "milk";
-  if (/Cattle Added/i.test(text) || /Added Cattle/i.test(text)) item = "cattle";
+  if (/Eggs Added|Added Eggs/i.test(text)) return { userId, ranchId, item: "eggs", amount: qty };
+  if (/Milk Added|Added Milk/i.test(text)) return { userId, ranchId, item: "milk", amount: qty };
 
-  if (!item || amount <= 0) return null;
-  return { userId, ranchId, item, amount };
+  // Cattle / Bison sales
+  const saleMatch = text.match(/for\s+([\d.]+)\$/i);
+  if (saleMatch) {
+    const saleValue = Number(saleMatch[1]);
+    if (!saleValue) return null;
+
+    const isBison = /bison/i.test(text);
+    const deduction = isBison ? CATTLE_DEDUCTION.bison : CATTLE_DEDUCTION.default;
+    const net = Math.max(0, saleValue - deduction);
+
+    return { userId, ranchId, item: "cattle", amount: net };
+  }
+
+  return null;
 }
 
-// ---------- DB WRITE (dedupe by message id) ----------
+// ---------- DB WRITE ----------
 async function storeEventAndUpdateTotals({ discordMessageId, userId, ranchId, item, amount }) {
-  const clientDb = await pool.connect();
+  const c = await pool.connect();
   try {
-    await clientDb.query("BEGIN");
+    await c.query("BEGIN");
 
-    const insertEvent = await clientDb.query(
+    const ins = await c.query(
       `
-      INSERT INTO public.ranch_events (discord_message_id, user_id, ranch_id, item, amount)
-      VALUES ($1, $2::bigint, $3, $4, $5)
+      INSERT INTO public.ranch_events
+        (discord_message_id, user_id, ranch_id, item, amount)
+      VALUES ($1, $2::bigint, $3, $4, $5::numeric)
       ON CONFLICT (discord_message_id) DO NOTHING
       RETURNING id
       `,
       [discordMessageId, userId, ranchId, item, amount]
     );
 
-    if (insertEvent.rowCount === 0) {
-      await clientDb.query("ROLLBACK");
+    if (!ins.rowCount) {
+      await c.query("ROLLBACK");
       return false;
     }
 
-    await clientDb.query(
+    await c.query(
       `
-      INSERT INTO public.ranch_totals (user_id, eggs, milk, cattle, updated_at)
-      VALUES ($1::bigint, 0, 0, 0, NOW())
+      INSERT INTO public.ranch_totals (user_id, eggs, milk, cattle)
+      VALUES ($1::bigint, 0, 0, 0)
       ON CONFLICT (user_id) DO NOTHING
       `,
       [userId]
     );
 
-    await clientDb.query(
+    await c.query(
       `
       UPDATE public.ranch_totals
-      SET ${item} = ${item} + $2,
+      SET ${item} = ${item} + $2::numeric,
           updated_at = NOW()
       WHERE user_id = $1::bigint
       `,
       [userId, amount]
     );
 
-    await clientDb.query("COMMIT");
-    if (DEBUG) console.log(`✅ Stored ${item} +${amount} for ${userId}`);
+    await c.query("COMMIT");
     return true;
-  } catch (err) {
-    await clientDb.query("ROLLBACK");
-    console.error("❌ DB transaction failed:", err);
+  } catch (e) {
+    await c.query("ROLLBACK");
+    console.error("❌ DB error:", e);
     return false;
   } finally {
-    clientDb.release();
+    c.release();
   }
 }
 
-// ---------- HISTORY BACKFILL (PAGINATED) ----------
-async function backfillFromChannelHistory(maxMessages = 1000) {
+// ---------- BACKFILL ----------
+async function backfillFromChannelHistory(max) {
   const channel = await client.channels.fetch(INPUT_CHANNEL_ID);
-  if (!channel) throw new Error("Input channel not found");
-
-  let fetched = 0;
   let lastId = null;
-  let inserted = 0;
+  let scanned = 0;
 
-  while (fetched < maxMessages) {
-    const batchSize = Math.min(100, maxMessages - fetched);
-    const opts = lastId ? { limit: batchSize, before: lastId } : { limit: batchSize };
+  while (scanned < max) {
+    const batch = await channel.messages.fetch(
+      lastId ? { limit: 100, before: lastId } : { limit: 100 }
+    );
+    if (!batch.size) break;
 
-    const messages = await channel.messages.fetch(opts);
-    if (messages.size === 0) break;
-
-    // Process oldest->newest in this batch
-    const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 
     for (const msg of sorted) {
-      fetched++;
-
-      const isWebhookOrBot = Boolean(msg.webhookId) || Boolean(msg.author?.bot);
-      if (!isWebhookOrBot) continue;
-
-      const parsed = parseRanchMessageFromDiscordMessage(msg);
+      scanned++;
+      const parsed = parseRanchMessage(msg);
       if (!parsed) continue;
 
-      const ok = await storeEventAndUpdateTotals({
+      await storeEventAndUpdateTotals({
         discordMessageId: msg.id,
         ...parsed,
       });
-
-      if (ok) inserted++;
     }
 
-    lastId = sorted[0].id; // oldest message id becomes "before" cursor
+    lastId = sorted[0].id;
   }
 
-  console.log(`📥 Backfill scanned ${fetched} msgs, inserted ${inserted} new events`);
+  console.log(`📥 Backfill scanned ${scanned} messages`);
 }
 
-// ---------- LEADERBOARD MESSAGE ----------
+// ---------- LEADERBOARD ----------
 async function ensureLeaderboardMessage() {
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
-  const messages = await channel.messages.fetch({ limit: 10 });
+  const msgs = await channel.messages.fetch({ limit: 10 });
+  const existing = msgs.find((m) => m.author.id === client.user.id);
 
-  const existing = messages.find((m) => m.author.id === client.user.id);
-
-  if (existing) {
-    leaderboardMessageId = existing.id;
-  } else {
-    const msg = await channel.send("🏆 Beaver Farms — Weekly Ledger\nLoading...");
-    leaderboardMessageId = msg.id;
-  }
+  if (existing) leaderboardMessageId = existing.id;
+  else leaderboardMessageId = (await channel.send("🏆 Beaver Farms — Weekly Ledger")).id;
 }
 
-// ---------- DEBOUNCED EDIT ----------
 async function scheduleLeaderboardUpdate(immediate = false) {
-  if (immediate) {
-    await updateLeaderboardMessage();
-    return;
-  }
+  if (immediate) return updateLeaderboardMessage();
 
   updateQueued = true;
   if (updateTimer) return;
@@ -305,66 +271,48 @@ async function scheduleLeaderboardUpdate(immediate = false) {
 }
 
 async function updateLeaderboardMessage() {
-  if (!leaderboardMessageId) return;
-
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
   const message = await channel.messages.fetch(leaderboardMessageId);
 
   const { rows } = await pool.query(
-    `
-    SELECT user_id, eggs, milk, cattle
-    FROM public.ranch_totals
-    WHERE eggs > 0 OR milk > 0 OR cattle > 0
-    `
+    `SELECT user_id, eggs, milk, cattle FROM public.ranch_totals`
   );
 
-  const entries = rows.map((r) => {
+  let output = "🏆 **Beaver Farms — Weekly Ledger**\n\n";
+  let total = 0;
+
+  for (const r of rows) {
     const eggs = Number(r.eggs);
     const milk = Number(r.milk);
     const cattle = Number(r.cattle);
-    const payout = eggs * PRICES.eggs + milk * PRICES.milk + cattle * PRICES.cattle;
-    return { userId: r.user_id.toString(), eggs, milk, cattle, payout };
-  });
+    const payout = eggs * PRICES.eggs + milk * PRICES.milk + cattle;
 
-  entries.sort((a, b) => b.payout - a.payout);
+    if (!payout) continue;
 
-  let output = "🏆 **Beaver Farms — Weekly Ledger**\n\n";
-  let ranchTotal = 0;
-
-  for (const e of entries) {
-    const user = await client.users.fetch(e.userId).catch(() => null);
-    const name = user ? user.username : e.userId;
-
-    ranchTotal += e.payout;
+    total += payout;
+    const user = await client.users.fetch(r.user_id.toString()).catch(() => null);
+    const name = user ? user.username : r.user_id;
 
     output +=
       `**${name}**\n` +
-      `🥚 Eggs: ${e.eggs}\n` +
-      `🥛 Milk: ${e.milk}\n` +
-      `🐄 Cattle: ${e.cattle}\n` +
-      `💰 **$${e.payout.toFixed(2)}**\n\n`;
+      `🥚 Eggs: ${eggs}\n` +
+      `🥛 Milk: ${milk}\n` +
+      `🐄 Cattle Net: $${cattle.toFixed(2)}\n` +
+      `💰 **$${payout.toFixed(2)}**\n\n`;
   }
 
-  output += `---\n💼 **Total Ranch Payroll:** $${ranchTotal.toFixed(2)}`;
-
+  output += `---\n💼 **Total Ranch Payroll:** $${total.toFixed(2)}`;
   await message.edit(output);
-  console.log("📊 Leaderboard updated");
 }
 
-// ---------- GRACEFUL SHUTDOWN ----------
-async function shutdown(signal) {
-  console.log(`🛑 Received ${signal}. Shutting down gracefully...`);
-  try {
-    await client.destroy().catch(() => {});
-    await pool.end().catch(() => {});
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 10000).unref();
-  } catch {
-    process.exit(1);
-  }
+// ---------- SHUTDOWN ----------
+async function shutdown() {
+  await client.destroy().catch(() => {});
+  await pool.end().catch(() => {});
+  server.close(() => process.exit(0));
 }
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 // ---------- LOGIN ----------
 client.login(process.env.BOT_TOKEN);
