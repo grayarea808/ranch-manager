@@ -1,7 +1,14 @@
 import express from "express";
 import dotenv from "dotenv";
 import pg from "pg";
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+} from "discord.js";
 
 dotenv.config();
 const { Pool } = pg;
@@ -15,75 +22,54 @@ const BOT_TOKEN =
   process.env.TOKEN;
 
 if (!BOT_TOKEN) {
-  console.error("❌ Missing Railway variable: BOT_TOKEN or DISCORD_TOKEN");
+  console.error("❌ Missing Railway variable: DISCORD_TOKEN (or BOT_TOKEN)");
   process.exit(1);
 }
 
-const DATABASE_URL = process.env.DATABASE_URL;
-const CAMP_INPUT_CHANNEL_ID = process.env.CAMP_INPUT_CHANNEL_ID;
-const CAMP_OUTPUT_CHANNEL_ID = process.env.CAMP_OUTPUT_CHANNEL_ID;
-
-if (!DATABASE_URL || !CAMP_INPUT_CHANNEL_ID || !CAMP_OUTPUT_CHANNEL_ID) {
-  console.error("❌ Missing required Railway variables: DATABASE_URL / CAMP_INPUT_CHANNEL_ID / CAMP_OUTPUT_CHANNEL_ID");
+const HERD_QUEUE_CHANNEL_ID = process.env.HERD_QUEUE_CHANNEL_ID;
+if (!HERD_QUEUE_CHANNEL_ID) {
+  console.error("❌ Missing Railway variable: HERD_QUEUE_CHANNEL_ID");
   process.exit(1);
 }
 
-const BACKFILL_ON_START = (process.env.BACKFILL_ON_START || "true") === "true";
-const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 5000);
+// optional DB (recommended so queue survives restarts)
+const DATABASE_URL = process.env.DATABASE_URL || null;
 
-const CAMP_NAME = process.env.CAMP_NAME || "Baba Yaga Camp";
-const NEXT_PAYOUT_LABEL = process.env.NEXT_PAYOUT_LABEL || "Saturday";
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
 
-// Delivery tier values
-const DELIVERY_VALUES = {
-  small: 500,
-  medium: 950,
-  large: 1500,
-};
-
-// Sale values -> tier mapping
-const SALE_VALUE_TO_TIER = {
-  500: "small",
-  950: "medium",
-  1500: "large",
-  1900: "large",
-};
-
-const CAMP_CUT = 0.30;
-const MATERIAL_POINTS = 2;
-const DELIVERY_POINTS = 3;
-const SUPPLY_POINTS = 1;
-
-// ================= DB =================
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined,
-});
-
-// ================= EXPRESS =================
+// ================= EXPRESS (health for Railway) =================
 const app = express();
-app.get("/", (_, res) => res.status(200).send("Camp Tracker running ✅"));
+app.get("/", (_, res) => res.status(200).send("Herd Queue running ✅"));
 app.get("/health", async (_, res) => {
   try {
-    await pool.query("SELECT 1");
-    res.status(200).json({ ok: true, db: true });
+    if (pool) await pool.query("SELECT 1");
+    res.status(200).json({ ok: true, db: !!pool });
   } catch (e) {
-    res.status(500).json({ ok: false, db: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-const server = app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Web listening on ${PORT}`));
+const server = app.listen(PORT, "0.0.0.0", () =>
+  console.log(`🚀 Web listening on ${PORT}`)
+);
 
 // ================= DISCORD =================
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [GatewayIntentBits.Guilds],
 });
 
 client.on("error", (e) => console.error("❌ Discord error:", e));
 process.on("unhandledRejection", (r) => console.error("❌ unhandledRejection:", r));
 process.on("uncaughtException", (e) => console.error("❌ uncaughtException:", e));
 
-// ================= SCHEMA =================
+// ================= DB SCHEMA =================
 async function ensureSchema() {
+  if (!pool) return;
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS public.bot_messages (
       key TEXT PRIMARY KEY,
@@ -92,32 +78,75 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS public.camp_events (
-      id BIGSERIAL PRIMARY KEY,
-      discord_message_id TEXT UNIQUE NOT NULL,
-      user_id BIGINT NOT NULL,
-      item TEXT NOT NULL CHECK (item IN ('materials','supplies','small','medium','large')),
-      amount INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS public.camp_totals (
-      user_id BIGINT PRIMARY KEY,
-      material_sets INT NOT NULL DEFAULT 0,
-      supplies INT NOT NULL DEFAULT 0,
-      small INT NOT NULL DEFAULT 0,
-      medium INT NOT NULL DEFAULT 0,
-      large INT NOT NULL DEFAULT 0,
+    CREATE TABLE IF NOT EXISTS public.herd_queue_state (
+      id INT PRIMARY KEY DEFAULT 1,
+      active_user_id BIGINT,
+      active_started_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS public.herd_queue_entries (
+      user_id BIGINT PRIMARY KEY,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // ensure singleton row exists
+  await pool.query(`
+    INSERT INTO public.herd_queue_state (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING
   `);
 }
 
-// ================= STATIC MESSAGE =================
-// IMPORTANT: new key so it won't keep editing the old "square embed" message if that was stored.
-const BOARD_KEY = "camp_board_text_v2";
+// ================= QUEUE STATE (memory fallback) =================
+let memActiveUserId = null;
+let memActiveStartedAt = null;
+let memQueue = []; // array of userIds in order
 
+async function loadQueueFromDB() {
+  if (!pool) return;
+
+  const state = await pool.query(`SELECT active_user_id, active_started_at FROM public.herd_queue_state WHERE id=1`);
+  memActiveUserId = state.rows[0]?.active_user_id ? String(state.rows[0].active_user_id) : null;
+  memActiveStartedAt = state.rows[0]?.active_started_at ? new Date(state.rows[0].active_started_at) : null;
+
+  const entries = await pool.query(`SELECT user_id FROM public.herd_queue_entries ORDER BY joined_at ASC`);
+  memQueue = entries.rows.map(r => String(r.user_id));
+}
+
+async function saveQueueToDB() {
+  if (!pool) return;
+
+  await pool.query(
+    `UPDATE public.herd_queue_state
+     SET active_user_id=$1::bigint, active_started_at=$2, updated_at=NOW()
+     WHERE id=1`,
+    [
+      memActiveUserId ? memActiveUserId : null,
+      memActiveStartedAt ? memActiveStartedAt.toISOString() : null,
+    ]
+  );
+
+  // rewrite entries
+  await pool.query(`TRUNCATE public.herd_queue_entries`);
+  for (let i = 0; i < memQueue.length; i++) {
+    await pool.query(
+      `INSERT INTO public.herd_queue_entries (user_id, joined_at) VALUES ($1::bigint, NOW() + ($2 || ' seconds')::interval)`,
+      [memQueue[i], i] // preserve order roughly
+    );
+  }
+}
+
+// ================= STATIC MESSAGE =================
 async function ensureBotMessage(key, channelId, initialText) {
+  if (!pool) {
+    // no DB: just send once per boot (not ideal), but workable
+    const channel = await client.channels.fetch(channelId);
+    const msg = await channel.send(initialText);
+    return msg.id;
+  }
+
   const { rows } = await pool.query(
     `SELECT message_id FROM public.bot_messages WHERE key=$1 LIMIT 1`,
     [key]
@@ -148,251 +177,152 @@ async function ensureBotMessage(key, channelId, initialText) {
   return msg.id;
 }
 
-// ================= PARSING =================
-function extractAllText(message) {
-  let text = (message.content || "").trim();
+// ================= RENDER =================
+const QUEUE_KEY = "herd_queue_board";
 
-  if (message.embeds?.length) {
-    for (const e of message.embeds) {
-      if (e.title) text += `\n${e.title}`;
-      if (e.description) text += `\n${e.description}`;
-      if (e.author?.name) text += `\n${e.author.name}`;
-      if (e.fields?.length) {
-        for (const f of e.fields) {
-          if (f.name) text += `\n${f.name}`;
-          if (f.value) text += `\n${f.value}`;
+function buildQueueEmbed() {
+  const embed = new EmbedBuilder()
+    .setTitle("🐎 Main Herd Queue")
+    .setColor(0x2b2d31);
+
+  const active = memActiveUserId ? `<@${memActiveUserId}>` : "None ✅";
+  const status = memActiveUserId ? "Status: Herding in progress ⏳" : "Status: Herding is available.";
+
+  let queueText = "No one in queue.";
+  if (memQueue.length) {
+    queueText = memQueue.map((uid, idx) => `${idx + 1}. <@${uid}>`).join("\n");
+  }
+
+  embed.setDescription(
+    `Current Herder: ${active}\n` +
+    `${status}\n\n` +
+    `Queue:\n${queueText}`
+  );
+
+  return embed;
+}
+
+function buildQueueComponents() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("queue_join")
+      .setLabel("Join Queue")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("queue_leave")
+      .setLabel("Leave Queue")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("queue_start")
+      .setLabel("Start Herding")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("queue_end")
+      .setLabel("End Herding")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return [row];
+}
+
+async function renderQueueBoard() {
+  const channel = await client.channels.fetch(HERD_QUEUE_CHANNEL_ID);
+  const msgId = await ensureBotMessage(QUEUE_KEY, HERD_QUEUE_CHANNEL_ID, "Loading herd queue...");
+
+  const msg = await channel.messages.fetch(msgId);
+  await msg.edit({
+    content: "",
+    embeds: [buildQueueEmbed()],
+    components: buildQueueComponents(),
+  });
+}
+
+// ================= HELPERS =================
+function isInQueue(userId) {
+  return memQueue.includes(userId);
+}
+
+function removeFromQueue(userId) {
+  memQueue = memQueue.filter((x) => x !== userId);
+}
+
+// ================= INTERACTIONS (FIXES “interaction failed”) =================
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isButton()) return;
+
+    // ✅ always acknowledge quickly so Discord doesn't error
+    await interaction.deferUpdate();
+
+    const userId = interaction.user.id;
+
+    if (interaction.customId === "queue_join") {
+      if (!memActiveUserId) {
+        // If no one herding, joining means you become first in queue (not active yet)
+      }
+      if (!isInQueue(userId) && memActiveUserId !== userId) {
+        memQueue.push(userId);
+      }
+    }
+
+    if (interaction.customId === "queue_leave") {
+      if (memActiveUserId === userId) {
+        // active herder can't "leave"; they must end session
+      } else {
+        removeFromQueue(userId);
+      }
+    }
+
+    if (interaction.customId === "queue_start") {
+      // only if no active herder
+      if (!memActiveUserId) {
+        // only first in queue can start, OR if queue empty you can start directly
+        if (memQueue.length === 0) {
+          memActiveUserId = userId;
+          memActiveStartedAt = new Date();
+        } else if (memQueue[0] === userId) {
+          memQueue.shift();
+          memActiveUserId = userId;
+          memActiveStartedAt = new Date();
         }
       }
-      if (e.footer?.text) text += `\n${e.footer.text}`;
-    }
-  }
-
-  return text.trim();
-}
-
-function extractUserId(text) {
-  const m = text.match(/Discord:\s*@([^\s]+)\s+(\d{17,19})/i);
-  if (m) return m[2];
-
-  const any = text.match(/\b(\d{17,19})\b/);
-  return any ? any[1] : null;
-}
-
-function parseCampLog(message) {
-  const text = extractAllText(message);
-  if (!text) return null;
-
-  const userId = extractUserId(text);
-  if (!userId) return null;
-
-  const sup = text.match(/Delivered Supplies:\s*(\d+)/i);
-  if (sup) {
-    const amount = Number(sup[1] || 0);
-    if (amount > 0) return { userId, item: "supplies", amount };
-  }
-
-  const mat = text.match(/Materials added:\s*([0-9]+(?:\.[0-9]+)?)/i);
-  if (mat) {
-    const amount = Math.floor(Number(mat[1] || 0));
-    if (amount > 0) return { userId, item: "materials", amount };
-  }
-
-  const sale = text.match(/Made a Sale Of\s+\d+\s+Of Stock For\s+\$([0-9]+(?:\.[0-9]+)?)/i);
-  if (sale) {
-    const value = Math.round(Number(sale[1]));
-    const tier = SALE_VALUE_TO_TIER[value];
-    if (tier) return { userId, item: tier, amount: 1 };
-  }
-
-  return null;
-}
-
-// ================= DB OPS =================
-async function insertEvent(discordMessageId, parsed) {
-  const { rowCount } = await pool.query(
-    `
-    INSERT INTO public.camp_events (discord_message_id, user_id, item, amount)
-    VALUES ($1, $2::bigint, $3, $4::int)
-    ON CONFLICT (discord_message_id) DO NOTHING
-    `,
-    [discordMessageId, parsed.userId, parsed.item, parsed.amount]
-  );
-  return rowCount > 0;
-}
-
-async function rebuildTotals() {
-  await pool.query(`TRUNCATE public.camp_totals`);
-
-  await pool.query(`
-    INSERT INTO public.camp_totals (user_id, material_sets, supplies, small, medium, large, updated_at)
-    SELECT
-      user_id,
-      COALESCE(SUM(CASE WHEN item='materials' THEN amount ELSE 0 END),0)::int AS material_sets,
-      COALESCE(SUM(CASE WHEN item='supplies' THEN amount ELSE 0 END),0)::int AS supplies,
-      COALESCE(SUM(CASE WHEN item='small' THEN amount ELSE 0 END),0)::int AS small,
-      COALESCE(SUM(CASE WHEN item='medium' THEN amount ELSE 0 END),0)::int AS medium,
-      COALESCE(SUM(CASE WHEN item='large' THEN amount ELSE 0 END),0)::int AS large,
-      NOW()
-    FROM public.camp_events
-    GROUP BY user_id
-  `);
-}
-
-// ================= BACKFILL =================
-async function backfillFromHistory(maxMessages) {
-  const channel = await client.channels.fetch(CAMP_INPUT_CHANNEL_ID);
-
-  let lastId = null;
-  let scanned = 0;
-  let parsedCount = 0;
-  let inserted = 0;
-
-  while (scanned < maxMessages) {
-    const batchSize = Math.min(100, maxMessages - scanned);
-    const batch = await channel.messages.fetch(lastId ? { limit: batchSize, before: lastId } : { limit: batchSize });
-    if (!batch.size) break;
-
-    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-    for (const msg of sorted) {
-      scanned++;
-      if (!msg.webhookId && !msg.author?.bot) continue;
-
-      const parsed = parseCampLog(msg);
-      if (!parsed) continue;
-      parsedCount++;
-
-      const ok = await insertEvent(msg.id, parsed);
-      if (ok) inserted++;
     }
 
-    lastId = sorted[0].id;
-  }
+    if (interaction.customId === "queue_end") {
+      // only active herder can end
+      if (memActiveUserId === userId) {
+        memActiveUserId = null;
+        memActiveStartedAt = null;
+      }
+    }
 
-  console.log(`📥 Camp backfill: scanned=${scanned} parsed=${parsedCount} inserted=${inserted}`);
-}
-
-// ================= MATH =================
-function computePoints(p) {
-  const deliveries = p.small + p.medium + p.large;
-  return (p.material_sets * MATERIAL_POINTS) + (deliveries * DELIVERY_POINTS) + (p.supplies * SUPPLY_POINTS);
-}
-
-function totalDeliveryValue(p) {
-  return (p.small * DELIVERY_VALUES.small) +
-         (p.medium * DELIVERY_VALUES.medium) +
-         (p.large * DELIVERY_VALUES.large);
-}
-
-// ================= OUTPUT (PLAIN TEXT ONLY) =================
-async function updateCampBoard() {
-  const msgId = await ensureBotMessage(
-    BOARD_KEY,
-    CAMP_OUTPUT_CHANNEL_ID,
-    `🏕️ ${CAMP_NAME}\nLoading...`
-  );
-
-  const channel = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
-  const msg = await channel.messages.fetch(msgId);
-
-  const { rows } = await pool.query(`
-    SELECT user_id, material_sets, supplies, small, medium, large
-    FROM public.camp_totals
-    WHERE material_sets>0 OR supplies>0 OR small>0 OR medium>0 OR large>0
-  `);
-
-  const players = rows.map(r => {
-    const p = {
-      user_id: r.user_id.toString(),
-      material_sets: Number(r.material_sets),
-      supplies: Number(r.supplies),
-      small: Number(r.small),
-      medium: Number(r.medium),
-      large: Number(r.large),
-    };
-    p.deliveries = p.small + p.medium + p.large;
-    p.points = computePoints(p);
-    p.delValue = totalDeliveryValue(p);
-    return p;
-  });
-
-  const gross = players.reduce((a, p) => a + p.delValue, 0);
-  const playerPool = gross * (1 - CAMP_CUT);
-  const campRevenue = gross * CAMP_CUT;
-  const totalPoints = players.reduce((a, p) => a + p.points, 0);
-  const valuePerPoint = totalPoints > 0 ? (playerPool / totalPoints) : 0;
-
-  for (const p of players) p.payout = p.points * valuePerPoint;
-
-  players.sort((a, b) => b.payout - a.payout || b.points - a.points);
-
-  let out =
-    `🏕️ **${CAMP_NAME}**\n` +
-    `📅 Next Camp Payout: **${NEXT_PAYOUT_LABEL}**\n` +
-    `Payout Mode: **Points (30% camp fee)**\n\n`;
-
-  const medals = ["🥇", "🥈", "🥉"];
-  for (let i = 0; i < Math.min(players.length, 25); i++) {
-    const p = players[i];
-    const badge = medals[i] || `#${i + 1}`;
-
-    out +=
-      `**${badge} <@${p.user_id}>**\n` +
-      `🪨 Materials: ${p.material_sets}\n` +
-      `🚚 Deliveries: ${p.deliveries} (S:${p.small} M:${p.medium} L:${p.large})\n` +
-      `📦 Supplies: ${p.supplies}\n` +
-      `⭐ Points: ${p.points}\n` +
-      `💰 **$${p.payout.toFixed(2)}**\n\n`;
-  }
-
-  out += `---\n🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)} • ⭐ Total Points: ${totalPoints}`;
-
-  // ensure no embed stays attached
-  await msg.edit({ content: out, embeds: [] });
-  console.log("📊 Camp board updated (text only)");
-}
-
-// ================= LIVE UPDATES =================
-let debounce = null;
-function scheduleUpdate() {
-  if (debounce) return;
-  debounce = setTimeout(async () => {
-    debounce = null;
-    await rebuildTotals();
-    await updateCampBoard();
-  }, 1500);
-}
-
-client.on("messageCreate", async (message) => {
-  try {
-    if (message.channel.id !== CAMP_INPUT_CHANNEL_ID) return;
-    if (!message.webhookId && !message.author?.bot) return;
-
-    const parsed = parseCampLog(message);
-    if (!parsed) return;
-
-    const ok = await insertEvent(message.id, parsed);
-    if (ok) scheduleUpdate();
+    // persist + re-render
+    await saveQueueToDB();
+    await renderQueueBoard();
   } catch (e) {
-    console.error("❌ messageCreate error:", e);
+    console.error("❌ interactionCreate error:", e);
+    // If deferUpdate failed, try a safe reply
+    try {
+      if (interaction.isRepliable() && !interaction.replied) {
+        await interaction.reply({ content: "⚠️ Something went wrong. Try again.", ephemeral: true });
+      }
+    } catch {}
   }
 });
 
 // ================= STARTUP =================
 client.once("clientReady", async () => {
   try {
-    console.log(`🏕️ Camp Manager Online: ${client.user.tag}`);
+    console.log(`🐎 Herd Queue online as ${client.user.tag}`);
+
     await ensureSchema();
+    await loadQueueFromDB();
+    await renderQueueBoard();
 
-    if (BACKFILL_ON_START) {
-      console.log(`📥 Backfilling camp history (max ${BACKFILL_MAX_MESSAGES})...`);
-      await backfillFromHistory(BACKFILL_MAX_MESSAGES);
-    }
-
-    await rebuildTotals();
-    await updateCampBoard();
-
-    console.log("✅ Startup complete.");
+    console.log("✅ Queue ready.");
   } catch (e) {
     console.error("❌ Startup failed:", e);
     process.exit(1);
@@ -404,7 +334,7 @@ async function shutdown(signal) {
   console.log(`🛑 ${signal} received. Shutting down...`);
   try {
     await client.destroy().catch(() => {});
-    await pool.end().catch(() => {});
+    if (pool) await pool.end().catch(() => {});
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 10000).unref();
   } catch {
