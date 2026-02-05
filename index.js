@@ -2,7 +2,6 @@ import express from "express";
 import { Client, GatewayIntentBits } from "discord.js";
 import dotenv from "dotenv";
 import pg from "pg";
-
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
 
 dotenv.config();
@@ -26,11 +25,23 @@ const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 5000);
 const BACKFILL_EVERY_MS = Number(process.env.BACKFILL_EVERY_MS || 300000);
 
 const PRICES = { eggs: 1.25, milk: 1.25 };
-const CATTLE_DEDUCTION = {
-  bison: Number(process.env.CATTLE_BISON_DEDUCTION || 400),
-  default: Number(process.env.CATTLE_DEFAULT_DEDUCTION || 300),
+
+// Herd sale economics (one payout per completed sale message; does NOT multiply)
+const HERD_ANIMAL_TOTALS = {
+  bison: { buy: 300, sell: 1200 },
+  deer: { buy: 250, sell: 1000 },
+  sheep: { buy: 150, sell: 900 },
 };
 
+// Ranch keeps $100 per completed herd sale (per finished cycle)
+const RANCH_PROFIT_PER_SALE = Number(process.env.RANCH_PROFIT_PER_SALE || 100);
+
+function herdCyclePayout(animalKey) {
+  const v = HERD_ANIMAL_TOTALS[animalKey];
+  return Math.max(0, (v.sell - v.buy) - RANCH_PROFIT_PER_SALE);
+}
+
+// Herd queue rules (Mode A)
 const HERD_REQUIRED_RUNS = Number(process.env.HERD_REQUIRED_RUNS || 4);
 const HERD_COOLDOWN_MINUTES = Number(process.env.HERD_COOLDOWN_MINUTES || 15);
 const HERD_STALE_HOURS = Number(process.env.HERD_STALE_HOURS || 2);
@@ -102,7 +113,7 @@ client.once("ready", async () => {
       return;
     }
 
-    // Ensure static messages exist (and are tracked)
+    // Ensure static messages exist
     leaderboardMessageId = await ensureBotMessage(
       "leaderboard",
       LEADERBOARD_CHANNEL_ID,
@@ -213,6 +224,8 @@ client.on("messageCreate", async (message) => {
 
 // =========================
 // PARSE RANCH MESSAGE (embeds + content)
+// Eggs/Milk: uses ": qty"
+// Herd sale: pays fixed payout based on animal totals, minus ranch profit per sale
 // =========================
 function parseRanchMessage(message) {
   let text = (message.content || "").trim();
@@ -240,6 +253,7 @@ function parseRanchMessage(message) {
   const ranchIdMatch = text.match(/Ranch ID:\s*(\d+)/i) || text.match(/ranch id\s*(\d+)/i);
   const ranchId = ranchIdMatch ? Number(ranchIdMatch[1]) : null;
 
+  // Eggs/Milk add pattern
   const addedMatch = text.match(/:\s*(\d+)\s*$/m);
   const qty = addedMatch ? Number(addedMatch[1]) : 0;
 
@@ -251,17 +265,20 @@ function parseRanchMessage(message) {
     return { userId, ranchId, item: "milk", amount: qty };
   }
 
-  // Cattle sale -> net dollars
-  const saleMatch = text.match(/for\s+([\d.]+)\$/i);
-  if (saleMatch) {
-    const saleValue = Number(saleMatch[1]);
-    if (!Number.isFinite(saleValue) || saleValue <= 0) return null;
+  // Herd sale pattern: treat as ONE completed cycle payout (no multiplying)
+  // We only trigger on messages that look like the cattle sale messages.
+  if (/Cattle Sale/i.test(text) || /Player .* sold/i.test(text) || /\bsold\s+\d+\s+/i.test(text)) {
+    const lower = text.toLowerCase();
 
-    const isBison = /bison/i.test(text);
-    const deduction = isBison ? CATTLE_DEDUCTION.bison : CATTLE_DEDUCTION.default;
-    const net = Math.max(0, saleValue - deduction);
+    let animal = null;
+    if (lower.includes("bison")) animal = "bison";
+    else if (lower.includes("deer")) animal = "deer";
+    else if (lower.includes("sheep")) animal = "sheep";
 
-    return { userId, ranchId, item: "cattle", amount: net };
+    if (!animal) return null;
+
+    const payout = herdCyclePayout(animal);
+    return { userId, ranchId, item: "cattle", amount: payout };
   }
 
   return null;
@@ -269,6 +286,8 @@ function parseRanchMessage(message) {
 
 // =========================
 // DB: Insert event + update totals (dedupe by discord_message_id)
+// eggs/milk: amount is units
+// cattle: amount is payout dollars (numeric)
 // =========================
 async function storeEventAndUpdateTotals({ discordMessageId, userId, ranchId, item, amount }) {
   const c = await pool.connect();
@@ -322,7 +341,7 @@ async function storeEventAndUpdateTotals({ discordMessageId, userId, ranchId, it
 }
 
 // =========================
-// Backfill ranch logs
+// Backfill ranch logs (safe; dedupe prevents double counting)
 // =========================
 async function backfillFromChannelHistory(max) {
   const channel = await client.channels.fetch(INPUT_CHANNEL_ID);
@@ -331,7 +350,9 @@ async function backfillFromChannelHistory(max) {
 
   while (scanned < max) {
     const batchSize = Math.min(100, max - scanned);
-    const batch = await channel.messages.fetch(lastId ? { limit: batchSize, before: lastId } : { limit: batchSize });
+    const batch = await channel.messages.fetch(
+      lastId ? { limit: batchSize, before: lastId } : { limit: batchSize }
+    );
     if (!batch.size) break;
 
     const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
@@ -354,7 +375,7 @@ async function backfillFromChannelHistory(max) {
 }
 
 // =========================
-// LEADERBOARD (SQL ORDER BY payout DESC)
+// LEADERBOARD (sorted in SQL by payout DESC)
 // =========================
 async function scheduleLeaderboardUpdate(immediate = false) {
   if (immediate) return updateLeaderboardMessage();
@@ -376,7 +397,6 @@ async function updateLeaderboardMessage() {
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
   const msg = await channel.messages.fetch(leaderboardMessageId);
 
-  // IMPORTANT: sort in SQL by computed payout DESC
   const { rows } = await pool.query(
     `
     SELECT
@@ -416,7 +436,7 @@ async function updateLeaderboardMessage() {
       `**${badge} ${name}**\n` +
       `🥚 Eggs: ${eggs}\n` +
       `🥛 Milk: ${milk}\n` +
-      `🐄 Cattle Net: $${cattleNet.toFixed(2)}\n` +
+      `🐄 Herd Profit: $${cattleNet.toFixed(2)}\n` +
       `💰 **$${payout.toFixed(2)}**\n\n`;
 
     rank++;
@@ -562,7 +582,6 @@ async function updateHerdMessage() {
 // =========================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
-  if (!HERD_CHANNEL_ID) return;
 
   if (interaction.channelId !== HERD_CHANNEL_ID) {
     return interaction.reply({ content: "Use the herding buttons in the herding channel.", ephemeral: true });
