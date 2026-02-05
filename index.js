@@ -12,48 +12,33 @@ const { Pool } = pg;
 // =========================
 const PORT = process.env.PORT || 8080;
 
-const INPUT_CHANNEL_ID = process.env.INPUT_CHANNEL_ID; // ranch logs channel
-const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID; // leaderboard channel
-const HERD_CHANNEL_ID = process.env.HERD_CHANNEL_ID; // herding queue channel
-
-const DEBUG = process.env.DEBUG === "true";
-
-const LEADERBOARD_DEBOUNCE_MS = Number(process.env.LEADERBOARD_DEBOUNCE_MS || 3000);
-
-const BACKFILL_ON_START = (process.env.BACKFILL_ON_START || "true") === "true";
-const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 5000);
-const BACKFILL_EVERY_MS = Number(process.env.BACKFILL_EVERY_MS || 300000);
+const INPUT_CHANNEL_ID = process.env.INPUT_CHANNEL_ID;
+const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
+const HERD_CHANNEL_ID = process.env.HERD_CHANNEL_ID;
 
 const PRICES = { eggs: 1.25, milk: 1.25 };
 
-// Herd sale economics (one payout per completed sale message; does NOT multiply)
+// Herd economy (one payout per completed sale message)
 const HERD_ANIMAL_TOTALS = {
   bison: { buy: 300, sell: 1200 },
   deer: { buy: 250, sell: 1000 },
   sheep: { buy: 150, sell: 900 },
 };
 
-// Ranch keeps $100 per completed herd sale (per finished cycle)
-const RANCH_PROFIT_PER_SALE = Number(process.env.RANCH_PROFIT_PER_SALE || 100);
+const RANCH_PROFIT_PER_SALE = 100;
 
 function herdCyclePayout(animalKey) {
   const v = HERD_ANIMAL_TOTALS[animalKey];
   return Math.max(0, (v.sell - v.buy) - RANCH_PROFIT_PER_SALE);
 }
 
-// Herd queue rules (Mode A)
-const HERD_REQUIRED_RUNS = Number(process.env.HERD_REQUIRED_RUNS || 4);
-const HERD_COOLDOWN_MINUTES = Number(process.env.HERD_COOLDOWN_MINUTES || 15);
-const HERD_STALE_HOURS = Number(process.env.HERD_STALE_HOURS || 2);
+// Herd rules
+const HERD_REQUIRED_RUNS = 4;
+const HERD_COOLDOWN_MINUTES = 15;
+const HERD_STALE_HOURS = 2;
 
 // =========================
-// CRASH LOGGING
-// =========================
-process.on("unhandledRejection", (r) => console.error("❌ unhandledRejection:", r));
-process.on("uncaughtException", (e) => console.error("❌ uncaughtException:", e));
-
-// =========================
-// POSTGRES
+// DATABASE
 // =========================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -61,127 +46,74 @@ const pool = new Pool({
 });
 
 // =========================
-// EXPRESS (Railway keep-alive)
+// EXPRESS
 // =========================
 const app = express();
-app.use(express.json());
-
-app.get("/", (_, res) => res.status(200).send("Ranch Manager online ✅"));
-app.get("/health", async (_, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.status(200).json({ ok: true, db: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, db: false, error: String(e?.message || e) });
-  }
-});
-
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Web server listening on port ${PORT}`);
-});
+app.get("/", (_, res) => res.send("Ranch Manager Running"));
+app.listen(PORT, "0.0.0.0");
 
 // =========================
 // DISCORD
 // =========================
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
-// Static message IDs (stored in DB table bot_messages)
 let leaderboardMessageId = null;
 let herdMessageId = null;
-
-// Leaderboard debounce
-let lbTimer = null;
-let lbQueued = false;
-
-// Herd message debounce
-let herdTimer = null;
-let herdQueued = false;
 
 // =========================
 // READY
 // =========================
 client.once("ready", async () => {
-  try {
-    console.log(`🚜 Ranch Manager online as ${client.user.tag}`);
-    await pool.query("SELECT 1");
-    console.log("✅ DB OK");
+  console.log(`🚜 Ranch Manager Online: ${client.user.tag}`);
 
-    if (!INPUT_CHANNEL_ID || !LEADERBOARD_CHANNEL_ID || !HERD_CHANNEL_ID) {
-      console.log("❌ Missing one of: INPUT_CHANNEL_ID, LEADERBOARD_CHANNEL_ID, HERD_CHANNEL_ID");
-      return;
-    }
+  leaderboardMessageId = await ensureStaticMessage(
+    "leaderboard",
+    LEADERBOARD_CHANNEL_ID,
+    "🏆 Beaver Farms — Weekly Ledger\nLoading..."
+  );
 
-    // Ensure static messages exist
-    leaderboardMessageId = await ensureBotMessage(
-      "leaderboard",
-      LEADERBOARD_CHANNEL_ID,
-      "🏆 Beaver Farms — Weekly Ledger\nLoading..."
-    );
+  herdMessageId = await ensureStaticMessage(
+    "herd",
+    HERD_CHANNEL_ID,
+    "🐎 Beaver Farms — Herding Queue\nLoading..."
+  );
 
-    herdMessageId = await ensureBotMessage(
-      "herd_queue",
-      HERD_CHANNEL_ID,
-      "🐎 Herding Queue\nLoading..."
-    );
-
-    // Backfill ranch logs
-    if (BACKFILL_ON_START) {
-      console.log(`📥 Backfill on start: scanning up to ${BACKFILL_MAX_MESSAGES} messages...`);
-      await backfillFromChannelHistory(BACKFILL_MAX_MESSAGES);
-    }
-
-    // Initial renders
-    await scheduleLeaderboardUpdate(true);
-    await scheduleHerdUpdate(true);
-
-    // Periodic backfill
-    setInterval(async () => {
-      try {
-        await backfillFromChannelHistory(300);
-        await scheduleLeaderboardUpdate(true);
-      } catch (e) {
-        console.error("❌ Periodic backfill failed:", e);
-      }
-    }, BACKFILL_EVERY_MS);
-
-    console.log("✅ Startup complete.");
-  } catch (e) {
-    console.error("❌ Startup failed:", e);
-    process.exit(1);
-  }
+  await updateLeaderboard();
+  await updateHerdBoard();
 });
 
 // =========================
-// UTIL: ensure static message (stored in DB)
+// STATIC MESSAGE HANDLER
 // =========================
-async function ensureBotMessage(key, channelId, initialText) {
+async function ensureStaticMessage(key, channelId, initialText) {
   const { rows } = await pool.query(
-    `SELECT message_id FROM public.bot_messages WHERE key = $1 LIMIT 1`,
+    "SELECT message_id FROM bot_messages WHERE key=$1",
     [key]
   );
 
   const channel = await client.channels.fetch(channelId);
 
   if (rows.length) {
-    const msgId = rows[0].message_id.toString();
     try {
-      await channel.messages.fetch(msgId);
-      return msgId;
-    } catch {
-      // missing -> recreate
-    }
+      await channel.messages.fetch(rows[0].message_id);
+      return rows[0].message_id;
+    } catch {}
   }
 
   const msg = await channel.send(initialText);
 
   await pool.query(
     `
-    INSERT INTO public.bot_messages (key, channel_id, message_id, updated_at)
-    VALUES ($1, $2::bigint, $3::bigint, NOW())
-    ON CONFLICT (key)
-    DO UPDATE SET channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id, updated_at = NOW()
+    INSERT INTO bot_messages (key, channel_id, message_id)
+    VALUES ($1,$2,$3)
+    ON CONFLICT (key) DO UPDATE
+    SET message_id=$3
     `,
     [key, channelId, msg.id]
   );
@@ -190,87 +122,50 @@ async function ensureBotMessage(key, channelId, initialText) {
 }
 
 // =========================
-// RANCH LOG LISTENER
+// LOG PARSER
 // =========================
 client.on("messageCreate", async (message) => {
-  try {
-    if (message.channel.id !== INPUT_CHANNEL_ID) return;
+  if (message.channel.id !== INPUT_CHANNEL_ID) return;
+  if (!message.webhookId && !message.author?.bot) return;
 
-    const isWebhookOrBot = Boolean(message.webhookId) || Boolean(message.author?.bot);
-    if (!isWebhookOrBot) return;
+  const parsed = parseMessage(message);
+  if (!parsed) return;
 
-    if (DEBUG) {
-      console.log("INCOMING LOG:", {
-        id: message.id,
-        content: message.content,
-        webhookId: message.webhookId,
-        embeds: message.embeds?.map((e) => ({ title: e.title, description: e.description })),
-      });
-    }
-
-    const parsed = parseRanchMessage(message);
-    if (!parsed) return;
-
-    const stored = await storeEventAndUpdateTotals({
-      discordMessageId: message.id,
-      ...parsed,
-    });
-
-    if (stored) await scheduleLeaderboardUpdate();
-  } catch (e) {
-    console.error("❌ messageCreate failed:", e);
-  }
+  const inserted = await storeEvent(parsed, message.id);
+  if (inserted) await updateLeaderboard();
 });
 
-// =========================
-// PARSE RANCH MESSAGE (embeds + content)
-// Eggs/Milk: uses ": qty"
-// Herd sale: pays fixed payout based on animal totals, minus ranch profit per sale
-// =========================
-function parseRanchMessage(message) {
-  let text = (message.content || "").trim();
+function parseMessage(message) {
+  let text = message.content || "";
 
   if (message.embeds?.length) {
     for (const e of message.embeds) {
-      if (e.title) text += `\n${e.title}`;
-      if (e.description) text += `\n${e.description}`;
-      if (e.fields?.length) {
-        for (const f of e.fields) {
-          if (f.name) text += `\n${f.name}`;
-          if (f.value) text += `\n${f.value}`;
-        }
-      }
+      if (e.title) text += "\n" + e.title;
+      if (e.description) text += "\n" + e.description;
     }
   }
 
-  text = text.trim();
-  if (!text) return null;
-
   const userMatch = text.match(/<@(\d+)>/);
   if (!userMatch) return null;
-  const userId = BigInt(userMatch[1]).toString();
+  const userId = userMatch[1];
 
-  const ranchIdMatch = text.match(/Ranch ID:\s*(\d+)/i) || text.match(/ranch id\s*(\d+)/i);
-  const ranchId = ranchIdMatch ? Number(ranchIdMatch[1]) : null;
-
-  // Eggs/Milk add pattern
-  const addedMatch = text.match(/:\s*(\d+)\s*$/m);
-  const qty = addedMatch ? Number(addedMatch[1]) : 0;
-
-  if (/Eggs Added|Added Eggs/i.test(text) && qty > 0) {
-    return { userId, ranchId, item: "eggs", amount: qty };
+  // Eggs
+  if (/Eggs Added/i.test(text)) {
+    const qty = Number(text.match(/:\s*(\d+)/)?.[1] || 0);
+    if (qty > 0) return { userId, item: "eggs", amount: qty };
   }
 
-  if (/Milk Added|Added Milk/i.test(text) && qty > 0) {
-    return { userId, ranchId, item: "milk", amount: qty };
+  // Milk
+  if (/Milk Added/i.test(text)) {
+    const qty = Number(text.match(/:\s*(\d+)/)?.[1] || 0);
+    if (qty > 0) return { userId, item: "milk", amount: qty };
   }
 
-  // Herd sale pattern: treat as ONE completed cycle payout (no multiplying)
-  // We only trigger on messages that look like the cattle sale messages.
-  if (/Cattle Sale/i.test(text) || /Player .* sold/i.test(text) || /\bsold\s+\d+\s+/i.test(text)) {
+  // Herd Sale (one payout per message)
+  if (/sold/i.test(text)) {
     const lower = text.toLowerCase();
-
     let animal = null;
+
     if (lower.includes("bison")) animal = "bison";
     else if (lower.includes("deer")) animal = "deer";
     else if (lower.includes("sheep")) animal = "sheep";
@@ -278,475 +173,183 @@ function parseRanchMessage(message) {
     if (!animal) return null;
 
     const payout = herdCyclePayout(animal);
-    return { userId, ranchId, item: "cattle", amount: payout };
+    return { userId, item: "cattle", amount: payout };
   }
 
   return null;
 }
 
 // =========================
-// DB: Insert event + update totals (dedupe by discord_message_id)
-// eggs/milk: amount is units
-// cattle: amount is payout dollars (numeric)
+// STORE EVENT
 // =========================
-async function storeEventAndUpdateTotals({ discordMessageId, userId, ranchId, item, amount }) {
-  const c = await pool.connect();
-  try {
-    await c.query("BEGIN");
+async function storeEvent({ userId, item, amount }, discordMessageId) {
+  const result = await pool.query(
+    `
+    INSERT INTO ranch_events (discord_message_id,user_id,item,amount)
+    VALUES ($1,$2,$3,$4)
+    ON CONFLICT (discord_message_id) DO NOTHING
+    RETURNING id
+    `,
+    [discordMessageId, userId, item, amount]
+  );
 
-    const ins = await c.query(
-      `
-      INSERT INTO public.ranch_events
-        (discord_message_id, user_id, ranch_id, item, amount)
-      VALUES ($1, $2::bigint, $3, $4, $5::numeric)
-      ON CONFLICT (discord_message_id) DO NOTHING
-      RETURNING id
-      `,
-      [discordMessageId, userId, ranchId, item, amount]
-    );
+  if (!result.rowCount) return false;
 
-    if (!ins.rowCount) {
-      await c.query("ROLLBACK");
-      return false;
-    }
+  await pool.query(
+    `
+    INSERT INTO ranch_totals (user_id, eggs, milk, cattle)
+    VALUES ($1,0,0,0)
+    ON CONFLICT (user_id) DO NOTHING
+    `,
+    [userId]
+  );
 
-    await c.query(
-      `
-      INSERT INTO public.ranch_totals (user_id, eggs, milk, cattle)
-      VALUES ($1::bigint, 0, 0, 0)
-      ON CONFLICT (user_id) DO NOTHING
-      `,
-      [userId]
-    );
+  await pool.query(
+    `UPDATE ranch_totals
+     SET ${item}=${item}+$2
+     WHERE user_id=$1`,
+    [userId, amount]
+  );
 
-    await c.query(
-      `
-      UPDATE public.ranch_totals
-      SET ${item} = ${item} + $2::numeric,
-          updated_at = NOW()
-      WHERE user_id = $1::bigint
-      `,
-      [userId, amount]
-    );
-
-    await c.query("COMMIT");
-    return true;
-  } catch (e) {
-    await c.query("ROLLBACK");
-    console.error("❌ DB transaction failed:", e);
-    return false;
-  } finally {
-    c.release();
-  }
+  return true;
 }
 
 // =========================
-// Backfill ranch logs (safe; dedupe prevents double counting)
+// LEADERBOARD (sorted SQL)
 // =========================
-async function backfillFromChannelHistory(max) {
-  const channel = await client.channels.fetch(INPUT_CHANNEL_ID);
-  let lastId = null;
-  let scanned = 0;
-
-  while (scanned < max) {
-    const batchSize = Math.min(100, max - scanned);
-    const batch = await channel.messages.fetch(
-      lastId ? { limit: batchSize, before: lastId } : { limit: batchSize }
-    );
-    if (!batch.size) break;
-
-    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-    for (const msg of sorted) {
-      scanned++;
-      const isWebhookOrBot = Boolean(msg.webhookId) || Boolean(msg.author?.bot);
-      if (!isWebhookOrBot) continue;
-
-      const parsed = parseRanchMessage(msg);
-      if (!parsed) continue;
-
-      await storeEventAndUpdateTotals({ discordMessageId: msg.id, ...parsed });
-    }
-
-    lastId = sorted[0].id;
-  }
-
-  if (DEBUG) console.log(`📥 Backfill scanned ${scanned}`);
-}
-
-// =========================
-// LEADERBOARD (sorted in SQL by payout DESC)
-// =========================
-async function scheduleLeaderboardUpdate(immediate = false) {
-  if (immediate) return updateLeaderboardMessage();
-
-  lbQueued = true;
-  if (lbTimer) return;
-
-  lbTimer = setTimeout(async () => {
-    lbTimer = null;
-    if (!lbQueued) return;
-    lbQueued = false;
-    await updateLeaderboardMessage();
-  }, LEADERBOARD_DEBOUNCE_MS);
-}
-
-async function updateLeaderboardMessage() {
-  if (!leaderboardMessageId) return;
-
+async function updateLeaderboard() {
   const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
   const msg = await channel.messages.fetch(leaderboardMessageId);
 
   const { rows } = await pool.query(
     `
-    SELECT
-      user_id,
-      eggs,
-      milk,
-      cattle,
-      (eggs * $1::numeric + milk * $2::numeric + cattle) AS payout
-    FROM public.ranch_totals
-    WHERE eggs > 0 OR milk > 0 OR cattle > 0
+    SELECT user_id, eggs, milk, cattle,
+    (eggs*1.25 + milk*1.25 + cattle) AS payout
+    FROM ranch_totals
+    WHERE eggs>0 OR milk>0 OR cattle>0
     ORDER BY payout DESC
-    `,
-    [PRICES.eggs, PRICES.milk]
+    `
   );
 
-  let total = 0;
-  let out = "🏆 **Beaver Farms — Weekly Ledger (Top Earners)**\n\n";
-
+  let output = "🏆 **Beaver Farms — Weekly Ledger (Top Earners)**\n\n";
   let rank = 1;
   const medals = ["🥇", "🥈", "🥉"];
 
   for (const r of rows) {
-    const eggs = Number(r.eggs);
-    const milk = Number(r.milk);
-    const cattleNet = Number(r.cattle);
-    const payout = Number(r.payout);
-
-    total += payout;
-
-    const userId = r.user_id.toString();
-    const user = await client.users.fetch(userId).catch(() => null);
-    const name = user ? user.username : userId;
-
     const badge = medals[rank - 1] || `#${rank}`;
+    const user = await client.users.fetch(r.user_id).catch(() => null);
+    const name = user ? user.username : r.user_id;
 
-    out +=
+    output +=
       `**${badge} ${name}**\n` +
-      `🥚 Eggs: ${eggs}\n` +
-      `🥛 Milk: ${milk}\n` +
-      `🐄 Herd Profit: $${cattleNet.toFixed(2)}\n` +
-      `💰 **$${payout.toFixed(2)}**\n\n`;
+      `🥚 ${r.eggs} | 🥛 ${r.milk} | 🐄 $${Number(r.cattle).toFixed(2)}\n` +
+      `💰 **$${Number(r.payout).toFixed(2)}**\n\n`;
 
     rank++;
   }
 
-  out += `---\n💼 **Total Ranch Payroll:** $${total.toFixed(2)}`;
-
-  await msg.edit(out);
+  await msg.edit(output);
 }
 
 // =========================
-// HERDING QUEUE (Mode A)
+// HERD QUEUE (STATIC ONLY)
 // =========================
 function now() { return new Date(); }
 function addMinutes(d, m) { return new Date(d.getTime() + m * 60000); }
 function addHours(d, h) { return new Date(d.getTime() + h * 3600000); }
 function toUnix(d) { return Math.floor(d.getTime() / 1000); }
-function fmtRel(d) { return `<t:${toUnix(d)}:R>`; }
+function rel(d) { return `<t:${toUnix(d)}:R>`; }
 
-async function getHerdState() {
-  const { rows } = await pool.query(`SELECT * FROM public.herd_state WHERE id = 1 LIMIT 1`);
-  return rows[0];
-}
-
-async function setHerdState(patch) {
-  const keys = Object.keys(patch);
-  if (!keys.length) return;
-
-  const sets = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
-  const vals = keys.map((k) => patch[k]);
-
-  await pool.query(`UPDATE public.herd_state SET ${sets} WHERE id = 1`, vals);
-}
-
-async function getQueue() {
-  const { rows } = await pool.query(`SELECT user_id, joined_at FROM public.herd_queue ORDER BY joined_at ASC`);
-  return rows.map((r) => ({ userId: r.user_id.toString(), joinedAt: r.joined_at }));
-}
-
-async function queueAdd(userId) {
-  await pool.query(
-    `INSERT INTO public.herd_queue (user_id, joined_at)
-     VALUES ($1::bigint, NOW())
-     ON CONFLICT (user_id) DO NOTHING`,
-    [userId]
-  );
-}
-
-async function queueRemove(userId) {
-  await pool.query(`DELETE FROM public.herd_queue WHERE user_id = $1::bigint`, [userId]);
-}
-
-function buildHerdButtons(canTakeOver) {
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("herd_join").setLabel("Reserve Slot (Join Queue)").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("herd_leave").setLabel("Leave Queue").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("herd_start").setLabel("Start Herding").setStyle(ButtonStyle.Primary),
-  );
-
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("herd_done").setLabel("Mark 1 Herd Done").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("herd_sold").setLabel("Mark Sold (Reset 0/4)").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("herd_end").setLabel("End Session").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("herd_takeover").setLabel("Take Over (2h rule)").setStyle(ButtonStyle.Danger).setDisabled(!canTakeOver),
-  );
-
-  return [row1, row2];
-}
-
-async function scheduleHerdUpdate(immediate = false) {
-  if (immediate) return updateHerdMessage();
-
-  herdQueued = true;
-  if (herdTimer) return;
-
-  herdTimer = setTimeout(async () => {
-    herdTimer = null;
-    if (!herdQueued) return;
-    herdQueued = false;
-    await updateHerdMessage();
-  }, 1200);
-}
-
-async function updateHerdMessage() {
-  if (!herdMessageId) return;
-
+async function updateHerdBoard() {
   const channel = await client.channels.fetch(HERD_CHANNEL_ID);
   const msg = await channel.messages.fetch(herdMessageId);
 
-  const state = await getHerdState();
-  const queue = await getQueue();
+  const { rows: [state] } = await pool.query(`SELECT * FROM herd_state WHERE id=1`);
+  const { rows: queue } = await pool.query(`SELECT user_id FROM herd_queue ORDER BY joined_at ASC`);
 
-  const activeUserId = state.active_user_id ? state.active_user_id.toString() : null;
-  const startedAt = state.active_started_at ? new Date(state.active_started_at) : null;
-  const lastActionAt = state.active_last_action_at ? new Date(state.active_last_action_at) : null;
-  const cooldownUntil = state.active_cooldown_until ? new Date(state.active_cooldown_until) : null;
-  const progress = Number(state.active_progress || 0);
+  let output = "🐎 **Beaver Farms — Herding Queue**\n\n";
+  output += "Rules: 1 active herder • 15m cooldown • 4 runs to sell • stale after 2h\n\n";
 
-  const stale = activeUserId && lastActionAt && now().getTime() >= addHours(lastActionAt, HERD_STALE_HOURS).getTime();
-  const canTakeOver = Boolean(stale);
-
-  let out = "🐎 **Beaver Farms — Herding Queue**\n\n";
-  out += `**Rules:** 1 active herder • ${HERD_COOLDOWN_MINUTES}m cooldown per run • ${HERD_REQUIRED_RUNS} runs to sell • stale after ${HERD_STALE_HOURS}h\n\n`;
-
-  if (!activeUserId) {
-    out += `**Current Herder:** _None_ ✅\n`;
-    out += `**Status:** Herding is available.\n\n`;
+  if (!state.active_user_id) {
+    output += "Current Herder: None ✅\nStatus: Herding is available.\n\n";
   } else {
-    out += `**Current Herder:** <@${activeUserId}>\n`;
-    if (startedAt) out += `**Started:** ${fmtRel(startedAt)}\n`;
-    if (lastActionAt) out += `**Last action:** ${fmtRel(lastActionAt)}\n`;
-
-    out += stale
-      ? `**Status:** ⚠️ **STALE** (inactive > ${HERD_STALE_HOURS}h) — takeover allowed.\n`
-      : `**Status:** Active\n`;
-
-    out += `**Progress:** ${progress}/${HERD_REQUIRED_RUNS} ${progress >= HERD_REQUIRED_RUNS ? "✅ **READY TO SELL**" : ""}\n`;
-
-    if (cooldownUntil && now().getTime() < cooldownUntil.getTime()) {
-      out += `**Cooldown:** ends ${fmtRel(cooldownUntil)}\n`;
-    } else {
-      out += `**Cooldown:** none\n`;
-    }
-
-    out += "\n";
+    output += `Current Herder: <@${state.active_user_id}>\n`;
+    output += `Progress: ${state.active_progress}/4\n`;
+    if (state.active_cooldown_until && now() < state.active_cooldown_until)
+      output += `Cooldown: ends ${rel(state.active_cooldown_until)}\n`;
+    output += "\n";
   }
 
-  out += "**Queue:**\n";
-  if (!queue.length) {
-    out += "_No one in queue._\n";
-  } else {
-    queue.slice(0, 15).forEach((q, i) => {
-      out += `${i + 1}. <@${q.userId}>\n`;
-    });
-    if (queue.length > 15) out += `…and ${queue.length - 15} more\n`;
-  }
+  output += "Queue:\n";
+  if (!queue.length) output += "No one in queue.";
+  else queue.forEach((q, i) => output += `${i + 1}. <@${q.user_id}>\n`);
 
-  await msg.edit({ content: out, components: buildHerdButtons(canTakeOver) });
+  await msg.edit({
+    content: output,
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("join").setLabel("Join Queue").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("leave").setLabel("Leave Queue").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("start").setLabel("Start").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("done").setLabel("Mark Done").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("end").setLabel("End").setStyle(ButtonStyle.Danger),
+      ),
+    ],
+  });
 }
 
 // =========================
-// BUTTON HANDLERS
+// BUTTON HANDLER (NO SPAM)
 // =========================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
 
-  if (interaction.channelId !== HERD_CHANNEL_ID) {
-    return interaction.reply({ content: "Use the herding buttons in the herding channel.", ephemeral: true });
-  }
+  await interaction.deferUpdate(); // silent
 
   const userId = interaction.user.id;
 
-  try {
-    const state = await getHerdState();
-    const queue = await getQueue();
-
-    const activeUserId = state.active_user_id ? state.active_user_id.toString() : null;
-    const lastActionAt = state.active_last_action_at ? new Date(state.active_last_action_at) : null;
-    const cooldownUntil = state.active_cooldown_until ? new Date(state.active_cooldown_until) : null;
-    const progress = Number(state.active_progress || 0);
-
-    const stale = activeUserId && lastActionAt && now().getTime() >= addHours(lastActionAt, HERD_STALE_HOURS).getTime();
-
-    const isQueued = queue.some((q) => q.userId === userId);
-    const isFirst = queue.length > 0 && queue[0].userId === userId;
-    const isActive = activeUserId === userId;
-
-    if (interaction.customId === "herd_join") {
-      if (isActive) return interaction.reply({ content: "You’re already the active herder.", ephemeral: true });
-      if (isQueued) return interaction.reply({ content: "You’re already in the queue.", ephemeral: true });
-
-      await queueAdd(userId);
-      await scheduleHerdUpdate(true);
-      return interaction.reply({ content: "✅ You joined the herding queue.", ephemeral: true });
-    }
-
-    if (interaction.customId === "herd_leave") {
-      if (!isQueued) return interaction.reply({ content: "You’re not in the queue.", ephemeral: true });
-      await queueRemove(userId);
-      await scheduleHerdUpdate(true);
-      return interaction.reply({ content: "✅ You left the queue.", ephemeral: true });
-    }
-
-    if (interaction.customId === "herd_start") {
-      if (activeUserId && !stale) {
-        return interaction.reply({ content: "Someone is already herding right now.", ephemeral: true });
-      }
-      if (!isFirst) {
-        return interaction.reply({ content: "You can only start if you’re #1 in the queue.", ephemeral: true });
-      }
-
-      await queueRemove(userId);
-      await setHerdState({
-        active_user_id: userId,
-        active_started_at: now(),
-        active_last_action_at: now(),
-        active_progress: 0,
-        active_cooldown_until: null,
-      });
-
-      await scheduleHerdUpdate(true);
-      return interaction.reply({ content: "🐎 You’re now the active herder.", ephemeral: true });
-    }
-
-    if (interaction.customId === "herd_done") {
-      if (!isActive) return interaction.reply({ content: "Only the active herder can do that.", ephemeral: true });
-
-      if (cooldownUntil && now().getTime() < cooldownUntil.getTime()) {
-        return interaction.reply({ content: `Cooldown active. Ends ${fmtRel(cooldownUntil)}.`, ephemeral: true });
-      }
-
-      if (progress >= HERD_REQUIRED_RUNS) {
-        return interaction.reply({ content: `You’re already at ${HERD_REQUIRED_RUNS}/${HERD_REQUIRED_RUNS} — ready to sell.`, ephemeral: true });
-      }
-
-      const newProgress = Math.min(HERD_REQUIRED_RUNS, progress + 1);
-      const cd = addMinutes(now(), HERD_COOLDOWN_MINUTES);
-
-      await setHerdState({
-        active_last_action_at: now(),
-        active_progress: newProgress,
-        active_cooldown_until: cd,
-      });
-
-      await scheduleHerdUpdate(true);
-      return interaction.reply({ content: `✅ Herd run recorded: ${newProgress}/${HERD_REQUIRED_RUNS}. Cooldown started.`, ephemeral: true });
-    }
-
-    if (interaction.customId === "herd_sold") {
-      if (!isActive) return interaction.reply({ content: "Only the active herder can do that.", ephemeral: true });
-
-      if (progress < HERD_REQUIRED_RUNS) {
-        return interaction.reply({ content: `You need ${HERD_REQUIRED_RUNS}/${HERD_REQUIRED_RUNS} before selling.`, ephemeral: true });
-      }
-
-      const cd = addMinutes(now(), HERD_COOLDOWN_MINUTES);
-
-      await setHerdState({
-        active_last_action_at: now(),
-        active_progress: 0,
-        active_cooldown_until: cd,
-      });
-
-      await scheduleHerdUpdate(true);
-      return interaction.reply({ content: "🏁 Sold recorded. Progress reset to 0/4. Cooldown started.", ephemeral: true });
-    }
-
-    if (interaction.customId === "herd_end") {
-      if (!isActive) return interaction.reply({ content: "Only the active herder can end the session.", ephemeral: true });
-
-      await setHerdState({
-        active_user_id: null,
-        active_started_at: null,
-        active_last_action_at: null,
-        active_progress: 0,
-        active_cooldown_until: null,
-      });
-
-      await scheduleHerdUpdate(true);
-      return interaction.reply({ content: "✅ Session ended. Herding is now available.", ephemeral: true });
-    }
-
-    if (interaction.customId === "herd_takeover") {
-      if (!activeUserId || !stale) {
-        return interaction.reply({ content: `Takeover is only allowed if inactive for ${HERD_STALE_HOURS} hours.`, ephemeral: true });
-      }
-
-      await queueRemove(userId);
-
-      await setHerdState({
-        active_user_id: userId,
-        active_started_at: now(),
-        active_last_action_at: now(),
-        active_progress: 0,
-        active_cooldown_until: null,
-      });
-
-      await scheduleHerdUpdate(true);
-      return interaction.reply({ content: "⚠️ Takeover successful. You are now the active herder.", ephemeral: true });
-    }
-
-    return interaction.reply({ content: "Unknown action.", ephemeral: true });
-  } catch (e) {
-    console.error("❌ interaction failed:", e);
-    try {
-      if (!interaction.replied) {
-        return interaction.reply({ content: "Error processing that. Try again.", ephemeral: true });
-      }
-    } catch {}
+  if (interaction.customId === "join") {
+    await pool.query(
+      `INSERT INTO herd_queue (user_id) VALUES ($1)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId]
+    );
   }
+
+  if (interaction.customId === "leave") {
+    await pool.query(`DELETE FROM herd_queue WHERE user_id=$1`, [userId]);
+  }
+
+  if (interaction.customId === "start") {
+    const { rows } = await pool.query(`SELECT * FROM herd_state WHERE id=1`);
+    if (!rows[0].active_user_id) {
+      await pool.query(
+        `UPDATE herd_state SET active_user_id=$1, active_progress=0 WHERE id=1`,
+        [userId]
+      );
+      await pool.query(`DELETE FROM herd_queue WHERE user_id=$1`, [userId]);
+    }
+  }
+
+  if (interaction.customId === "done") {
+    await pool.query(
+      `UPDATE herd_state
+       SET active_progress=active_progress+1,
+           active_cooldown_until=NOW() + INTERVAL '15 minutes'
+       WHERE id=1 AND active_user_id=$1`,
+      [userId]
+    );
+  }
+
+  if (interaction.customId === "end") {
+    await pool.query(
+      `UPDATE herd_state
+       SET active_user_id=NULL, active_progress=0, active_cooldown_until=NULL
+       WHERE id=1`
+    );
+  }
+
+  await updateHerdBoard();
 });
 
-// =========================
-// GRACEFUL SHUTDOWN
-// =========================
-async function shutdown(signal) {
-  console.log(`🛑 ${signal} received. Shutting down...`);
-  try {
-    await client.destroy().catch(() => {});
-    await pool.end().catch(() => {});
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 10000).unref();
-  } catch {
-    process.exit(1);
-  }
-}
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
-
-// =========================
-// LOGIN
-// =========================
 client.login(process.env.BOT_TOKEN);
