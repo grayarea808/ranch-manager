@@ -24,26 +24,25 @@ const CAMP_INPUT_CHANNEL_ID = process.env.CAMP_INPUT_CHANNEL_ID;
 const CAMP_OUTPUT_CHANNEL_ID = process.env.CAMP_OUTPUT_CHANNEL_ID;
 
 if (!DATABASE_URL || !CAMP_INPUT_CHANNEL_ID || !CAMP_OUTPUT_CHANNEL_ID) {
-  console.error("❌ Missing required Railway variables: DATABASE_URL / CAMP_INPUT_CHANNEL_ID / CAMP_OUTPUT_CHANNEL_ID");
+  console.error("❌ Missing required Railway variables.");
   process.exit(1);
 }
 
-const BACKFILL_ON_START = (process.env.BACKFILL_ON_START || "true") === "true";
-const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 5000);
+const BACKFILL_ON_START = true;
+const BACKFILL_MAX_MESSAGES = 5000;
 
-// Delivery tier values
+// Delivery values
 const DELIVERY_VALUES = {
   small: 500,
   medium: 950,
   large: 1500,
 };
 
-// Sale values seen in logs -> tier mapping
 const SALE_VALUE_TO_TIER = {
   500: "small",
   950: "medium",
   1500: "large",
-  1900: "large", // keep if your server uses 1900 as a "large-like" sale
+  1900: "large",
 };
 
 const CAMP_CUT = 0.30;
@@ -54,30 +53,20 @@ const SUPPLY_POINTS = 1;
 // ================= DB =================
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+  ssl: { rejectUnauthorized: false },
 });
 
 // ================= EXPRESS =================
 const app = express();
 app.get("/", (_, res) => res.status(200).send("Camp Tracker running ✅"));
-app.get("/health", async (_, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.status(200).json({ ok: true, db: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, db: false, error: String(e?.message || e) });
-  }
-});
-app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Web listening on ${PORT}`));
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`🚀 Web listening on ${PORT}`)
+);
 
 // ================= DISCORD =================
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
-
-client.on("error", (e) => console.error("❌ Discord error:", e));
-process.on("unhandledRejection", (r) => console.error("❌ unhandledRejection:", r));
-process.on("uncaughtException", (e) => console.error("❌ uncaughtException:", e));
 
 // ================= SCHEMA =================
 async function ensureSchema() {
@@ -110,97 +99,41 @@ async function ensureSchema() {
   `);
 }
 
-// ================= STATIC MESSAGE =================
-async function ensureBotMessage(key, channelId, initialText) {
-  const { rows } = await pool.query(
-    `SELECT message_id FROM public.bot_messages WHERE key=$1 LIMIT 1`,
-    [key]
-  );
-
-  const channel = await client.channels.fetch(channelId);
-
-  if (rows.length) {
-    const msgId = rows[0].message_id.toString();
-    try {
-      await channel.messages.fetch(msgId);
-      return msgId;
-    } catch {}
-  }
-
-  const msg = await channel.send(initialText);
-
-  await pool.query(
-    `
-    INSERT INTO public.bot_messages (key, channel_id, message_id, updated_at)
-    VALUES ($1, $2::bigint, $3::bigint, NOW())
-    ON CONFLICT (key)
-    DO UPDATE SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id, updated_at=NOW()
-    `,
-    [key, channelId, msg.id]
-  );
-
-  return msg.id;
-}
-
-// ================= TEXT EXTRACTION =================
+// ================= UTIL =================
 function extractAllText(message) {
-  let text = (message.content || "").trim();
-
+  let text = message.content || "";
   if (message.embeds?.length) {
     for (const e of message.embeds) {
-      if (e.title) text += `\n${e.title}`;
       if (e.description) text += `\n${e.description}`;
-      if (e.author?.name) text += `\n${e.author.name}`;
-      if (e.fields?.length) {
-        for (const f of e.fields) {
-          if (f.name) text += `\n${f.name}`;
-          if (f.value) text += `\n${f.value}`;
-        }
+      if (e.fields) {
+        for (const f of e.fields) text += `\n${f.value}`;
       }
-      if (e.footer?.text) text += `\n${e.footer.text}`;
     }
   }
-
-  return text.trim();
+  return text;
 }
 
-// Example: "Discord: @grayarea 316442197715189770"
-function extractUserIdFromDiscordLine(text) {
+function extractUserId(text) {
   const m = text.match(/Discord:\s*@\S+\s+(\d{17,19})/i);
   if (m) return m[1];
-
-  // fallback: any snowflake
   const any = text.match(/\b(\d{17,19})\b/);
   return any ? any[1] : null;
 }
 
-// ================= PARSER =================
 function parseCampLog(message) {
   const text = extractAllText(message);
-  if (!text) return null;
-
-  const userId = extractUserIdFromDiscordLine(text);
+  const userId = extractUserId(text);
   if (!userId) return null;
 
-  // Delivered Supplies: 42
   const sup = text.match(/Delivered Supplies:\s*(\d+)/i);
-  if (sup) {
-    const amount = Number(sup[1] || 0);
-    if (amount > 0) return { userId, item: "supplies", amount };
-  }
+  if (sup) return { userId, item: "supplies", amount: Number(sup[1]) };
 
-  // Materials added: 1.0
-  const mat = text.match(/Materials added:\s*([0-9]+(?:\.[0-9]+)?)/i);
-  if (mat) {
-    const amount = Math.floor(Number(mat[1] || 0));
-    if (amount > 0) return { userId, item: "materials", amount };
-  }
+  const mat = text.match(/Materials added:\s*([0-9]+)/i);
+  if (mat) return { userId, item: "materials", amount: Number(mat[1]) };
 
-  // Made a Sale Of 50 Of Stock For $950
-  const sale = text.match(/Made a Sale Of\s+\d+\s+Of Stock For\s+\$([0-9]+(?:\.[0-9]+)?)/i);
+  const sale = text.match(/Made a Sale Of\s+\d+\s+Of Stock For\s+\$([0-9]+)/i);
   if (sale) {
-    const value = Math.round(Number(sale[1]));
-    const tier = SALE_VALUE_TO_TIER[value];
+    const tier = SALE_VALUE_TO_TIER[Number(sale[1])];
     if (tier) return { userId, item: tier, amount: 1 };
   }
 
@@ -208,103 +141,72 @@ function parseCampLog(message) {
 }
 
 // ================= DB OPS =================
-async function insertEvent(discordMessageId, parsed) {
-  const { rowCount } = await pool.query(
-    `
+async function insertEvent(id, parsed) {
+  await pool.query(`
     INSERT INTO public.camp_events (discord_message_id, user_id, item, amount)
-    VALUES ($1, $2::bigint, $3, $4::int)
+    VALUES ($1,$2,$3,$4)
     ON CONFLICT (discord_message_id) DO NOTHING
-    `,
-    [discordMessageId, parsed.userId, parsed.item, parsed.amount]
-  );
-  return rowCount > 0;
+  `, [id, parsed.userId, parsed.item, parsed.amount]);
 }
 
 async function rebuildTotals() {
   await pool.query(`TRUNCATE public.camp_totals`);
 
   await pool.query(`
-    INSERT INTO public.camp_totals (user_id, material_sets, supplies, small, medium, large, updated_at)
+    INSERT INTO public.camp_totals (user_id, material_sets, supplies, small, medium, large)
     SELECT
       user_id,
-      COALESCE(SUM(CASE WHEN item='materials' THEN amount ELSE 0 END),0)::int AS material_sets,
-      COALESCE(SUM(CASE WHEN item='supplies' THEN amount ELSE 0 END),0)::int AS supplies,
-      COALESCE(SUM(CASE WHEN item='small' THEN amount ELSE 0 END),0)::int AS small,
-      COALESCE(SUM(CASE WHEN item='medium' THEN amount ELSE 0 END),0)::int AS medium,
-      COALESCE(SUM(CASE WHEN item='large' THEN amount ELSE 0 END),0)::int AS large,
-      NOW()
+      SUM(CASE WHEN item='materials' THEN amount ELSE 0 END),
+      SUM(CASE WHEN item='supplies' THEN amount ELSE 0 END),
+      SUM(CASE WHEN item='small' THEN amount ELSE 0 END),
+      SUM(CASE WHEN item='medium' THEN amount ELSE 0 END),
+      SUM(CASE WHEN item='large' THEN amount ELSE 0 END)
     FROM public.camp_events
     GROUP BY user_id
   `);
 }
 
-// ================= BACKFILL =================
-async function backfillFromHistory(maxMessages) {
-  const channel = await client.channels.fetch(CAMP_INPUT_CHANNEL_ID);
-
-  let lastId = null;
-  let scanned = 0;
-  let parsedCount = 0;
-  let inserted = 0;
-
-  while (scanned < maxMessages) {
-    const batchSize = Math.min(100, maxMessages - scanned);
-    const batch = await channel.messages.fetch(lastId ? { limit: batchSize, before: lastId } : { limit: batchSize });
-    if (!batch.size) break;
-
-    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-    for (const msg of sorted) {
-      scanned++;
-      if (!msg.webhookId && !msg.author?.bot) continue;
-
-      const parsed = parseCampLog(msg);
-      if (!parsed) continue;
-      parsedCount++;
-
-      const ok = await insertEvent(msg.id, parsed);
-      if (ok) inserted++;
-    }
-
-    lastId = sorted[0].id;
+// ================= DISPLAY HELPERS =================
+async function getDiscordTag(userId) {
+  try {
+    const user = await client.users.fetch(userId);
+    return `@${user.username}`;
+  } catch {
+    return `<@${userId}>`;
   }
-
-  console.log(`📥 Camp backfill: scanned=${scanned} parsed=${parsedCount} inserted=${inserted}`);
 }
 
-// ================= BOARD RENDER =================
 function computePoints(p) {
-  const deliveries = p.small + p.medium + p.large;
-  return (p.material_sets * MATERIAL_POINTS) + (deliveries * DELIVERY_POINTS) + (p.supplies * SUPPLY_POINTS);
+  return (p.material_sets * MATERIAL_POINTS) +
+         ((p.small + p.medium + p.large) * DELIVERY_POINTS) +
+         (p.supplies * SUPPLY_POINTS);
 }
 
-function totalDeliveryValue(p) {
+function deliveryValue(p) {
   return (p.small * DELIVERY_VALUES.small) +
          (p.medium * DELIVERY_VALUES.medium) +
          (p.large * DELIVERY_VALUES.large);
 }
 
-function fmtMoney(x) {
-  return `$${Number(x).toFixed(2)}`;
-}
-
+// ================= BOARD =================
 async function updateCampBoard() {
-  const msgId = await ensureBotMessage(
-    "camp_board",
-    CAMP_OUTPUT_CHANNEL_ID,
-    "🏕️ Baba Yaga Camp\nLoading..."
-  );
-
   const channel = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
-  const msg = await channel.messages.fetch(msgId);
+  let msg;
+  const { rows } = await pool.query(`SELECT message_id FROM public.bot_messages WHERE key='camp_board'`);
+  if (rows.length) {
+    msg = await channel.messages.fetch(rows[0].message_id);
+  } else {
+    msg = await channel.send("Loading...");
+    await pool.query(`
+      INSERT INTO public.bot_messages (key, channel_id, message_id)
+      VALUES ('camp_board',$1,$2)
+    `, [CAMP_OUTPUT_CHANNEL_ID, msg.id]);
+  }
 
-  const { rows } = await pool.query(`
-    SELECT user_id, material_sets, supplies, small, medium, large
-    FROM public.camp_totals
-    WHERE material_sets>0 OR supplies>0 OR small>0 OR medium>0 OR large>0
-  `);
+  const data = await pool.query(`SELECT * FROM public.camp_totals`);
+  const players = [];
 
-  const players = rows.map(r => {
+  for (const r of data.rows) {
     const p = {
       user_id: r.user_id.toString(),
       material_sets: Number(r.material_sets),
@@ -313,92 +215,67 @@ async function updateCampBoard() {
       medium: Number(r.medium),
       large: Number(r.large),
     };
-    const points = computePoints(p);
-    const deliveries = p.small + p.medium + p.large;
-    const delValue = totalDeliveryValue(p);
-    return { ...p, points, deliveries, delValue };
+    p.points = computePoints(p);
+    p.value = deliveryValue(p);
+    players.push(p);
+  }
+
+  const gross = players.reduce((a,p)=>a+p.value,0);
+  const poolValue = gross*(1-CAMP_CUT);
+  const totalPoints = players.reduce((a,p)=>a+p.points,0);
+  players.forEach(p=>{
+    p.payout = totalPoints>0 ? (p.points/totalPoints)*poolValue : 0;
   });
 
-  const totalPoints = players.reduce((a, p) => a + p.points, 0);
-  const gross = players.reduce((a, p) => a + p.delValue, 0);
-  const playerPool = gross * (1 - CAMP_CUT);
-  const campRevenue = gross * CAMP_CUT;
-  const valuePerPoint = totalPoints > 0 ? (playerPool / totalPoints) : 0;
-
-  players.sort((a, b) => b.points - a.points);
+  players.sort((a,b)=>b.payout-a.payout);
 
   const embed = new EmbedBuilder()
     .setTitle("🏕️ Baba Yaga Camp")
     .setDescription("Payout Mode: Points (30% camp fee)")
-    .setColor(0x2b2d31)
-    .setFooter({ text: `🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)}` });
+    .setColor(0x2b2d31);
 
-  // Compact 2-column layout:
-  // Discord supports up to 3 inline fields per row, but 2 is cleaner.
-  for (const p of players.slice(0, 24)) {
-    const payout = p.points * valuePerPoint;
+  const medals=["🥇","🥈","🥉"];
 
+  for(let i=0;i<players.length;i++){
+    const p=players[i];
+    const tag=await getDiscordTag(p.user_id);
+    const medal=medals[i]||`#${i+1}`;
     embed.addFields({
-      name: `<@${p.user_id}>`,
+      name:`${medal} ${tag}`,
       value:
-        `🪨 **${p.material_sets}** mats\n` +
-        `🚚 **${p.deliveries}** (S:${p.small} M:${p.medium} L:${p.large})\n` +
-        `📦 **${p.supplies}** supplies\n` +
-        `⭐ **${p.points}** pts\n` +
-        `💰 **${fmtMoney(payout)}**`,
-      inline: true,
+        `🪨 Materials: ${p.material_sets}\n`+
+        `🚚 Deliveries: ${p.small+p.medium+p.large}\n`+
+        `📦 Supplies: ${p.supplies}\n`+
+        `⭐ Points: ${p.points}\n`+
+        `💰 $${p.payout.toFixed(2)}`,
+      inline:true
     });
   }
 
-  await msg.edit({ content: "", embeds: [embed] });
-  console.log("📊 Camp board updated");
+  embed.setFooter({
+    text:`🧾 Total Delivery Value: $${gross.toFixed(0)} • 💰 Camp Revenue: $${(gross*CAMP_CUT).toFixed(0)}`
+  });
+
+  await msg.edit({content:"",embeds:[embed]});
 }
-
-// ================= LIVE UPDATES =================
-let debounce = null;
-function scheduleUpdate() {
-  if (debounce) return;
-  debounce = setTimeout(async () => {
-    debounce = null;
-    await rebuildTotals();
-    await updateCampBoard();
-  }, 1500);
-}
-
-client.on("messageCreate", async (message) => {
-  try {
-    if (message.channel.id !== CAMP_INPUT_CHANNEL_ID) return;
-    if (!message.webhookId && !message.author?.bot) return;
-
-    const parsed = parseCampLog(message);
-    if (!parsed) return;
-
-    const ok = await insertEvent(message.id, parsed);
-    if (ok) scheduleUpdate();
-  } catch (e) {
-    console.error("❌ messageCreate error:", e);
-  }
-});
 
 // ================= STARTUP =================
-client.once("clientReady", async () => {
-  try {
-    console.log(`🏕️ Camp Manager Online: ${client.user.tag}`);
-    await ensureSchema();
+client.once("clientReady", async ()=>{
+  console.log(`🏕️ Camp Manager Online: ${client.user.tag}`);
+  await ensureSchema();
 
-    if (BACKFILL_ON_START) {
-      console.log(`📥 Backfilling camp history (max ${BACKFILL_MAX_MESSAGES})...`);
-      await backfillFromHistory(BACKFILL_MAX_MESSAGES);
+  if(BACKFILL_ON_START){
+    const channel=await client.channels.fetch(CAMP_INPUT_CHANNEL_ID);
+    const messages=await channel.messages.fetch({limit:BACKFILL_MAX_MESSAGES});
+    for(const msg of messages.values()){
+      if(!msg.webhookId&&!msg.author?.bot) continue;
+      const parsed=parseCampLog(msg);
+      if(parsed) await insertEvent(msg.id,parsed);
     }
-
-    await rebuildTotals();
-    await updateCampBoard();
-
-    console.log("✅ Startup complete.");
-  } catch (e) {
-    console.error("❌ Startup failed:", e);
-    process.exit(1);
   }
+
+  await rebuildTotals();
+  await updateCampBoard();
 });
 
 client.login(BOT_TOKEN);
