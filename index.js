@@ -114,6 +114,9 @@ async function ensureSchema() {
 }
 
 // ================= STATIC MESSAGE =================
+// IMPORTANT: new key so it won't keep editing the old "square embed" message if that was stored.
+const BOARD_KEY = "camp_board_text_v2";
+
 async function ensureBotMessage(key, channelId, initialText) {
   const { rows } = await pool.query(
     `SELECT message_id FROM public.bot_messages WHERE key=$1 LIMIT 1`,
@@ -168,7 +171,6 @@ function extractAllText(message) {
 }
 
 function extractUserId(text) {
-  // "Discord: @Peter 359854613186215936"
   const m = text.match(/Discord:\s*@([^\s]+)\s+(\d{17,19})/i);
   if (m) return m[2];
 
@@ -282,10 +284,10 @@ function totalDeliveryValue(p) {
          (p.large * DELIVERY_VALUES.large);
 }
 
-// ================= OUTPUT (PLAIN TEXT LIKE RANCH) =================
+// ================= OUTPUT (PLAIN TEXT ONLY) =================
 async function updateCampBoard() {
   const msgId = await ensureBotMessage(
-    "camp_board",
+    BOARD_KEY,
     CAMP_OUTPUT_CHANNEL_ID,
     `🏕️ ${CAMP_NAME}\nLoading...`
   );
@@ -322,7 +324,6 @@ async function updateCampBoard() {
 
   for (const p of players) p.payout = p.points * valuePerPoint;
 
-  // sort like ranch leaderboard (highest first)
   players.sort((a, b) => b.payout - a.payout || b.points - a.points);
 
   let out =
@@ -346,8 +347,9 @@ async function updateCampBoard() {
 
   out += `---\n🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)} • ⭐ Total Points: ${totalPoints}`;
 
-  await msg.edit(out);
-  console.log("📊 Camp board updated (plain text)");
+  // ensure no embed stays attached
+  await msg.edit({ content: out, embeds: [] });
+  console.log("📊 Camp board updated (text only)");
 }
 
 // ================= LIVE UPDATES =================
