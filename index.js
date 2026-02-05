@@ -23,6 +23,9 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const CAMP_INPUT_CHANNEL_ID = process.env.CAMP_INPUT_CHANNEL_ID;
 const CAMP_OUTPUT_CHANNEL_ID = process.env.CAMP_OUTPUT_CHANNEL_ID;
 
+// OPTIONAL but recommended for name lookup:
+const GUILD_ID = process.env.GUILD_ID || null;
+
 if (!DATABASE_URL || !CAMP_INPUT_CHANNEL_ID || !CAMP_OUTPUT_CHANNEL_ID) {
   console.error("❌ Missing required Railway variables: DATABASE_URL / CAMP_INPUT_CHANNEL_ID / CAMP_OUTPUT_CHANNEL_ID");
   process.exit(1);
@@ -31,22 +34,21 @@ if (!DATABASE_URL || !CAMP_INPUT_CHANNEL_ID || !CAMP_OUTPUT_CHANNEL_ID) {
 const BACKFILL_ON_START = (process.env.BACKFILL_ON_START || "true") === "true";
 const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 5000);
 
-// Delivery tier values (your current assumptions)
+// Delivery tier values
 const DELIVERY_VALUES = {
   small: 500,
   medium: 950,
   large: 1500,
 };
 
-// If the log says $1900, treat as large for now (can change later)
+// Sale values seen in logs -> tier mapping
 const SALE_VALUE_TO_TIER = {
   500: "small",
   950: "medium",
   1500: "large",
-  1900: "large",
+  1900: "large", // if server uses 1900 as large, keep this
 };
 
-// Camp cut + points
 const CAMP_CUT = 0.30;
 const MATERIAL_POINTS = 2;
 const DELIVERY_POINTS = 3;
@@ -65,7 +67,11 @@ app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Web listening on ${PORT}`));
 
 // ================= DISCORD =================
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 client.on("error", (e) => console.error("❌ Discord error:", e));
@@ -157,18 +163,16 @@ function extractAllText(message) {
   return text.trim();
 }
 
-// ================= USER ID FROM YOUR LOG FORMAT =================
-// Example: "Discord: @grayarea 316442197715189770"
+// Example line: "Discord: @grayarea 316442197715189770"
 function extractUserIdFromDiscordLine(text) {
   const m = text.match(/Discord:\s*@\S+\s+(\d{17,19})/i);
   if (m) return m[1];
 
-  // fallback: any snowflake
   const any = text.match(/\b(\d{17,19})\b/);
   return any ? any[1] : null;
 }
 
-// ================= PARSER (matches your examples) =================
+// ================= PARSER =================
 function parseCampLog(message) {
   const text = extractAllText(message);
   if (!text) return null;
@@ -176,28 +180,23 @@ function parseCampLog(message) {
   const userId = extractUserIdFromDiscordLine(text);
   if (!userId) return null;
 
-  // Delivered Supplies: 42
   const sup = text.match(/Delivered Supplies:\s*(\d+)/i);
   if (sup) {
     const amount = Number(sup[1] || 0);
     if (amount > 0) return { userId, item: "supplies", amount };
   }
 
-  // Donated ... / Materials added: 1.0
   const mat = text.match(/Materials added:\s*([0-9]+(?:\.[0-9]+)?)/i);
   if (mat) {
     const amount = Math.floor(Number(mat[1] || 0));
     if (amount > 0) return { userId, item: "materials", amount };
   }
 
-  // Made a Sale Of 50 Of Stock For $950
   const sale = text.match(/Made a Sale Of\s+\d+\s+Of Stock For\s+\$([0-9]+(?:\.[0-9]+)?)/i);
   if (sale) {
     const value = Math.round(Number(sale[1]));
     const tier = SALE_VALUE_TO_TIER[value];
     if (tier) return { userId, item: tier, amount: 1 };
-    // unknown sale value -> ignore for now (or treat as large if you want)
-    return null;
   }
 
   return null;
@@ -268,6 +267,29 @@ async function backfillFromHistory(maxMessages) {
   console.log(`📥 Camp backfill: scanned=${scanned} parsed=${parsedCount} inserted=${inserted}`);
 }
 
+// ================= NAME LOOKUP =================
+async function resolveDisplayLabel(userId) {
+  // If you provide GUILD_ID, we can fetch member nicknames (best)
+  if (GUILD_ID) {
+    try {
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const member = await guild.members.fetch(userId);
+      const name = member?.displayName || member?.user?.username;
+      if (name) return `${name} (ID: ${userId})`;
+    } catch {}
+  }
+
+  // Fallback: fetch user object
+  try {
+    const u = await client.users.fetch(userId);
+    const tag = u?.tag || u?.username;
+    if (tag) return `${tag} (ID: ${userId})`;
+  } catch {}
+
+  // Final fallback
+  return `ID: ${userId}`;
+}
+
 // ================= BOARD RENDER =================
 function computePoints(p) {
   const deliveries = p.small + p.medium + p.large;
@@ -296,9 +318,10 @@ async function updateCampBoard() {
     WHERE material_sets>0 OR supplies>0 OR small>0 OR medium>0 OR large>0
   `);
 
-  const players = rows.map(r => {
+  const players = [];
+  for (const r of rows) {
     const p = {
-      user_id: r.user_id,
+      user_id: r.user_id.toString(),
       material_sets: Number(r.material_sets),
       supplies: Number(r.supplies),
       small: Number(r.small),
@@ -308,37 +331,45 @@ async function updateCampBoard() {
     const points = computePoints(p);
     const deliveries = p.small + p.medium + p.large;
     const delValue = totalDeliveryValue(p);
-    return { ...p, points, deliveries, delValue };
-  });
+    players.push({ ...p, points, deliveries, delValue });
+  }
 
-  const totalPoints = players.reduce((a,p)=>a+p.points,0);
-  const gross = players.reduce((a,p)=>a+p.delValue,0);
+  const totalPoints = players.reduce((a, p) => a + p.points, 0);
+  const gross = players.reduce((a, p) => a + p.delValue, 0);
   const playerPool = gross * (1 - CAMP_CUT);
   const campRevenue = gross * CAMP_CUT;
   const valuePerPoint = totalPoints > 0 ? (playerPool / totalPoints) : 0;
 
-  players.sort((a,b)=>b.points-a.points);
+  players.sort((a, b) => b.points - a.points);
 
   const embed = new EmbedBuilder()
     .setTitle("🏕️ Baba Yaga Camp")
     .setDescription("Payout Mode: Points (30% camp fee)")
     .setColor(0x2b2d31);
 
-  for (const p of players.slice(0, 24)) {
+  // Resolve display labels in parallel (name + ID), then add fields
+  const labels = await Promise.all(players.slice(0, 24).map(p => resolveDisplayLabel(p.user_id)));
+
+  for (let i = 0; i < Math.min(players.length, 24); i++) {
+    const p = players[i];
     const payout = p.points * valuePerPoint;
+
     embed.addFields({
-      name: `<@${p.user_id}>`,
+      name: labels[i],
       value:
+        `<@${p.user_id}>\n` +
         `🪨 Materials: ${p.material_sets}\n` +
         `🚚 Deliveries: ${p.deliveries} (S:${p.small} M:${p.medium} L:${p.large})\n` +
         `📦 Supplies: ${p.supplies}\n` +
         `⭐ Points: ${p.points}\n` +
         `💰 Payout: **$${payout.toFixed(2)}**`,
-      inline: true,
+      inline: false,
     });
   }
 
-  embed.setFooter({ text: `🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)}` });
+  embed.setFooter({
+    text: `🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)}`
+  });
 
   await msg.edit({ content: "", embeds: [embed] });
   console.log("📊 Camp board updated");
