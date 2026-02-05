@@ -23,9 +23,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const CAMP_INPUT_CHANNEL_ID = process.env.CAMP_INPUT_CHANNEL_ID;
 const CAMP_OUTPUT_CHANNEL_ID = process.env.CAMP_OUTPUT_CHANNEL_ID;
 
-// OPTIONAL but recommended for name lookup:
-const GUILD_ID = process.env.GUILD_ID || null;
-
 if (!DATABASE_URL || !CAMP_INPUT_CHANNEL_ID || !CAMP_OUTPUT_CHANNEL_ID) {
   console.error("❌ Missing required Railway variables: DATABASE_URL / CAMP_INPUT_CHANNEL_ID / CAMP_OUTPUT_CHANNEL_ID");
   process.exit(1);
@@ -46,7 +43,7 @@ const SALE_VALUE_TO_TIER = {
   500: "small",
   950: "medium",
   1500: "large",
-  1900: "large", // if server uses 1900 as large, keep this
+  1900: "large", // keep if your server uses 1900 as a "large-like" sale
 };
 
 const CAMP_CUT = 0.30;
@@ -63,15 +60,19 @@ const pool = new Pool({
 // ================= EXPRESS =================
 const app = express();
 app.get("/", (_, res) => res.status(200).send("Camp Tracker running ✅"));
+app.get("/health", async (_, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.status(200).json({ ok: true, db: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, db: false, error: String(e?.message || e) });
+  }
+});
 app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Web listening on ${PORT}`));
 
 // ================= DISCORD =================
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
 client.on("error", (e) => console.error("❌ Discord error:", e));
@@ -163,11 +164,12 @@ function extractAllText(message) {
   return text.trim();
 }
 
-// Example line: "Discord: @grayarea 316442197715189770"
+// Example: "Discord: @grayarea 316442197715189770"
 function extractUserIdFromDiscordLine(text) {
   const m = text.match(/Discord:\s*@\S+\s+(\d{17,19})/i);
   if (m) return m[1];
 
+  // fallback: any snowflake
   const any = text.match(/\b(\d{17,19})\b/);
   return any ? any[1] : null;
 }
@@ -180,18 +182,21 @@ function parseCampLog(message) {
   const userId = extractUserIdFromDiscordLine(text);
   if (!userId) return null;
 
+  // Delivered Supplies: 42
   const sup = text.match(/Delivered Supplies:\s*(\d+)/i);
   if (sup) {
     const amount = Number(sup[1] || 0);
     if (amount > 0) return { userId, item: "supplies", amount };
   }
 
+  // Materials added: 1.0
   const mat = text.match(/Materials added:\s*([0-9]+(?:\.[0-9]+)?)/i);
   if (mat) {
     const amount = Math.floor(Number(mat[1] || 0));
     if (amount > 0) return { userId, item: "materials", amount };
   }
 
+  // Made a Sale Of 50 Of Stock For $950
   const sale = text.match(/Made a Sale Of\s+\d+\s+Of Stock For\s+\$([0-9]+(?:\.[0-9]+)?)/i);
   if (sale) {
     const value = Math.round(Number(sale[1]));
@@ -267,29 +272,6 @@ async function backfillFromHistory(maxMessages) {
   console.log(`📥 Camp backfill: scanned=${scanned} parsed=${parsedCount} inserted=${inserted}`);
 }
 
-// ================= NAME LOOKUP =================
-async function resolveDisplayLabel(userId) {
-  // If you provide GUILD_ID, we can fetch member nicknames (best)
-  if (GUILD_ID) {
-    try {
-      const guild = await client.guilds.fetch(GUILD_ID);
-      const member = await guild.members.fetch(userId);
-      const name = member?.displayName || member?.user?.username;
-      if (name) return `${name} (ID: ${userId})`;
-    } catch {}
-  }
-
-  // Fallback: fetch user object
-  try {
-    const u = await client.users.fetch(userId);
-    const tag = u?.tag || u?.username;
-    if (tag) return `${tag} (ID: ${userId})`;
-  } catch {}
-
-  // Final fallback
-  return `ID: ${userId}`;
-}
-
 // ================= BOARD RENDER =================
 function computePoints(p) {
   const deliveries = p.small + p.medium + p.large;
@@ -300,6 +282,10 @@ function totalDeliveryValue(p) {
   return (p.small * DELIVERY_VALUES.small) +
          (p.medium * DELIVERY_VALUES.medium) +
          (p.large * DELIVERY_VALUES.large);
+}
+
+function fmtMoney(x) {
+  return `$${Number(x).toFixed(2)}`;
 }
 
 async function updateCampBoard() {
@@ -318,8 +304,7 @@ async function updateCampBoard() {
     WHERE material_sets>0 OR supplies>0 OR small>0 OR medium>0 OR large>0
   `);
 
-  const players = [];
-  for (const r of rows) {
+  const players = rows.map(r => {
     const p = {
       user_id: r.user_id.toString(),
       material_sets: Number(r.material_sets),
@@ -331,8 +316,8 @@ async function updateCampBoard() {
     const points = computePoints(p);
     const deliveries = p.small + p.medium + p.large;
     const delValue = totalDeliveryValue(p);
-    players.push({ ...p, points, deliveries, delValue });
-  }
+    return { ...p, points, deliveries, delValue };
+  });
 
   const totalPoints = players.reduce((a, p) => a + p.points, 0);
   const gross = players.reduce((a, p) => a + p.delValue, 0);
@@ -345,31 +330,25 @@ async function updateCampBoard() {
   const embed = new EmbedBuilder()
     .setTitle("🏕️ Baba Yaga Camp")
     .setDescription("Payout Mode: Points (30% camp fee)")
-    .setColor(0x2b2d31);
+    .setColor(0x2b2d31)
+    .setFooter({ text: `🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)}` });
 
-  // Resolve display labels in parallel (name + ID), then add fields
-  const labels = await Promise.all(players.slice(0, 24).map(p => resolveDisplayLabel(p.user_id)));
-
-  for (let i = 0; i < Math.min(players.length, 24); i++) {
-    const p = players[i];
+  // Compact 2-column layout:
+  // Discord supports up to 3 inline fields per row, but 2 is cleaner.
+  for (const p of players.slice(0, 24)) {
     const payout = p.points * valuePerPoint;
 
     embed.addFields({
-      name: labels[i],
+      name: `<@${p.user_id}>`,
       value:
-        `<@${p.user_id}>\n` +
-        `🪨 Materials: ${p.material_sets}\n` +
-        `🚚 Deliveries: ${p.deliveries} (S:${p.small} M:${p.medium} L:${p.large})\n` +
-        `📦 Supplies: ${p.supplies}\n` +
-        `⭐ Points: ${p.points}\n` +
-        `💰 Payout: **$${payout.toFixed(2)}**`,
-      inline: false,
+        `🪨 **${p.material_sets}** mats\n` +
+        `🚚 **${p.deliveries}** (S:${p.small} M:${p.medium} L:${p.large})\n` +
+        `📦 **${p.supplies}** supplies\n` +
+        `⭐ **${p.points}** pts\n` +
+        `💰 **${fmtMoney(payout)}**`,
+      inline: true,
     });
   }
-
-  embed.setFooter({
-    text: `🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)}`
-  });
 
   await msg.edit({ content: "", embeds: [embed] });
   console.log("📊 Camp board updated");
