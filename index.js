@@ -1,7 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import pg from "pg";
-import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
+import { Client, GatewayIntentBits } from "discord.js";
 
 dotenv.config();
 const { Pool } = pg;
@@ -41,12 +41,12 @@ const DELIVERY_VALUES = {
   large: 1500,
 };
 
-// Sale values seen in logs -> tier mapping
+// Sale values -> tier mapping
 const SALE_VALUE_TO_TIER = {
   500: "small",
   950: "medium",
   1500: "large",
-  1900: "large", // keep if your server uses 1900 as “large-like”
+  1900: "large",
 };
 
 const CAMP_CUT = 0.30;
@@ -71,7 +71,7 @@ app.get("/health", async (_, res) => {
     res.status(500).json({ ok: false, db: false, error: String(e?.message || e) });
   }
 });
-app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Web listening on ${PORT}`));
+const server = app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Web listening on ${PORT}`));
 
 // ================= DISCORD =================
 const client = new Client({
@@ -89,12 +89,6 @@ async function ensureSchema() {
       key TEXT PRIMARY KEY,
       channel_id BIGINT NOT NULL,
       message_id BIGINT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS public.camp_users (
-      user_id BIGINT PRIMARY KEY,
-      discord_tag TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -151,7 +145,7 @@ async function ensureBotMessage(key, channelId, initialText) {
   return msg.id;
 }
 
-// ================= TEXT EXTRACTION =================
+// ================= PARSING =================
 function extractAllText(message) {
   let text = (message.content || "").trim();
 
@@ -173,69 +167,46 @@ function extractAllText(message) {
   return text.trim();
 }
 
-// ✅ Pull BOTH @name and id from: "Discord: @Peter 359854613186215936"
-function extractDiscordIdentity(text) {
+function extractUserId(text) {
+  // "Discord: @Peter 359854613186215936"
   const m = text.match(/Discord:\s*@([^\s]+)\s+(\d{17,19})/i);
-  if (m) {
-    return { tag: `@${m[1]}`, userId: m[2] };
-  }
-  // fallback: just id
+  if (m) return m[2];
+
   const any = text.match(/\b(\d{17,19})\b/);
-  if (any) return { tag: `<@${any[1]}>`, userId: any[1] };
-  return null;
+  return any ? any[1] : null;
 }
 
-// ================= PARSER =================
 function parseCampLog(message) {
   const text = extractAllText(message);
   if (!text) return null;
 
-  const ident = extractDiscordIdentity(text);
-  if (!ident) return null;
+  const userId = extractUserId(text);
+  if (!userId) return null;
 
-  // Delivered Supplies: 42
   const sup = text.match(/Delivered Supplies:\s*(\d+)/i);
   if (sup) {
     const amount = Number(sup[1] || 0);
-    if (amount > 0) return { userId: ident.userId, tag: ident.tag, item: "supplies", amount };
+    if (amount > 0) return { userId, item: "supplies", amount };
   }
 
-  // Materials added: 1.0
   const mat = text.match(/Materials added:\s*([0-9]+(?:\.[0-9]+)?)/i);
   if (mat) {
     const amount = Math.floor(Number(mat[1] || 0));
-    if (amount > 0) return { userId: ident.userId, tag: ident.tag, item: "materials", amount };
+    if (amount > 0) return { userId, item: "materials", amount };
   }
 
-  // Made a Sale Of 50 Of Stock For $950
   const sale = text.match(/Made a Sale Of\s+\d+\s+Of Stock For\s+\$([0-9]+(?:\.[0-9]+)?)/i);
   if (sale) {
     const value = Math.round(Number(sale[1]));
     const tier = SALE_VALUE_TO_TIER[value];
-    if (tier) return { userId: ident.userId, tag: ident.tag, item: tier, amount: 1 };
+    if (tier) return { userId, item: tier, amount: 1 };
   }
 
   return null;
 }
 
 // ================= DB OPS =================
-async function upsertUserTag(userId, tag) {
-  // store ONLY clean @name if available; if it’s <@id> fallback, still store it but we’ll try to overwrite later
-  await pool.query(
-    `
-    INSERT INTO public.camp_users (user_id, discord_tag, updated_at)
-    VALUES ($1::bigint, $2, NOW())
-    ON CONFLICT (user_id)
-    DO UPDATE SET discord_tag = EXCLUDED.discord_tag, updated_at = NOW()
-    `,
-    [userId, tag]
-  );
-}
-
 async function insertEvent(discordMessageId, parsed) {
-  // save user tag first (so display is always available)
-  if (parsed.tag) await upsertUserTag(parsed.userId, parsed.tag);
-
   const { rowCount } = await pool.query(
     `
     INSERT INTO public.camp_events (discord_message_id, user_id, item, amount)
@@ -299,7 +270,7 @@ async function backfillFromHistory(maxMessages) {
   console.log(`📥 Camp backfill: scanned=${scanned} parsed=${parsedCount} inserted=${inserted}`);
 }
 
-// ================= BOARD RENDER =================
+// ================= MATH =================
 function computePoints(p) {
   const deliveries = p.small + p.medium + p.large;
   return (p.material_sets * MATERIAL_POINTS) + (deliveries * DELIVERY_POINTS) + (p.supplies * SUPPLY_POINTS);
@@ -311,10 +282,7 @@ function totalDeliveryValue(p) {
          (p.large * DELIVERY_VALUES.large);
 }
 
-function fmtMoney(x) {
-  return `$${Number(x).toFixed(2)}`;
-}
-
+// ================= OUTPUT (PLAIN TEXT LIKE RANCH) =================
 async function updateCampBoard() {
   const msgId = await ensureBotMessage(
     "camp_board",
@@ -325,77 +293,61 @@ async function updateCampBoard() {
   const channel = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
   const msg = await channel.messages.fetch(msgId);
 
-  // pull totals + stored tags
   const { rows } = await pool.query(`
-    SELECT
-      t.user_id,
-      COALESCE(u.discord_tag, ('<@' || t.user_id::text || '>')) AS discord_tag,
-      t.material_sets, t.supplies, t.small, t.medium, t.large
-    FROM public.camp_totals t
-    LEFT JOIN public.camp_users u ON u.user_id = t.user_id
-    WHERE t.material_sets>0 OR t.supplies>0 OR t.small>0 OR t.medium>0 OR t.large>0
+    SELECT user_id, material_sets, supplies, small, medium, large
+    FROM public.camp_totals
+    WHERE material_sets>0 OR supplies>0 OR small>0 OR medium>0 OR large>0
   `);
 
   const players = rows.map(r => {
     const p = {
       user_id: r.user_id.toString(),
-      tag: String(r.discord_tag),
       material_sets: Number(r.material_sets),
       supplies: Number(r.supplies),
       small: Number(r.small),
       medium: Number(r.medium),
       large: Number(r.large),
     };
-    p.points = computePoints(p);
     p.deliveries = p.small + p.medium + p.large;
+    p.points = computePoints(p);
     p.delValue = totalDeliveryValue(p);
     return p;
   });
 
-  const totalPoints = players.reduce((a, p) => a + p.points, 0);
   const gross = players.reduce((a, p) => a + p.delValue, 0);
   const playerPool = gross * (1 - CAMP_CUT);
   const campRevenue = gross * CAMP_CUT;
+  const totalPoints = players.reduce((a, p) => a + p.points, 0);
   const valuePerPoint = totalPoints > 0 ? (playerPool / totalPoints) : 0;
 
-  // payout + sort like your ranch board
   for (const p of players) p.payout = p.points * valuePerPoint;
+
+  // sort like ranch leaderboard (highest first)
   players.sort((a, b) => b.payout - a.payout || b.points - a.points);
 
-  const embed = new EmbedBuilder()
-    .setTitle(`🏕️ ${CAMP_NAME}`)
-    .setDescription(
-      `📅 Next Camp Payout: **${NEXT_PAYOUT_LABEL}**\n` +
-      `Payout Mode: **Points (30% camp fee)**`
-    )
-    .setColor(0x2b2d31)
-    .setFooter({
-      text:
-        `🧾 Total Delivery Value: $${Math.round(gross)} • ` +
-        `💰 Camp Revenue: $${Math.round(campRevenue)} • ` +
-        `⭐ Total Points: ${totalPoints}`,
-    });
+  let out =
+    `🏕️ **${CAMP_NAME}**\n` +
+    `📅 Next Camp Payout: **${NEXT_PAYOUT_LABEL}**\n` +
+    `Payout Mode: **Points (30% camp fee)**\n\n`;
 
-  // Compact 2-column ranked style
   const medals = ["🥇", "🥈", "🥉"];
-  for (let i = 0; i < Math.min(players.length, 24); i++) {
+  for (let i = 0; i < Math.min(players.length, 25); i++) {
     const p = players[i];
     const badge = medals[i] || `#${i + 1}`;
 
-    embed.addFields({
-      name: `${badge} ${p.tag}`,
-      value:
-        `🪨 **${p.material_sets}** mats\n` +
-        `🚚 **${p.deliveries}** (S:${p.small} M:${p.medium} L:${p.large})\n` +
-        `📦 **${p.supplies}** supplies\n` +
-        `⭐ **${p.points}** pts\n` +
-        `💰 **${fmtMoney(p.payout)}**`,
-      inline: true,
-    });
+    out +=
+      `**${badge} <@${p.user_id}>**\n` +
+      `🪨 Materials: ${p.material_sets}\n` +
+      `🚚 Deliveries: ${p.deliveries} (S:${p.small} M:${p.medium} L:${p.large})\n` +
+      `📦 Supplies: ${p.supplies}\n` +
+      `⭐ Points: ${p.points}\n` +
+      `💰 **$${p.payout.toFixed(2)}**\n\n`;
   }
 
-  await msg.edit({ content: "", embeds: [embed] });
-  console.log("📊 Camp board updated");
+  out += `---\n🧾 Total Delivery Value: $${Math.round(gross)} • 💰 Camp Revenue: $${Math.round(campRevenue)} • ⭐ Total Points: ${totalPoints}`;
+
+  await msg.edit(out);
+  console.log("📊 Camp board updated (plain text)");
 }
 
 // ================= LIVE UPDATES =================
@@ -444,5 +396,20 @@ client.once("clientReady", async () => {
     process.exit(1);
   }
 });
+
+// ================= SHUTDOWN =================
+async function shutdown(signal) {
+  console.log(`🛑 ${signal} received. Shutting down...`);
+  try {
+    await client.destroy().catch(() => {});
+    await pool.end().catch(() => {});
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 10000).unref();
+  } catch {
+    process.exit(1);
+  }
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 client.login(BOT_TOKEN);
