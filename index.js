@@ -44,7 +44,7 @@ const RANCH_OUTPUT_CHANNEL_ID =
 const CAMP_INPUT_CHANNEL_ID = process.env.CAMP_INPUT_CHANNEL_ID;
 const CAMP_OUTPUT_CHANNEL_ID = process.env.CAMP_OUTPUT_CHANNEL_ID;
 
-const HERD_QUEUE_CHANNEL_ID = process.env.HERD_QUEUE_CHANNEL_ID || process.env.HERD_CHANNEL_ID; // support your older var name
+const HERD_QUEUE_CHANNEL_ID = process.env.HERD_QUEUE_CHANNEL_ID || process.env.HERD_CHANNEL_ID;
 
 if (!RANCH_INPUT_CHANNEL_ID || !RANCH_OUTPUT_CHANNEL_ID) {
   console.error("❌ Missing ranch channels: RANCH_INPUT_CHANNEL_ID / RANCH_OUTPUT_CHANNEL_ID");
@@ -174,7 +174,6 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    -- Herd queue persistent state
     CREATE TABLE IF NOT EXISTS public.herd_queue_state (
       key TEXT PRIMARY KEY,
       value JSONB NOT NULL,
@@ -182,7 +181,6 @@ async function ensureSchema() {
     );
   `);
 
-  // Safe add columns (older schema)
   await pool.query(`
     ALTER TABLE public.ranch_events
       ADD COLUMN IF NOT EXISTS eggs INT NOT NULL DEFAULT 0,
@@ -301,8 +299,16 @@ function dowFromShort(short) {
   return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(short);
 }
 
+/* ================= INIT WEEK STARTS (ONLY ONCE) ================= */
+async function initWeekStartsIfMissing() {
+  const r = await getState("ranch_week_start_iso", null);
+  if (!r) await setState("ranch_week_start_iso", new Date().toISOString());
+
+  const c = await getState("camp_week_start_iso", null);
+  if (!c) await setState("camp_week_start_iso", new Date().toISOString());
+}
+
 /* ================= PARSERS ================= */
-// Ranch
 function parseRanch(message) {
   const text = extractAllText(message);
   if (!text) return null;
@@ -333,7 +339,6 @@ function parseRanch(message) {
   return { userId, eggs, milk, herd_profit };
 }
 
-// Camp
 function parseCamp(message) {
   const text = extractAllText(message);
   if (!text) return null;
@@ -441,7 +446,7 @@ async function ensureCurrentMessage(key, channelId, defaultText) {
   }
 }
 
-/* ================= RANCH RENDER (compact, no profit shown) ================= */
+/* ================= RANCH RENDER ================= */
 async function renderRanchBoard(isFinal = false) {
   const key = "ranch_current_msg";
   const msgId = await ensureCurrentMessage(
@@ -493,7 +498,7 @@ async function renderRanchBoard(isFinal = false) {
   await msg.edit({ content: out, embeds: [] });
 }
 
-/* ================= CAMP RENDER (compact) ================= */
+/* ================= CAMP RENDER ================= */
 function campMathRow(r) {
   const materials = Number(r.materials);
   const supplies = Number(r.supplies);
@@ -559,470 +564,6 @@ async function renderCampBoard(isFinal = false) {
 
   await msg.edit({ content: out, embeds: [] });
 }
-
-/* ================= POLLING + BACKFILL ================= */
-let ranchDebounce = null;
-let campDebounce = null;
-
-function scheduleRanchRender() {
-  if (ranchDebounce) return;
-  ranchDebounce = setTimeout(async () => {
-    ranchDebounce = null;
-    await rebuildRanchTotals();
-    await renderRanchBoard(false);
-  }, LEADERBOARD_DEBOUNCE_MS);
-}
-
-function scheduleCampRender() {
-  if (campDebounce) return;
-  campDebounce = setTimeout(async () => {
-    campDebounce = null;
-    await rebuildCampTotals();
-    await renderCampBoard(false);
-  }, LEADERBOARD_DEBOUNCE_MS);
-}
-
-async function pollOnce(channelId, parseFn, insertFn, label) {
-  const channel = await client.channels.fetch(channelId);
-  const batch = await channel.messages.fetch({ limit: 100 });
-
-  let inserted = 0;
-  for (const msg of batch.values()) {
-    const d = parseFn(msg);
-    if (!d) continue;
-    const ok = await insertFn(msg.id, d);
-    if (ok) inserted++;
-  }
-
-  if (DEBUG) console.log(`${label} poll fetched=${batch.size} inserted=${inserted}`);
-  return inserted;
-}
-
-async function backfillChannel(channelId, parseFn, insertFn, label) {
-  const channel = await client.channels.fetch(channelId);
-
-  let lastId = null;
-  let scanned = 0;
-  let inserted = 0;
-
-  while (scanned < BACKFILL_MAX_MESSAGES) {
-    const limit = Math.min(100, BACKFILL_MAX_MESSAGES - scanned);
-    const batch = await channel.messages.fetch(lastId ? { limit, before: lastId } : { limit });
-    if (!batch.size) break;
-
-    const msgs = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    for (const msg of msgs) {
-      scanned++;
-      const d = parseFn(msg);
-      if (!d) continue;
-      const ok = await insertFn(msg.id, d);
-      if (ok) inserted++;
-    }
-    lastId = msgs[0].id;
-  }
-
-  console.log(`📥 ${label} backfill scanned=${scanned} inserted=${inserted}`);
-  return inserted;
-}
-
-/* ================= WEEKLY ROLLOVER ================= */
-async function initWeekStartsIfMissing() {
-  const r = await getState("ranch_week_start_iso", null);
-  if (!r) await setState("ranch_week_start_iso", new Date().toISOString());
-  const c = await getState("camp_week_start_iso", null);
-  if (!c) await setState("camp_week_start_iso", new Date().toISOString());
-}
-
-async function rolloverIfDue() {
-  const p = nowInTZParts();
-  const dow = dowFromShort(p.weekday);
-  const hh = Number(p.hour);
-  const mm = Number(p.minute);
-
-  if (dow !== WEEKLY_DOW) return;
-  if (hh !== WEEKLY_HOUR || mm !== WEEKLY_MINUTE) return;
-
-  const stamp = `${p.year}-${p.month}-${p.day}`;
-  const last = await getState("weekly_rollover_stamp", "");
-  if (last === stamp) return;
-
-  console.log(`🗓️ Weekly rollover triggered (${stamp} ${WEEKLY_TZ})`);
-
-  // mark current as FINAL
-  await rebuildRanchTotals();
-  await rebuildCampTotals();
-  await renderRanchBoard(true);
-  await renderCampBoard(true);
-
-  // new current week messages
-  {
-    const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏆 **Beaver Falls — Weekly Ranch Ledger**\n\n(Starting new week…)" });
-    await setBoardMessage("ranch_current_msg", RANCH_OUTPUT_CHANNEL_ID, m.id);
-  }
-  {
-    const ch = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏕️ **Beaver Falls Camp — Weekly Payout (Points)**\n\n(Starting new week…)" });
-    await setBoardMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, m.id);
-  }
-
-  // reset weekly tables
-  await pool.query(`TRUNCATE public.ranch_events`);
-  await pool.query(`TRUNCATE public.ranch_totals`);
-  await pool.query(`TRUNCATE public.camp_events`);
-  await pool.query(`TRUNCATE public.camp_totals`);
-
-  // set week starts
-  const nowIso = new Date().toISOString();
-  await setState("ranch_week_start_iso", nowIso);
-  await setState("camp_week_start_iso", nowIso);
-
-  // render fresh
-  await renderRanchBoard(false);
-  await renderCampBoard(false);
-
-  await setState("weekly_rollover_stamp", stamp);
-  console.log("✅ Weekly rollover complete");
-}
-
-/* ================= HERD QUEUE (fixed interactions) ================= */
-// Stored in DB under key "main"
-function defaultQueueState() {
-  return {
-    activeHerderId: null,
-    activeSince: null,
-    queue: [], // { userId, joinedAt }
-  };
-}
-
-async function getQueueState() {
-  const { rows } = await pool.query(`SELECT value FROM public.herd_queue_state WHERE key='main' LIMIT 1`);
-  if (!rows.length) return defaultQueueState();
-  const v = rows[0].value;
-  // normalize
-  return {
-    activeHerderId: v.activeHerderId ?? null,
-    activeSince: v.activeSince ?? null,
-    queue: Array.isArray(v.queue) ? v.queue : [],
-  };
-}
-
-async function saveQueueState(state) {
-  await pool.query(
-    `
-    INSERT INTO public.herd_queue_state (key, value, updated_at)
-    VALUES ('main', $1::jsonb, NOW())
-    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-    `,
-    [JSON.stringify(state)]
-  );
-}
-
-function clearStale(state) {
-  const now = Date.now();
-  state.queue = state.queue.filter((q) => now - Number(q.joinedAt || 0) <= HERD_STALE_MS);
-
-  if (state.activeHerderId && state.activeSince) {
-    if (now - Number(state.activeSince) > HERD_STALE_MS) {
-      state.activeHerderId = null;
-      state.activeSince = null;
-    }
-  }
-  return state;
-}
-
-async function ensureHerdQueueMessage() {
-  const key = "herd_queue_msg";
-  const msgId = await ensureCurrentMessage(
-    key,
-    HERD_QUEUE_CHANNEL_ID,
-    "🐎 **Beaver Falls — Herd Queue**\nLoading..."
-  );
-  return msgId;
-}
-
-function buildHerdComponents(state, isAdmin = false) {
-  const joinBtn = new ButtonBuilder()
-    .setCustomId("herd_join")
-    .setLabel("Join Queue")
-    .setStyle(ButtonStyle.Success);
-
-  const leaveBtn = new ButtonBuilder()
-    .setCustomId("herd_leave")
-    .setLabel("Leave Queue")
-    .setStyle(ButtonStyle.Secondary);
-
-  const clearStaleBtn = new ButtonBuilder()
-    .setCustomId("herd_clear_stale")
-    .setLabel("Clear Stale (2h+)")
-    .setStyle(ButtonStyle.Danger);
-
-  const row1 = new ActionRowBuilder().addComponents(joinBtn, leaveBtn);
-
-  // Admin remove select
-  let row2 = null;
-  if (isAdmin && state.queue.length) {
-    const options = state.queue.slice(0, 25).map((q) => ({
-      label: q.userId,
-      value: q.userId,
-      description: "Remove from queue",
-    }));
-
-    const select = new StringSelectMenuBuilder()
-      .setCustomId("herd_admin_remove_select")
-      .setPlaceholder("Admin: remove someone…")
-      .addOptions(options);
-
-    row2 = new ActionRowBuilder().addComponents(select);
-  }
-
-  const row3 = isAdmin ? new ActionRowBuilder().addComponents(clearStaleBtn) : null;
-
-  return [row1, ...(row2 ? [row2] : []), ...(row3 ? [row3] : [])];
-}
-
-async function renderHerdQueue() {
-  const msgId = await ensureHerdQueueMessage();
-  const channel = await client.channels.fetch(HERD_QUEUE_CHANNEL_ID);
-  const msg = await channel.messages.fetch(msgId);
-
-  let state = await getQueueState();
-  state = clearStale(state);
-  await saveQueueState(state);
-
-  const currentHerder = state.activeHerderId ? `<@${state.activeHerderId}>` : "None ✅";
-  const status = state.activeHerderId ? "Herding in progress ⏳" : "Herding is available ✅";
-
-  const queueLines =
-    state.queue.length === 0
-      ? "No one in queue."
-      : state.queue
-          .slice(0, 15)
-          .map((q, i) => `${i + 1}. <@${q.userId}>`)
-          .join("\n");
-
-  const content =
-    `🐎 **Beaver Falls — Herd Queue**\n` +
-    `Rules: 1 active herder • stale after 2h\n\n` +
-    `Current Herder: ${currentHerder}\n` +
-    `Status: ${status}\n\n` +
-    `Queue:\n${queueLines}`;
-
-  // We can’t know admin here; keep components minimal. Admin options appear when an admin presses anything.
-  await msg.edit({ content, components: buildHerdComponents(state, false), embeds: [] });
-}
-
-function isAdminMember(interaction) {
-  // ManageGuild or Administrator
-  const perms = interaction.memberPermissions;
-  if (!perms) return false;
-  return perms.has(PermissionsBitField.Flags.Administrator) || perms.has(PermissionsBitField.Flags.ManageGuild);
-}
-
-async function upsertHerdComponentsForViewer(interaction) {
-  // After any interaction, re-render with admin controls if admin
-  const msg = interaction.message;
-  let state = await getQueueState();
-  state = clearStale(state);
-  await saveQueueState(state);
-  const comps = buildHerdComponents(state, isAdminMember(interaction));
-  await msg.edit({ components: comps });
-}
-
-/* ================= INTERACTIONS (FIXED) ================= */
-client.on("interactionCreate", async (interaction) => {
-  try {
-    if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
-
-    // ✅ FIX 1: always ack fast to prevent "interaction failed"
-    if (!interaction.deferred && !interaction.replied) {
-      // buttons on existing message: deferUpdate is best (no “thinking…” message)
-      await interaction.deferUpdate();
-    }
-
-    // Herd queue controls
-    if (interaction.isButton() && interaction.customId.startsWith("herd_")) {
-      let state = await getQueueState();
-      state = clearStale(state);
-
-      const uid = interaction.user.id;
-
-      if (interaction.customId === "herd_join") {
-        const inQueue = state.queue.some((q) => q.userId === uid);
-        const isActive = state.activeHerderId === uid;
-
-        if (!inQueue && !isActive) {
-          if (state.queue.length >= HERD_QUEUE_MAX) {
-            // ✅ FIX 2: ephemeral followup on errors
-            await interaction.followUp({ content: "Queue is full right now.", ephemeral: true });
-          } else {
-            state.queue.push({ userId: uid, joinedAt: Date.now() });
-            await saveQueueState(state);
-          }
-        }
-      }
-
-      if (interaction.customId === "herd_leave") {
-        if (state.activeHerderId === uid) {
-          // if they’re active, just clear them
-          state.activeHerderId = null;
-          state.activeSince = null;
-        }
-        state.queue = state.queue.filter((q) => q.userId !== uid);
-        await saveQueueState(state);
-      }
-
-      if (interaction.customId === "herd_clear_stale") {
-        if (!isAdminMember(interaction)) {
-          await interaction.followUp({ content: "Admin only.", ephemeral: true });
-        } else {
-          state = clearStale(state);
-          await saveQueueState(state);
-        }
-      }
-
-      // Auto-assign active herder if none and queue has someone
-      if (!state.activeHerderId && state.queue.length) {
-        const next = state.queue.shift();
-        state.activeHerderId = next.userId;
-        state.activeSince = Date.now();
-        await saveQueueState(state);
-      }
-
-      // Re-render queue message content
-      await renderHerdQueue();
-      // Update buttons/select for viewer (admin gets admin controls)
-      await upsertHerdComponentsForViewer(interaction);
-      return;
-    }
-
-    // Admin remove select
-    if (interaction.isStringSelectMenu() && interaction.customId === "herd_admin_remove_select") {
-      if (!isAdminMember(interaction)) {
-        await interaction.followUp({ content: "Admin only.", ephemeral: true });
-        return;
-      }
-      const removeId = interaction.values?.[0];
-      if (!removeId) return;
-
-      let state = await getQueueState();
-      state = clearStale(state);
-
-      // remove from queue; if they were active, clear active
-      if (state.activeHerderId === removeId) {
-        state.activeHerderId = null;
-        state.activeSince = null;
-      }
-      state.queue = state.queue.filter((q) => q.userId !== removeId);
-      await saveQueueState(state);
-
-      // If no active, promote next
-      if (!state.activeHerderId && state.queue.length) {
-        const next = state.queue.shift();
-        state.activeHerderId = next.userId;
-        state.activeSince = Date.now();
-        await saveQueueState(state);
-      }
-
-      await renderHerdQueue();
-      await upsertHerdComponentsForViewer(interaction);
-      await interaction.followUp({ content: `Removed <@${removeId}> from the queue.`, ephemeral: true });
-      return;
-    }
-  } catch (e) {
-    console.error("❌ interactionCreate error:", e);
-    // ✅ FIX 3: never let it fail silently
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: "Something bugged out — try again.", ephemeral: true });
-      } else {
-        await interaction.reply({ content: "Something bugged out — try again.", ephemeral: true });
-      }
-    } catch {}
-  }
-});
-
-/* ================= STARTUP ================= */
-async function initWeekStartsIfMissing() {
-  const r = await getState("ranch_week_start_iso", null);
-  if (!r) await setState("ranch_week_start_iso", new Date().toISOString());
-  const c = await getState("camp_week_start_iso", null);
-  if (!c) await setState("camp_week_start_iso", new Date().toISOString());
-}
-
-client.once("clientReady", async () => {
-  try {
-    console.log(`🤖 Online as ${client.user.tag}`);
-
-    await ensureSchema();
-    await initWeekStartsIfMissing();
-
-    // Ensure static messages exist
-    await renderRanchBoard(false);
-    await renderCampBoard(false);
-    await renderHerdQueue();
-
-    // Backfill on start
-    if (BACKFILL_ON_START) {
-      console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
-      const rInserted = await backfillChannel(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
-      const cInserted = await backfillChannel(CAMP_INPUT_CHANNEL_ID, parseCamp, insertCampEvent, "CAMP");
-      if (rInserted > 0) {
-        await rebuildRanchTotals();
-        await renderRanchBoard(false);
-      }
-      if (cInserted > 0) {
-        await rebuildCampTotals();
-        await renderCampBoard(false);
-      }
-    }
-
-    // Poll loops
-    setInterval(async () => {
-      try {
-        const r = await pollOnce(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
-        if (r > 0) {
-          // debounce not strictly necessary here; keep it light
-          await rebuildRanchTotals();
-          await renderRanchBoard(false);
-        }
-      } catch (e) {
-        console.error("❌ Ranch poll error:", e);
-      }
-    }, BACKFILL_EVERY_MS);
-
-    setInterval(async () => {
-      try {
-        const c = await pollOnce(CAMP_INPUT_CHANNEL_ID, parseCamp, insertCampEvent, "CAMP");
-        if (c > 0) {
-          await rebuildCampTotals();
-          await renderCampBoard(false);
-        }
-      } catch (e) {
-        console.error("❌ Camp poll error:", e);
-      }
-    }, BACKFILL_EVERY_MS);
-
-    // Keep herd queue refreshed (clears stale automatically)
-    setInterval(() => {
-      renderHerdQueue().catch((e) => console.error("❌ renderHerdQueue:", e));
-    }, 60_000);
-
-    // Weekly rollover check
-    setInterval(() => {
-      rolloverIfDue().catch((e) => console.error("❌ rolloverIfDue:", e));
-    }, 30_000);
-
-    console.log(
-      `✅ Running. Poll=${BACKFILL_EVERY_MS}ms | Weekly reset: Sat ${String(WEEKLY_HOUR).padStart(2, "0")}:${String(
-        WEEKLY_MINUTE
-      ).padStart(2, "0")} ${WEEKLY_TZ}`
-    );
-  } catch (e) {
-    console.error("❌ Startup failed:", e);
-    process.exit(1);
-  }
-});
 
 /* ================= WEEKLY ROLLOVER ================= */
 async function rolloverIfDue() {
@@ -1116,6 +657,307 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
   if (DEBUG) console.log(`${label} poll fetched=${batch.size} inserted=${inserted}`);
   return inserted;
 }
+
+/* ================= HERD QUEUE (NO FAIL INTERACTIONS) ================= */
+function defaultQueueState() {
+  return {
+    activeHerderId: null,
+    activeSince: null,
+    queue: [], // { userId, joinedAt }
+  };
+}
+
+async function getQueueState() {
+  const { rows } = await pool.query(`SELECT value FROM public.herd_queue_state WHERE key='main' LIMIT 1`);
+  if (!rows.length) return defaultQueueState();
+  const v = rows[0].value;
+  return {
+    activeHerderId: v.activeHerderId ?? null,
+    activeSince: v.activeSince ?? null,
+    queue: Array.isArray(v.queue) ? v.queue : [],
+  };
+}
+
+async function saveQueueState(state) {
+  await pool.query(
+    `
+    INSERT INTO public.herd_queue_state (key, value, updated_at)
+    VALUES ('main', $1::jsonb, NOW())
+    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    `,
+    [JSON.stringify(state)]
+  );
+}
+
+function clearStale(state) {
+  const now = Date.now();
+  state.queue = state.queue.filter((q) => now - Number(q.joinedAt || 0) <= HERD_STALE_MS);
+  if (state.activeHerderId && state.activeSince) {
+    if (now - Number(state.activeSince) > HERD_STALE_MS) {
+      state.activeHerderId = null;
+      state.activeSince = null;
+    }
+  }
+  return state;
+}
+
+function isAdminMember(interaction) {
+  const perms = interaction.memberPermissions;
+  if (!perms) return false;
+  return perms.has(PermissionsBitField.Flags.Administrator) || perms.has(PermissionsBitField.Flags.ManageGuild);
+}
+
+function buildHerdComponents(state, isAdmin = false) {
+  const joinBtn = new ButtonBuilder().setCustomId("herd_join").setLabel("Join Queue").setStyle(ButtonStyle.Success);
+  const leaveBtn = new ButtonBuilder().setCustomId("herd_leave").setLabel("Leave Queue").setStyle(ButtonStyle.Secondary);
+
+  const row1 = new ActionRowBuilder().addComponents(joinBtn, leaveBtn);
+
+  const rows = [row1];
+
+  if (isAdmin) {
+    const clearStaleBtn = new ButtonBuilder()
+      .setCustomId("herd_clear_stale")
+      .setLabel("Clear Stale (2h+)")
+      .setStyle(ButtonStyle.Danger);
+    rows.push(new ActionRowBuilder().addComponents(clearStaleBtn));
+
+    if (state.queue.length || state.activeHerderId) {
+      const ids = [];
+      if (state.activeHerderId) ids.push(state.activeHerderId);
+      for (const q of state.queue) ids.push(q.userId);
+
+      const unique = [...new Set(ids)].slice(0, 25);
+      const options = unique.map((id) => ({
+        label: id,
+        value: id,
+        description: "Remove from queue (or active)",
+      }));
+
+      const select = new StringSelectMenuBuilder()
+        .setCustomId("herd_admin_remove_select")
+        .setPlaceholder("Admin: remove someone…")
+        .addOptions(options);
+
+      rows.push(new ActionRowBuilder().addComponents(select));
+    }
+  }
+
+  return rows;
+}
+
+async function ensureHerdQueueMessage() {
+  const key = "herd_queue_msg";
+  return ensureCurrentMessage(key, HERD_QUEUE_CHANNEL_ID, "🐎 **Beaver Falls — Herd Queue**\nLoading...");
+}
+
+async function renderHerdQueue(forceAdminComponents = false, interactionForAdmin = null) {
+  const msgId = await ensureHerdQueueMessage();
+  const channel = await client.channels.fetch(HERD_QUEUE_CHANNEL_ID);
+  const msg = await channel.messages.fetch(msgId);
+
+  let state = await getQueueState();
+  state = clearStale(state);
+  await saveQueueState(state);
+
+  const currentHerder = state.activeHerderId ? `<@${state.activeHerderId}>` : "None ✅";
+  const status = state.activeHerderId ? "Herding in progress ⏳" : "Herding is available ✅";
+
+  const queueLines =
+    state.queue.length === 0
+      ? "No one in queue."
+      : state.queue.slice(0, 15).map((q, i) => `${i + 1}. <@${q.userId}>`).join("\n");
+
+  const content =
+    `🐎 **Beaver Falls — Herd Queue**\n` +
+    `Rules: 1 active herder • stale after 2h\n\n` +
+    `Current Herder: ${currentHerder}\n` +
+    `Status: ${status}\n\n` +
+    `Queue:\n${queueLines}`;
+
+  const admin = forceAdminComponents && interactionForAdmin ? isAdminMember(interactionForAdmin) : false;
+  await msg.edit({ content, components: buildHerdComponents(state, admin), embeds: [] });
+}
+
+// Interaction handler (✅ always ACK fast)
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
+
+    // ✅ prevents "interaction failed"
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate();
+    }
+
+    // Buttons
+    if (interaction.isButton() && interaction.customId.startsWith("herd_")) {
+      let state = await getQueueState();
+      state = clearStale(state);
+
+      const uid = interaction.user.id;
+
+      if (interaction.customId === "herd_join") {
+        const inQueue = state.queue.some((q) => q.userId === uid);
+        const isActive = state.activeHerderId === uid;
+
+        if (!inQueue && !isActive) {
+          if (state.queue.length >= HERD_QUEUE_MAX) {
+            await interaction.followUp({ content: "Queue is full right now.", ephemeral: true });
+          } else {
+            state.queue.push({ userId: uid, joinedAt: Date.now() });
+            await saveQueueState(state);
+          }
+        }
+      }
+
+      if (interaction.customId === "herd_leave") {
+        if (state.activeHerderId === uid) {
+          state.activeHerderId = null;
+          state.activeSince = null;
+        }
+        state.queue = state.queue.filter((q) => q.userId !== uid);
+        await saveQueueState(state);
+      }
+
+      if (interaction.customId === "herd_clear_stale") {
+        if (!isAdminMember(interaction)) {
+          await interaction.followUp({ content: "Admin only.", ephemeral: true });
+        } else {
+          state = clearStale(state);
+          await saveQueueState(state);
+        }
+      }
+
+      // Promote next if no active herder
+      if (!state.activeHerderId && state.queue.length) {
+        const next = state.queue.shift();
+        state.activeHerderId = next.userId;
+        state.activeSince = Date.now();
+        await saveQueueState(state);
+      }
+
+      // Re-render with admin controls for admins
+      await renderHerdQueue(true, interaction);
+      return;
+    }
+
+    // Admin remove select
+    if (interaction.isStringSelectMenu() && interaction.customId === "herd_admin_remove_select") {
+      if (!isAdminMember(interaction)) {
+        await interaction.followUp({ content: "Admin only.", ephemeral: true });
+        return;
+      }
+
+      const removeId = interaction.values?.[0];
+      if (!removeId) return;
+
+      let state = await getQueueState();
+      state = clearStale(state);
+
+      if (state.activeHerderId === removeId) {
+        state.activeHerderId = null;
+        state.activeSince = null;
+      }
+      state.queue = state.queue.filter((q) => q.userId !== removeId);
+      await saveQueueState(state);
+
+      if (!state.activeHerderId && state.queue.length) {
+        const next = state.queue.shift();
+        state.activeHerderId = next.userId;
+        state.activeSince = Date.now();
+        await saveQueueState(state);
+      }
+
+      await renderHerdQueue(true, interaction);
+      await interaction.followUp({ content: `Removed <@${removeId}> from the queue.`, ephemeral: true });
+      return;
+    }
+  } catch (e) {
+    console.error("❌ interactionCreate error:", e);
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp({ content: "Something bugged out — try again.", ephemeral: true });
+      } else {
+        await interaction.reply({ content: "Something bugged out — try again.", ephemeral: true });
+      }
+    } catch {}
+  }
+});
+
+/* ================= STARTUP ================= */
+client.once("clientReady", async () => {
+  try {
+    console.log(`🤖 Online as ${client.user.tag}`);
+
+    await ensureSchema();
+    await initWeekStartsIfMissing();
+
+    // Ensure static messages exist
+    await renderRanchBoard(false);
+    await renderCampBoard(false);
+    await renderHerdQueue(false);
+
+    // Backfill on start
+    if (BACKFILL_ON_START) {
+      console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
+      const rInserted = await backfillChannel(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
+      const cInserted = await backfillChannel(CAMP_INPUT_CHANNEL_ID, parseCamp, insertCampEvent, "CAMP");
+
+      if (rInserted > 0) {
+        await rebuildRanchTotals();
+        await renderRanchBoard(false);
+      }
+      if (cInserted > 0) {
+        await rebuildCampTotals();
+        await renderCampBoard(false);
+      }
+    }
+
+    // Poll loops
+    setInterval(async () => {
+      try {
+        const r = await pollOnce(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
+        if (r > 0) {
+          await rebuildRanchTotals();
+          await renderRanchBoard(false);
+        }
+      } catch (e) {
+        console.error("❌ Ranch poll error:", e);
+      }
+    }, BACKFILL_EVERY_MS);
+
+    setInterval(async () => {
+      try {
+        const c = await pollOnce(CAMP_INPUT_CHANNEL_ID, parseCamp, insertCampEvent, "CAMP");
+        if (c > 0) {
+          await rebuildCampTotals();
+          await renderCampBoard(false);
+        }
+      } catch (e) {
+        console.error("❌ Camp poll error:", e);
+      }
+    }, BACKFILL_EVERY_MS);
+
+    // Keep queue fresh (auto-clears stale)
+    setInterval(() => {
+      renderHerdQueue(false).catch((e) => console.error("❌ renderHerdQueue:", e));
+    }, 60_000);
+
+    // Weekly rollover checker
+    setInterval(() => {
+      rolloverIfDue().catch((e) => console.error("❌ rolloverIfDue:", e));
+    }, 30_000);
+
+    console.log(
+      `✅ Running. Poll=${BACKFILL_EVERY_MS}ms | Weekly reset: Sat ${String(WEEKLY_HOUR).padStart(2, "0")}:${String(
+        WEEKLY_MINUTE
+      ).padStart(2, "0")} ${WEEKLY_TZ}`
+    );
+  } catch (e) {
+    console.error("❌ Startup failed:", e);
+    process.exit(1);
+  }
+});
 
 /* ================= SHUTDOWN ================= */
 async function shutdown(signal) {
