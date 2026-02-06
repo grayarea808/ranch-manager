@@ -10,8 +10,8 @@ const { Pool } = pg;
 const PORT = process.env.PORT || 8080;
 
 const BOT_TOKEN =
-  process.env.BOT_TOKEN ||
   process.env.DISCORD_TOKEN ||
+  process.env.BOT_TOKEN ||
   process.env.TOKEN;
 
 if (!BOT_TOKEN) {
@@ -19,30 +19,42 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const RANCH_INPUT_CHANNEL_ID = process.env.RANCH_INPUT_CHANNEL_ID;
-const RANCH_OUTPUT_CHANNEL_ID = process.env.RANCH_OUTPUT_CHANNEL_ID;
-const RANCH_ID = String(process.env.RANCH_ID || "164");
+const RANCH_INPUT_CHANNEL_ID =
+  process.env.RANCH_INPUT_CHANNEL_ID ||
+  process.env.INPUT_CHANNEL_ID ||
+  process.env.LOG_CHANNEL_ID;
 
-if (!RANCH_INPUT_CHANNEL_ID || !RANCH_OUTPUT_CHANNEL_ID) {
-  console.error("❌ Missing Railway variables: RANCH_INPUT_CHANNEL_ID / RANCH_OUTPUT_CHANNEL_ID");
-  process.exit(1);
-}
+const RANCH_OUTPUT_CHANNEL_ID =
+  process.env.RANCH_OUTPUT_CHANNEL_ID ||
+  process.env.LEADERBOARD_CHANNEL_ID ||
+  process.env.OUTPUT_CHANNEL_ID;
 
 const DATABASE_URL = process.env.DATABASE_URL;
+
 if (!DATABASE_URL) {
   console.error("❌ Missing Railway variable: DATABASE_URL");
   process.exit(1);
 }
+if (!RANCH_INPUT_CHANNEL_ID || !RANCH_OUTPUT_CHANNEL_ID) {
+  console.error("❌ Missing Railway variables: RANCH_INPUT_CHANNEL_ID + RANCH_OUTPUT_CHANNEL_ID (or aliases)");
+  process.exit(1);
+}
 
-const BACKFILL_ON_START = (process.env.BACKFILL_ON_START || "true") === "true";
-const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 5000);
+const RANCH_ID = String(process.env.RANCH_ID || "164");
+const POLL_SECONDS = Number(process.env.POLL_SECONDS || 20);
 
 // Prices
 const MILK_PRICE = 1.25;
 const EGGS_PRICE = 1.25;
 
-// Herd profit rules (optional, if you parse herding completed/sales later)
+// Herd rules you confirmed:
+// profit = sell - buy - 100 (ranch profit)
 const RANCH_PROFIT_PER_HERD = 100;
+const HERD_ANIMALS = {
+  bison: { buy: 300 },
+  deer: { buy: 250 },
+  sheep: { buy: 150 },
+};
 
 // ================= DB =================
 const pool = new Pool({
@@ -82,6 +94,12 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS public.bot_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS public.ranch_events (
       id BIGSERIAL PRIMARY KEY,
       discord_message_id TEXT UNIQUE NOT NULL,
@@ -102,6 +120,22 @@ async function ensureSchema() {
   `);
 }
 
+async function getState(key, fallback = null) {
+  const { rows } = await pool.query(`SELECT value FROM public.bot_state WHERE key=$1 LIMIT 1`, [key]);
+  return rows.length ? rows[0].value : fallback;
+}
+
+async function setState(key, value) {
+  await pool.query(
+    `
+    INSERT INTO public.bot_state (key, value, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    `,
+    [key, String(value)]
+  );
+}
+
 async function ensureBotMessage(key, channelId, initialText) {
   const { rows } = await pool.query(
     `SELECT message_id FROM public.bot_messages WHERE key=$1 LIMIT 1`,
@@ -118,7 +152,9 @@ async function ensureBotMessage(key, channelId, initialText) {
     } catch {}
   }
 
-  const msg = await channel.send({ content: initialText });
+  // invisible placeholder so it doesn't show “Loading…”
+  const msg = await channel.send({ content: "\u200B" });
+  await msg.edit({ content: initialText, embeds: [] });
 
   await pool.query(
     `
@@ -155,12 +191,12 @@ function extractAllText(message) {
   return text.trim();
 }
 
-// ✅ MOST RELIABLE: use Discord parsed mentions first
 function getUserIdFromMessage(message, text) {
-  const mentioned = message.mentions?.users?.first?.();
-  if (mentioned?.id) return mentioned.id;
+  // best: parsed mentions
+  const first = message.mentions?.users?.first?.();
+  if (first?.id) return first.id;
 
-  // fallback: <@123> or <@!123>
+  // fallback: raw mention in text
   const mention = text.match(/<@!?(\d{17,19})>/);
   if (mention) return mention[1];
 
@@ -173,44 +209,76 @@ function getUserIdFromMessage(message, text) {
   return any ? any[1] : null;
 }
 
-function getRanchIdIfPresent(text) {
-  const a = text.match(/ranch id\s*(\d+)/i);
-  return a ? a[1] : null;
+function ranchIdMatches(text) {
+  // Accept both forms:
+  // "Added Milk to ranch id 164 : 18"
+  // "Ranch ID: 164"
+  const m = text.match(/ranch\s*id[:\s]+(\d+)/i);
+  if (!m) return true; // if ranch id missing, don't discard
+  return String(m[1]) === RANCH_ID;
 }
 
-// ================= PARSER =================
-function parseRanchLog(message) {
+// ================= MULTI-EVENT PARSER =================
+// IMPORTANT: can return multiple deltas for ONE message (Eggs + Milk, etc.)
+function parseRanchLogMulti(message) {
   const text = extractAllText(message);
-  if (!text) return null;
+  if (!text) return [];
 
-  const rid = getRanchIdIfPresent(text);
-  if (rid && String(rid) !== RANCH_ID) return null;
+  if (!ranchIdMatches(text)) return [];
 
   const userId = getUserIdFromMessage(message, text);
-  if (!userId) return null;
+  if (!userId) return [];
 
-  // Looser match: handles "Milk Added" line + "Added Milk to ranch id ..."
-  const milkMatch = text.match(/Added\s+Milk[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/i);
-  if (milkMatch) return { userId, eggs: 0, milk: Number(milkMatch[1]), herd_profit: 0 };
+  const deltas = [];
 
-  const eggsMatch = text.match(/Added\s+Eggs[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/i);
-  if (eggsMatch) return { userId, eggs: Number(eggsMatch[1]), milk: 0, herd_profit: 0 };
+  // Eggs Added (can appear multiple times, we sum all matches)
+  const eggsRegex = /Added\s+Eggs[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/gi;
+  let m;
+  let eggsSum = 0;
+  while ((m = eggsRegex.exec(text)) !== null) {
+    eggsSum += Number(m[1] || 0);
+  }
+  if (eggsSum > 0) deltas.push({ userId, eggs: eggsSum, milk: 0, herd_profit: 0 });
 
-  // Optional: you can later parse herding completed into herd_profit if needed
-  // Right now: just ensure milk/eggs ALWAYS count.
+  // Milk Added (can appear multiple times, sum)
+  const milkRegex = /Added\s+Milk[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/gi;
+  let milkSum = 0;
+  while ((m = milkRegex.exec(text)) !== null) {
+    milkSum += Number(m[1] || 0);
+  }
+  if (milkSum > 0) deltas.push({ userId, eggs: 0, milk: milkSum, herd_profit: 0 });
 
-  return null;
+  // Cattle Sale line:
+  // "Player @Peter ... sold 5 Bison for 1200.0$"
+  // Profit = sell - buy - 100 (does NOT multiply)
+  const saleRegex = /sold\s+\d+\s+(Bison|Deer|Sheep)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i;
+  const sale = text.match(saleRegex);
+  if (sale) {
+    const animal = sale[1].toLowerCase();
+    const sell = Number(sale[2]);
+    const buy = HERD_ANIMALS[animal]?.buy;
+
+    if (typeof buy === "number") {
+      const profit = sell - buy - RANCH_PROFIT_PER_HERD;
+      deltas.push({ userId, eggs: 0, milk: 0, herd_profit: profit });
+    }
+  }
+
+  return deltas;
 }
 
 // ================= DB OPS =================
-async function insertEvent(discordMessageId, parsed) {
+async function insertEvent(discordMessageId, delta) {
+  // One row per Discord message ID — BUT if a message contains multiple deltas,
+  // we need them combined into a single insert.
+  // We'll handle that outside by combining first.
   const { rowCount } = await pool.query(
     `
     INSERT INTO public.ranch_events (discord_message_id, user_id, eggs, milk, herd_profit)
     VALUES ($1, $2::bigint, $3::int, $4::int, $5::numeric)
     ON CONFLICT (discord_message_id) DO NOTHING
     `,
-    [discordMessageId, parsed.userId, parsed.eggs, parsed.milk, parsed.herd_profit]
+    [discordMessageId, delta.userId, delta.eggs, delta.milk, delta.herd_profit]
   );
   return rowCount > 0;
 }
@@ -231,39 +299,9 @@ async function rebuildTotals() {
   `);
 }
 
-// ================= BACKFILL =================
-async function backfillFromHistory(maxMessages) {
-  const channel = await client.channels.fetch(RANCH_INPUT_CHANNEL_ID);
+// ================= COMPACT LEADERBOARD =================
+const BOARD_KEY = "ranch_weekly_ledger_compact";
 
-  let lastId = null;
-  let scanned = 0;
-  let inserted = 0;
-
-  while (scanned < maxMessages) {
-    const batchSize = Math.min(100, maxMessages - scanned);
-    const batch = await channel.messages.fetch(lastId ? { limit: batchSize, before: lastId } : { limit: batchSize });
-    if (!batch.size) break;
-
-    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-    for (const msg of sorted) {
-      scanned++;
-
-      const parsed = parseRanchLog(msg);
-      if (!parsed) continue;
-
-      const ok = await insertEvent(msg.id, parsed);
-      if (ok) inserted++;
-    }
-
-    lastId = sorted[0].id;
-  }
-
-  console.log(`📥 Ranch backfill: scanned=${scanned} inserted=${inserted}`);
-}
-
-// ================= LEADERBOARD =================
-const BOARD_KEY = "ranch_weekly_ledger_text";
 function money(n) {
   return `$${Number(n).toFixed(2)}`;
 }
@@ -272,7 +310,7 @@ async function updateBoard() {
   const msgId = await ensureBotMessage(
     BOARD_KEY,
     RANCH_OUTPUT_CHANNEL_ID,
-    "🏆 Beaver Farms — Weekly Ledger\nLoading..."
+    "🏆 Beaver Farms — Weekly Ledger\n\n(loading)"
   );
 
   const channel = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
@@ -294,52 +332,83 @@ async function updateBoard() {
 
   players.sort((a, b) => b.payout - a.payout);
 
-  let out = `🏆 **Beaver Farms — Weekly Ledger (Top Earners)**\n\n`;
+  // super compact: one line per person
+  let out = `🏆 **Beaver Farms — Weekly Ledger (Compact)**\n`;
+  out += `Prices: 🥚$${EGGS_PRICE} • 🥛$${MILK_PRICE} • Herd profit rules active\n\n`;
 
   const medals = ["🥇", "🥈", "🥉"];
-  for (let i = 0; i < Math.min(players.length, 25); i++) {
+  const maxLines = 40; // fits way more people
+  for (let i = 0; i < Math.min(players.length, maxLines); i++) {
     const p = players[i];
-    const badge = medals[i] || `#${i + 1}`;
-
-    out +=
-      `**${badge} <@${p.user_id}>**\n` +
-      `🥚 Eggs: ${p.eggs}\n` +
-      `🥛 Milk: ${p.milk}\n` +
-      `🐄 Herd Profit: ${money(p.herdProfit)}\n` +
-      `💰 **${money(p.payout)}**\n\n`;
+    const rank = medals[i] || `#${i + 1}`;
+    out += `${rank} <@${p.user_id}>  | 🥚${p.eggs} 🥛${p.milk} 🐄${money(p.herdProfit)} | 💰 **${money(p.payout)}**\n`;
   }
 
   const payroll = players.reduce((a, p) => a + p.payout, 0);
-  out += `---\n💼 **Total Ranch Payroll:** ${money(payroll)}`;
+  out += `\n---\n💼 **Total Ranch Payroll:** ${money(payroll)}`;
 
   await msg.edit({ content: out, embeds: [] });
-  console.log("📊 Ranch board updated");
+  console.log("📊 Leaderboard updated");
 }
 
-// ================= LIVE UPDATES =================
-let debounce = null;
-function scheduleUpdate() {
-  if (debounce) return;
-  debounce = setTimeout(async () => {
-    debounce = null;
+// ================= POLLING =================
+// Poll channel and process any messages after last_seen_id
+const STATE_LAST_ID = "ranch_last_seen_message_id";
+
+async function processNewLogsOnce() {
+  const channel = await client.channels.fetch(RANCH_INPUT_CHANNEL_ID);
+
+  let lastSeen = await getState(STATE_LAST_ID, null);
+  let fetchedAny = false;
+
+  while (true) {
+    const batch = await channel.messages.fetch(
+      lastSeen ? { limit: 100, after: lastSeen } : { limit: 100 }
+    );
+
+    if (!batch.size) break;
+
+    // Sort oldest -> newest
+    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    for (const msg of sorted) {
+      fetchedAny = true;
+
+      const deltas = parseRanchLogMulti(msg);
+      if (deltas.length) {
+        // Combine multiple deltas into one insert for this message id
+        const combined = deltas.reduce(
+          (acc, d) => ({
+            userId: d.userId,
+            eggs: acc.eggs + (d.eggs || 0),
+            milk: acc.milk + (d.milk || 0),
+            herd_profit: acc.herd_profit + (d.herd_profit || 0),
+          }),
+          { userId: deltas[0].userId, eggs: 0, milk: 0, herd_profit: 0 }
+        );
+
+        await insertEvent(msg.id, combined);
+      }
+
+      lastSeen = msg.id;
+      await setState(STATE_LAST_ID, lastSeen);
+    }
+
+    // If Discord returns <=100, we might still have more after lastSeen; loop again.
+    if (sorted.length < 100) break;
+  }
+
+  if (fetchedAny) {
     await rebuildTotals();
     await updateBoard();
-  }, 1500);
+  }
 }
 
-client.on("messageCreate", async (message) => {
-  try {
-    if (message.channel.id !== RANCH_INPUT_CHANNEL_ID) return;
-
-    const parsed = parseRanchLog(message);
-    if (!parsed) return;
-
-    const ok = await insertEvent(message.id, parsed);
-    if (ok) scheduleUpdate();
-  } catch (e) {
-    console.error("❌ messageCreate error:", e);
-  }
-});
+function startPolling() {
+  setInterval(() => {
+    processNewLogsOnce().catch(e => console.error("❌ poll error:", e));
+  }, POLL_SECONDS * 1000);
+}
 
 // ================= STARTUP =================
 client.once("clientReady", async () => {
@@ -347,15 +416,26 @@ client.once("clientReady", async () => {
     console.log(`🚜 Ranch Manager Online: ${client.user.tag}`);
     await ensureSchema();
 
-    if (BACKFILL_ON_START) {
-      console.log(`📥 Backfilling ranch history (max ${BACKFILL_MAX_MESSAGES})...`);
-      await backfillFromHistory(BACKFILL_MAX_MESSAGES);
+    // Initialize lastSeen on first boot if empty:
+    let lastSeen = await getState(STATE_LAST_ID, null);
+    if (!lastSeen) {
+      // set lastSeen to the newest message so we don't re-process whole history by accident
+      const channel = await client.channels.fetch(RANCH_INPUT_CHANNEL_ID);
+      const newest = await channel.messages.fetch({ limit: 1 });
+      const newestMsg = newest.first();
+      if (newestMsg) {
+        await setState(STATE_LAST_ID, newestMsg.id);
+        console.log(`🧠 Initialized lastSeen to newest msg: ${newestMsg.id}`);
+      }
     }
 
-    await rebuildTotals();
-    await updateBoard();
+    // One immediate pass (will catch new users right away)
+    await processNewLogsOnce();
 
-    console.log("✅ Startup complete.");
+    // Start polling forever
+    startPolling();
+
+    console.log(`✅ Polling logs every ${POLL_SECONDS}s`);
   } catch (e) {
     console.error("❌ Startup failed:", e);
     process.exit(1);
