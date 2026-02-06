@@ -30,7 +30,7 @@ if (!RANCH_INPUT_CHANNEL_ID || !RANCH_OUTPUT_CHANNEL_ID) {
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
-  console.error("❌ Missing Railway variable: DATABASE_URL (recommended for persistence)");
+  console.error("❌ Missing Railway variable: DATABASE_URL");
   process.exit(1);
 }
 
@@ -41,14 +41,8 @@ const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 5000);
 const MILK_PRICE = 1.25;
 const EGGS_PRICE = 1.25;
 
-// Herd profit rules (your latest clarified math):
-// Profit = sell - buy - 100 (ranch profit)
+// Herd profit rules (optional, if you parse herding completed/sales later)
 const RANCH_PROFIT_PER_HERD = 100;
-const HERD_ANIMALS = {
-  bison: { buy: 300, sell: 1200 },
-  deer: { buy: 250, sell: 1000 },
-  sheep: { buy: 150, sell: 900 },
-};
 
 // ================= DB =================
 const pool = new Pool({
@@ -161,56 +155,49 @@ function extractAllText(message) {
   return text.trim();
 }
 
-// ✅ THIS is the important fix.
-// Works for:
-// "<@8960...>"  OR  "@killaky 8960..."  OR any snowflake in the message.
-function extractUserIdFromRanchLog(text) {
+// ✅ MOST RELIABLE: use Discord parsed mentions first
+function getUserIdFromMessage(message, text) {
+  const mentioned = message.mentions?.users?.first?.();
+  if (mentioned?.id) return mentioned.id;
+
+  // fallback: <@123> or <@!123>
   const mention = text.match(/<@!?(\d{17,19})>/);
   if (mention) return mention[1];
 
+  // fallback: "@name 123..."
   const atLine = text.match(/@\S+\s+(\d{17,19})\b/);
   if (atLine) return atLine[1];
 
+  // fallback: any snowflake
   const any = text.match(/\b(\d{17,19})\b/);
   return any ? any[1] : null;
 }
 
+function getRanchIdIfPresent(text) {
+  const a = text.match(/ranch id\s*(\d+)/i);
+  return a ? a[1] : null;
+}
+
 // ================= PARSER =================
-// Handles:
-// "Added Milk to ranch id 164 : 18"
-// "Added Eggs to ranch id 164 : 33"
-// Also supports cattle/bison logs if you add later.
 function parseRanchLog(message) {
   const text = extractAllText(message);
   if (!text) return null;
 
-  // Only track the ranch id you want
-  const ranchIdMatch = text.match(/ranch id\s*(\d+)/i) || text.match(/Ranch ID:\s*(\d+)/i);
-  if (ranchIdMatch && String(ranchIdMatch[1]) !== RANCH_ID) return null;
+  const rid = getRanchIdIfPresent(text);
+  if (rid && String(rid) !== RANCH_ID) return null;
 
-  const userId = extractUserIdFromRanchLog(text);
+  const userId = getUserIdFromMessage(message, text);
   if (!userId) return null;
 
-  // Eggs/Milk adds
-  const milkMatch = text.match(/Added\s+Milk\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
+  // Looser match: handles "Milk Added" line + "Added Milk to ranch id ..."
+  const milkMatch = text.match(/Added\s+Milk[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/i);
   if (milkMatch) return { userId, eggs: 0, milk: Number(milkMatch[1]), herd_profit: 0 };
 
-  const eggsMatch = text.match(/Added\s+Eggs\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
+  const eggsMatch = text.match(/Added\s+Eggs[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/i);
   if (eggsMatch) return { userId, eggs: Number(eggsMatch[1]), milk: 0, herd_profit: 0 };
 
-  // Herd sale (profit rules example)
-  // If you later have a log like: "Player X sold 4 Bison for 864.0$"
-  // We convert to herd profit = sell - buy - 100
-  const soldMatch = text.match(/sold\s+\d+\s+(Bison|Deer|Sheep)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i);
-  if (soldMatch) {
-    const animal = soldMatch[1].toLowerCase();
-    const sell = Number(soldMatch[2]);
-    const rule = HERD_ANIMALS[animal];
-    if (!rule) return null;
-
-    const herdProfit = sell - rule.buy - RANCH_PROFIT_PER_HERD;
-    return { userId, eggs: 0, milk: 0, herd_profit: herdProfit };
-  }
+  // Optional: you can later parse herding completed into herd_profit if needed
+  // Right now: just ensure milk/eggs ALWAYS count.
 
   return null;
 }
@@ -261,7 +248,6 @@ async function backfillFromHistory(maxMessages) {
 
     for (const msg of sorted) {
       scanned++;
-      if (!msg.webhookId && !msg.author?.bot) continue;
 
       const parsed = parseRanchLog(msg);
       if (!parsed) continue;
@@ -276,9 +262,8 @@ async function backfillFromHistory(maxMessages) {
   console.log(`📥 Ranch backfill: scanned=${scanned} inserted=${inserted}`);
 }
 
-// ================= LEADERBOARD (single static message) =================
+// ================= LEADERBOARD =================
 const BOARD_KEY = "ranch_weekly_ledger_text";
-
 function money(n) {
   return `$${Number(n).toFixed(2)}`;
 }
@@ -303,15 +288,8 @@ async function updateBoard() {
     const eggs = Number(r.eggs);
     const milk = Number(r.milk);
     const herdProfit = Number(r.herd_profit);
-
     const payout = (eggs * EGGS_PRICE) + (milk * MILK_PRICE) + herdProfit;
-    return {
-      user_id: r.user_id.toString(),
-      eggs,
-      milk,
-      herdProfit,
-      payout,
-    };
+    return { user_id: r.user_id.toString(), eggs, milk, herdProfit, payout };
   });
 
   players.sort((a, b) => b.payout - a.payout);
@@ -352,7 +330,6 @@ function scheduleUpdate() {
 client.on("messageCreate", async (message) => {
   try {
     if (message.channel.id !== RANCH_INPUT_CHANNEL_ID) return;
-    if (!message.webhookId && !message.author?.bot) return;
 
     const parsed = parseRanchLog(message);
     if (!parsed) return;
