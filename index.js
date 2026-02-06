@@ -22,17 +22,19 @@ const BOT_TOKEN =
   process.env.TOKEN;
 
 if (!BOT_TOKEN) {
-  console.error("❌ Missing Railway variable: DISCORD_TOKEN (or BOT_TOKEN)");
+  console.error("❌ Missing DISCORD_TOKEN");
   process.exit(1);
 }
 
-const HERD_QUEUE_CHANNEL_ID = process.env.HERD_QUEUE_CHANNEL_ID;
+const HERD_QUEUE_CHANNEL_ID =
+  process.env.HERD_QUEUE_CHANNEL_ID ||
+  process.env.HERD_CHANNEL_ID;
+
 if (!HERD_QUEUE_CHANNEL_ID) {
-  console.error("❌ Missing Railway variable: HERD_QUEUE_CHANNEL_ID");
+  console.error("❌ Missing HERD_QUEUE_CHANNEL_ID");
   process.exit(1);
 }
 
-// optional DB (recommended so queue survives restarts)
 const DATABASE_URL = process.env.DATABASE_URL || null;
 
 const pool = DATABASE_URL
@@ -42,306 +44,161 @@ const pool = DATABASE_URL
     })
   : null;
 
-// ================= EXPRESS (health for Railway) =================
+// ================= EXPRESS =================
 const app = express();
-app.get("/", (_, res) => res.status(200).send("Herd Queue running ✅"));
-app.get("/health", async (_, res) => {
-  try {
-    if (pool) await pool.query("SELECT 1");
-    res.status(200).json({ ok: true, db: !!pool });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-const server = app.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Web listening on ${PORT}`)
-);
+app.get("/", (_, res) => res.send("Herd Queue running"));
+app.listen(PORT, "0.0.0.0");
 
 // ================= DISCORD =================
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-client.on("error", (e) => console.error("❌ Discord error:", e));
-process.on("unhandledRejection", (r) => console.error("❌ unhandledRejection:", r));
-process.on("uncaughtException", (e) => console.error("❌ uncaughtException:", e));
-
-// ================= DB SCHEMA =================
+// ================= DB =================
 async function ensureSchema() {
   if (!pool) return;
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS public.bot_messages (
-      key TEXT PRIMARY KEY,
-      channel_id BIGINT NOT NULL,
-      message_id BIGINT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS public.herd_queue_state (
-      id INT PRIMARY KEY DEFAULT 1,
-      active_user_id BIGINT,
-      active_started_at TIMESTAMPTZ,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS public.herd_queue_entries (
+    CREATE TABLE IF NOT EXISTS herd_queue (
       user_id BIGINT PRIMARY KEY,
-      joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      joined_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS bot_messages (
+      key TEXT PRIMARY KEY,
+      channel_id BIGINT,
+      message_id BIGINT
     );
   `);
-
-  // ensure singleton row exists
-  await pool.query(`
-    INSERT INTO public.herd_queue_state (id)
-    VALUES (1)
-    ON CONFLICT (id) DO NOTHING
-  `);
 }
 
-// ================= QUEUE STATE (memory fallback) =================
-let memActiveUserId = null;
-let memActiveStartedAt = null;
-let memQueue = []; // array of userIds in order
+let memQueue = [];
 
-async function loadQueueFromDB() {
+async function loadQueue() {
   if (!pool) return;
-
-  const state = await pool.query(`SELECT active_user_id, active_started_at FROM public.herd_queue_state WHERE id=1`);
-  memActiveUserId = state.rows[0]?.active_user_id ? String(state.rows[0].active_user_id) : null;
-  memActiveStartedAt = state.rows[0]?.active_started_at ? new Date(state.rows[0].active_started_at) : null;
-
-  const entries = await pool.query(`SELECT user_id FROM public.herd_queue_entries ORDER BY joined_at ASC`);
-  memQueue = entries.rows.map(r => String(r.user_id));
-}
-
-async function saveQueueToDB() {
-  if (!pool) return;
-
-  await pool.query(
-    `UPDATE public.herd_queue_state
-     SET active_user_id=$1::bigint, active_started_at=$2, updated_at=NOW()
-     WHERE id=1`,
-    [
-      memActiveUserId ? memActiveUserId : null,
-      memActiveStartedAt ? memActiveStartedAt.toISOString() : null,
-    ]
+  const { rows } = await pool.query(
+    `SELECT user_id FROM herd_queue ORDER BY joined_at ASC`
   );
+  memQueue = rows.map(r => String(r.user_id));
+}
 
-  // rewrite entries
-  await pool.query(`TRUNCATE public.herd_queue_entries`);
+async function saveQueue() {
+  if (!pool) return;
+  await pool.query(`TRUNCATE herd_queue`);
   for (let i = 0; i < memQueue.length; i++) {
     await pool.query(
-      `INSERT INTO public.herd_queue_entries (user_id, joined_at) VALUES ($1::bigint, NOW() + ($2 || ' seconds')::interval)`,
-      [memQueue[i], i] // preserve order roughly
+      `INSERT INTO herd_queue (user_id, joined_at)
+       VALUES ($1::bigint, NOW() + ($2 || ' seconds')::interval)`,
+      [memQueue[i], i]
     );
   }
 }
 
 // ================= STATIC MESSAGE =================
-async function ensureBotMessage(key, channelId, initialText) {
+async function ensureBoard() {
   if (!pool) {
-    // no DB: just send once per boot (not ideal), but workable
-    const channel = await client.channels.fetch(channelId);
-    const msg = await channel.send(initialText);
+    const channel = await client.channels.fetch(HERD_QUEUE_CHANNEL_ID);
+    const msg = await channel.send("Loading...");
     return msg.id;
   }
 
   const { rows } = await pool.query(
-    `SELECT message_id FROM public.bot_messages WHERE key=$1 LIMIT 1`,
-    [key]
+    `SELECT message_id FROM bot_messages WHERE key='herd_queue'`
   );
 
-  const channel = await client.channels.fetch(channelId);
+  const channel = await client.channels.fetch(HERD_QUEUE_CHANNEL_ID);
 
   if (rows.length) {
-    const msgId = rows[0].message_id.toString();
     try {
-      await channel.messages.fetch(msgId);
-      return msgId;
+      await channel.messages.fetch(rows[0].message_id);
+      return rows[0].message_id.toString();
     } catch {}
   }
 
-  const msg = await channel.send(initialText);
-
+  const msg = await channel.send("Loading...");
   await pool.query(
-    `
-    INSERT INTO public.bot_messages (key, channel_id, message_id, updated_at)
-    VALUES ($1, $2::bigint, $3::bigint, NOW())
-    ON CONFLICT (key)
-    DO UPDATE SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id, updated_at=NOW()
-    `,
-    [key, channelId, msg.id]
+    `INSERT INTO bot_messages (key, channel_id, message_id)
+     VALUES ('herd_queue',$1,$2)
+     ON CONFLICT (key)
+     DO UPDATE SET message_id=EXCLUDED.message_id`,
+    [HERD_QUEUE_CHANNEL_ID, msg.id]
   );
 
   return msg.id;
 }
 
 // ================= RENDER =================
-const QUEUE_KEY = "herd_queue_board";
+function buildEmbed() {
+  const active = memQueue.length ? `<@${memQueue[0]}>` : "None ✅";
 
-function buildQueueEmbed() {
-  const embed = new EmbedBuilder()
+  const queueText = memQueue.length
+    ? memQueue.map((u, i) => `${i + 1}. <@${u}>`).join("\n")
+    : "No one in queue.";
+
+  return new EmbedBuilder()
     .setTitle("🐎 Main Herd Queue")
-    .setColor(0x2b2d31);
-
-  const active = memActiveUserId ? `<@${memActiveUserId}>` : "None ✅";
-  const status = memActiveUserId ? "Status: Herding in progress ⏳" : "Status: Herding is available.";
-
-  let queueText = "No one in queue.";
-  if (memQueue.length) {
-    queueText = memQueue.map((uid, idx) => `${idx + 1}. <@${uid}>`).join("\n");
-  }
-
-  embed.setDescription(
-    `Current Herder: ${active}\n` +
-    `${status}\n\n` +
-    `Queue:\n${queueText}`
-  );
-
-  return embed;
+    .setColor(0x2b2d31)
+    .setDescription(
+      `Current Herder: ${active}\n` +
+      `Status: ${memQueue.length ? "Herding in progress ⏳" : "Herding is available."}\n\n` +
+      `Queue:\n${queueText}`
+    );
 }
 
-function buildQueueComponents() {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("queue_join")
-      .setLabel("Join Queue")
-      .setStyle(ButtonStyle.Primary),
-
-    new ButtonBuilder()
-      .setCustomId("queue_leave")
-      .setLabel("Leave Queue")
-      .setStyle(ButtonStyle.Secondary),
-
-    new ButtonBuilder()
-      .setCustomId("queue_start")
-      .setLabel("Start Herding")
-      .setStyle(ButtonStyle.Success),
-
-    new ButtonBuilder()
-      .setCustomId("queue_end")
-      .setLabel("End Herding")
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  return [row];
+function buildButtons() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("join")
+        .setLabel("Join Queue")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("leave")
+        .setLabel("Leave Queue")
+        .setStyle(ButtonStyle.Secondary)
+    ),
+  ];
 }
 
-async function renderQueueBoard() {
+async function render() {
   const channel = await client.channels.fetch(HERD_QUEUE_CHANNEL_ID);
-  const msgId = await ensureBotMessage(QUEUE_KEY, HERD_QUEUE_CHANNEL_ID, "Loading herd queue...");
-
+  const msgId = await ensureBoard();
   const msg = await channel.messages.fetch(msgId);
+
   await msg.edit({
-    content: "",
-    embeds: [buildQueueEmbed()],
-    components: buildQueueComponents(),
+    embeds: [buildEmbed()],
+    components: buildButtons(),
   });
 }
 
-// ================= HELPERS =================
-function isInQueue(userId) {
-  return memQueue.includes(userId);
-}
+// ================= INTERACTIONS =================
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isButton()) return;
 
-function removeFromQueue(userId) {
-  memQueue = memQueue.filter((x) => x !== userId);
-}
+  await interaction.deferUpdate(); // prevent "interaction failed"
 
-// ================= INTERACTIONS (FIXES “interaction failed”) =================
-client.on("interactionCreate", async (interaction) => {
-  try {
-    if (!interaction.isButton()) return;
+  const userId = interaction.user.id;
 
-    // ✅ always acknowledge quickly so Discord doesn't error
-    await interaction.deferUpdate();
-
-    const userId = interaction.user.id;
-
-    if (interaction.customId === "queue_join") {
-      if (!memActiveUserId) {
-        // If no one herding, joining means you become first in queue (not active yet)
-      }
-      if (!isInQueue(userId) && memActiveUserId !== userId) {
-        memQueue.push(userId);
-      }
+  if (interaction.customId === "join") {
+    if (!memQueue.includes(userId)) {
+      memQueue.push(userId);
     }
-
-    if (interaction.customId === "queue_leave") {
-      if (memActiveUserId === userId) {
-        // active herder can't "leave"; they must end session
-      } else {
-        removeFromQueue(userId);
-      }
-    }
-
-    if (interaction.customId === "queue_start") {
-      // only if no active herder
-      if (!memActiveUserId) {
-        // only first in queue can start, OR if queue empty you can start directly
-        if (memQueue.length === 0) {
-          memActiveUserId = userId;
-          memActiveStartedAt = new Date();
-        } else if (memQueue[0] === userId) {
-          memQueue.shift();
-          memActiveUserId = userId;
-          memActiveStartedAt = new Date();
-        }
-      }
-    }
-
-    if (interaction.customId === "queue_end") {
-      // only active herder can end
-      if (memActiveUserId === userId) {
-        memActiveUserId = null;
-        memActiveStartedAt = null;
-      }
-    }
-
-    // persist + re-render
-    await saveQueueToDB();
-    await renderQueueBoard();
-  } catch (e) {
-    console.error("❌ interactionCreate error:", e);
-    // If deferUpdate failed, try a safe reply
-    try {
-      if (interaction.isRepliable() && !interaction.replied) {
-        await interaction.reply({ content: "⚠️ Something went wrong. Try again.", ephemeral: true });
-      }
-    } catch {}
   }
+
+  if (interaction.customId === "leave") {
+    memQueue = memQueue.filter(u => u !== userId);
+  }
+
+  await saveQueue();
+  await render();
 });
 
-// ================= STARTUP =================
+// ================= START =================
 client.once("clientReady", async () => {
-  try {
-    console.log(`🐎 Herd Queue online as ${client.user.tag}`);
-
-    await ensureSchema();
-    await loadQueueFromDB();
-    await renderQueueBoard();
-
-    console.log("✅ Queue ready.");
-  } catch (e) {
-    console.error("❌ Startup failed:", e);
-    process.exit(1);
-  }
+  console.log(`🐎 Herd Queue online as ${client.user.tag}`);
+  await ensureSchema();
+  await loadQueue();
+  await render();
 });
-
-// ================= SHUTDOWN =================
-async function shutdown(signal) {
-  console.log(`🛑 ${signal} received. Shutting down...`);
-  try {
-    await client.destroy().catch(() => {});
-    if (pool) await pool.end().catch(() => {});
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 10000).unref();
-  } catch {
-    process.exit(1);
-  }
-}
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
 
 client.login(BOT_TOKEN);
