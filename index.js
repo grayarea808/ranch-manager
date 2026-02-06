@@ -63,9 +63,8 @@ if (!HERD_QUEUE_CHANNEL_ID) {
 const BACKFILL_ON_START = String(process.env.BACKFILL_ON_START || "true").toLowerCase() === "true";
 const BACKFILL_EVERY_MS = Number(process.env.BACKFILL_EVERY_MS || 300000);
 const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 1000);
-const LEADERBOARD_DEBOUNCE_MS = Number(process.env.LEADERBOARD_DEBOUNCE_MS || 3000);
 
-// Weekly rollover schedule (Tampa time defaults)
+// Weekly rollover schedule
 const WEEKLY_TZ = process.env.WEEKLY_ROLLOVER_TZ || "America/New_York";
 const WEEKLY_DOW = Number(process.env.WEEKLY_ROLLOVER_DOW ?? 6); // Sat
 const WEEKLY_HOUR = Number(process.env.WEEKLY_ROLLOVER_HOUR ?? 9);
@@ -174,25 +173,20 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    -- ✅ matches your screenshot
     CREATE TABLE IF NOT EXISTS public.herd_queue_state (
       key TEXT PRIMARY KEY,
-      value JSONB NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      value JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      queue_json JSONB NOT NULL DEFAULT '[]'::jsonb
     );
   `);
 
+  // Ensure main row exists
   await pool.query(`
-    ALTER TABLE public.ranch_events
-      ADD COLUMN IF NOT EXISTS eggs INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS milk INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS herd_profit NUMERIC NOT NULL DEFAULT 0;
-
-    ALTER TABLE public.camp_events
-      ADD COLUMN IF NOT EXISTS materials INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS supplies INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS del_small INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS del_med INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS del_large INT NOT NULL DEFAULT 0;
+    INSERT INTO public.herd_queue_state (key, value, queue_json, updated_at)
+    VALUES ('main', '{}'::jsonb, '[]'::jsonb, NOW())
+    ON CONFLICT (key) DO NOTHING;
   `);
 }
 
@@ -200,7 +194,6 @@ async function getState(key, fallback = null) {
   const { rows } = await pool.query(`SELECT value FROM public.bot_state WHERE key=$1 LIMIT 1`, [key]);
   return rows.length ? rows[0].value : fallback;
 }
-
 async function setState(key, value) {
   await pool.query(
     `
@@ -216,7 +209,6 @@ async function getBoardMessageId(key) {
   const { rows } = await pool.query(`SELECT message_id FROM public.bot_messages WHERE key=$1 LIMIT 1`, [key]);
   return rows.length ? rows[0].message_id.toString() : null;
 }
-
 async function setBoardMessage(key, channelId, messageId) {
   await pool.query(
     `
@@ -229,39 +221,7 @@ async function setBoardMessage(key, channelId, messageId) {
   );
 }
 
-/* ================= TEXT/DATE HELPERS ================= */
-function money(n) {
-  return `$${Number(n).toFixed(2)}`;
-}
-
-function extractAllText(message) {
-  let text = (message.content || "").trim();
-  if (message.embeds?.length) {
-    for (const e of message.embeds) {
-      if (e.title) text += `\n${e.title}`;
-      if (e.description) text += `\n${e.description}`;
-      if (e.author?.name) text += `\n${e.author.name}`;
-      if (e.fields?.length) for (const f of e.fields) text += `\n${f.name}\n${f.value}`;
-      if (e.footer?.text) text += `\n${e.footer.text}`;
-    }
-  }
-  return text.trim();
-}
-
-function getUserIdFromMessage(message, text) {
-  const first = message.mentions?.users?.first?.();
-  if (first?.id) return first.id;
-
-  const mention = text.match(/<@!?(\d{17,19})>/);
-  if (mention) return mention[1];
-
-  const atLine = text.match(/@\S+\s+(\d{17,19})\b/);
-  if (atLine) return atLine[1];
-
-  const any = text.match(/\b(\d{17,19})\b/);
-  return any ? any[1] : null;
-}
-
+/* ================= DATE HELPERS ================= */
 function tzParts(date) {
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone: WEEKLY_TZ,
@@ -278,7 +238,6 @@ function fmtDate(date) {
   const p = tzParts(date);
   return `${p.month}/${p.day}/${p.year}`;
 }
-
 function nowInTZParts() {
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone: WEEKLY_TZ,
@@ -298,14 +257,40 @@ function nowInTZParts() {
 function dowFromShort(short) {
   return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(short);
 }
-
-/* ================= INIT WEEK STARTS (ONLY ONCE) ================= */
+function money(n) {
+  return `$${Number(n).toFixed(2)}`;
+}
 async function initWeekStartsIfMissing() {
   const r = await getState("ranch_week_start_iso", null);
   if (!r) await setState("ranch_week_start_iso", new Date().toISOString());
-
   const c = await getState("camp_week_start_iso", null);
   if (!c) await setState("camp_week_start_iso", new Date().toISOString());
+}
+
+/* ================= MESSAGE TEXT HELPERS ================= */
+function extractAllText(message) {
+  let text = (message.content || "").trim();
+  if (message.embeds?.length) {
+    for (const e of message.embeds) {
+      if (e.title) text += `\n${e.title}`;
+      if (e.description) text += `\n${e.description}`;
+      if (e.author?.name) text += `\n${e.author.name}`;
+      if (e.fields?.length) for (const f of e.fields) text += `\n${f.name}\n${f.value}`;
+      if (e.footer?.text) text += `\n${e.footer.text}`;
+    }
+  }
+  return text.trim();
+}
+
+function getUserIdFromMessage(message, text) {
+  const first = message.mentions?.users?.first?.();
+  if (first?.id) return first.id;
+  const mention = text.match(/<@!?(\d{17,19})>/);
+  if (mention) return mention[1];
+  const atLine = text.match(/@\S+\s+(\d{17,19})\b/);
+  if (atLine) return atLine[1];
+  const any = text.match(/\b(\d{17,19})\b/);
+  return any ? any[1] : null;
 }
 
 /* ================= PARSERS ================= */
@@ -446,7 +431,7 @@ async function ensureCurrentMessage(key, channelId, defaultText) {
   }
 }
 
-/* ================= RANCH RENDER ================= */
+/* ================= RANCH RENDER (compact) ================= */
 async function renderRanchBoard(isFinal = false) {
   const key = "ranch_current_msg";
   const msgId = await ensureCurrentMessage(
@@ -468,7 +453,7 @@ async function renderRanchBoard(isFinal = false) {
     .map((r) => {
       const eggs = Number(r.eggs);
       const milk = Number(r.milk);
-      const herdProfit = Number(r.herd_profit); // internal
+      const herdProfit = Number(r.herd_profit); // internal only
       const payout = eggs * EGGS_PRICE + milk * MILK_PRICE + herdProfit;
       return { user_id: r.user_id.toString(), eggs, milk, payout };
     })
@@ -586,7 +571,6 @@ async function rolloverIfDue() {
   await renderRanchBoard(true);
   await renderCampBoard(true);
 
-  // new posts for next week
   {
     const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
     const m = await ch.send({ content: "🏆 **Beaver Falls — Weekly Ranch Ledger**\n\n(Starting new week…)" });
@@ -658,47 +642,58 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
   return inserted;
 }
 
-/* ================= HERD QUEUE (NO FAIL INTERACTIONS) ================= */
+/* ================= HERD QUEUE (matches your table) ================= */
 function defaultQueueState() {
-  return {
-    activeHerderId: null,
-    activeSince: null,
-    queue: [], // { userId, joinedAt }
-  };
-}
-
-async function getQueueState() {
-  const { rows } = await pool.query(`SELECT value FROM public.herd_queue_state WHERE key='main' LIMIT 1`);
-  if (!rows.length) return defaultQueueState();
-  const v = rows[0].value;
-  return {
-    activeHerderId: v.activeHerderId ?? null,
-    activeSince: v.activeSince ?? null,
-    queue: Array.isArray(v.queue) ? v.queue : [],
-  };
-}
-
-async function saveQueueState(state) {
-  await pool.query(
-    `
-    INSERT INTO public.herd_queue_state (key, value, updated_at)
-    VALUES ('main', $1::jsonb, NOW())
-    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-    `,
-    [JSON.stringify(state)]
-  );
+  return { activeHerderId: null, activeSince: null, queue: [] };
 }
 
 function clearStale(state) {
   const now = Date.now();
-  state.queue = state.queue.filter((q) => now - Number(q.joinedAt || 0) <= HERD_STALE_MS);
-  if (state.activeHerderId && state.activeSince) {
-    if (now - Number(state.activeSince) > HERD_STALE_MS) {
-      state.activeHerderId = null;
-      state.activeSince = null;
-    }
+  state.queue = (state.queue || []).filter((q) => now - Number(q.joinedAt || 0) <= HERD_STALE_MS);
+
+  if (state.activeHerderId && state.activeSince && now - Number(state.activeSince) > HERD_STALE_MS) {
+    state.activeHerderId = null;
+    state.activeSince = null;
   }
   return state;
+}
+
+async function getQueueState() {
+  const { rows } = await pool.query(
+    `SELECT value, queue_json FROM public.herd_queue_state WHERE key='main' LIMIT 1`
+  );
+  if (!rows.length) return defaultQueueState();
+
+  const v = rows[0].value || {};
+  const q = Array.isArray(rows[0].queue_json) ? rows[0].queue_json : [];
+
+  const state = {
+    activeHerderId: v.activeHerderId ?? null,
+    activeSince: v.activeSince ?? null,
+    queue: q,
+  };
+
+  return clearStale(state);
+}
+
+async function saveQueueState(state) {
+  state = clearStale(state);
+
+  const value = {
+    activeHerderId: state.activeHerderId,
+    activeSince: state.activeSince,
+  };
+
+  await pool.query(
+    `
+    UPDATE public.herd_queue_state
+    SET value=$1::jsonb,
+        queue_json=$2::jsonb,
+        updated_at=NOW()
+    WHERE key='main'
+    `,
+    [JSON.stringify(value), JSON.stringify(state.queue || [])]
+  );
 }
 
 function isAdminMember(interaction) {
@@ -710,7 +705,6 @@ function isAdminMember(interaction) {
 function buildHerdComponents(state, isAdmin = false) {
   const joinBtn = new ButtonBuilder().setCustomId("herd_join").setLabel("Join Queue").setStyle(ButtonStyle.Success);
   const leaveBtn = new ButtonBuilder().setCustomId("herd_leave").setLabel("Leave Queue").setStyle(ButtonStyle.Secondary);
-
   const row1 = new ActionRowBuilder().addComponents(joinBtn, leaveBtn);
 
   const rows = [row1];
@@ -722,12 +716,12 @@ function buildHerdComponents(state, isAdmin = false) {
       .setStyle(ButtonStyle.Danger);
     rows.push(new ActionRowBuilder().addComponents(clearStaleBtn));
 
-    if (state.queue.length || state.activeHerderId) {
-      const ids = [];
-      if (state.activeHerderId) ids.push(state.activeHerderId);
-      for (const q of state.queue) ids.push(q.userId);
+    const ids = [];
+    if (state.activeHerderId) ids.push(state.activeHerderId);
+    for (const q of state.queue || []) ids.push(q.userId);
+    const unique = [...new Set(ids)].slice(0, 25);
 
-      const unique = [...new Set(ids)].slice(0, 25);
+    if (unique.length) {
       const options = unique.map((id) => ({
         label: id,
         value: id,
@@ -751,13 +745,20 @@ async function ensureHerdQueueMessage() {
   return ensureCurrentMessage(key, HERD_QUEUE_CHANNEL_ID, "🐎 **Beaver Falls — Herd Queue**\nLoading...");
 }
 
-async function renderHerdQueue(forceAdminComponents = false, interactionForAdmin = null) {
+async function renderHerdQueue(withAdmin = false, interaction = null) {
   const msgId = await ensureHerdQueueMessage();
   const channel = await client.channels.fetch(HERD_QUEUE_CHANNEL_ID);
   const msg = await channel.messages.fetch(msgId);
 
   let state = await getQueueState();
-  state = clearStale(state);
+
+  // Promote next if none active
+  if (!state.activeHerderId && state.queue.length) {
+    const next = state.queue.shift();
+    state.activeHerderId = next.userId;
+    state.activeSince = Date.now();
+  }
+
   await saveQueueState(state);
 
   const currentHerder = state.activeHerderId ? `<@${state.activeHerderId}>` : "None ✅";
@@ -775,25 +776,21 @@ async function renderHerdQueue(forceAdminComponents = false, interactionForAdmin
     `Status: ${status}\n\n` +
     `Queue:\n${queueLines}`;
 
-  const admin = forceAdminComponents && interactionForAdmin ? isAdminMember(interactionForAdmin) : false;
+  const admin = withAdmin && interaction ? isAdminMember(interaction) : false;
   await msg.edit({ content, components: buildHerdComponents(state, admin), embeds: [] });
 }
 
-// Interaction handler (✅ always ACK fast)
+// Interactions (fast ACK to prevent "interaction failed")
 client.on("interactionCreate", async (interaction) => {
   try {
     if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
 
-    // ✅ prevents "interaction failed"
     if (!interaction.deferred && !interaction.replied) {
       await interaction.deferUpdate();
     }
 
-    // Buttons
     if (interaction.isButton() && interaction.customId.startsWith("herd_")) {
       let state = await getQueueState();
-      state = clearStale(state);
-
       const uid = interaction.user.id;
 
       if (interaction.customId === "herd_join") {
@@ -805,7 +802,6 @@ client.on("interactionCreate", async (interaction) => {
             await interaction.followUp({ content: "Queue is full right now.", ephemeral: true });
           } else {
             state.queue.push({ userId: uid, joinedAt: Date.now() });
-            await saveQueueState(state);
           }
         }
       }
@@ -816,7 +812,6 @@ client.on("interactionCreate", async (interaction) => {
           state.activeSince = null;
         }
         state.queue = state.queue.filter((q) => q.userId !== uid);
-        await saveQueueState(state);
       }
 
       if (interaction.customId === "herd_clear_stale") {
@@ -824,24 +819,14 @@ client.on("interactionCreate", async (interaction) => {
           await interaction.followUp({ content: "Admin only.", ephemeral: true });
         } else {
           state = clearStale(state);
-          await saveQueueState(state);
         }
       }
 
-      // Promote next if no active herder
-      if (!state.activeHerderId && state.queue.length) {
-        const next = state.queue.shift();
-        state.activeHerderId = next.userId;
-        state.activeSince = Date.now();
-        await saveQueueState(state);
-      }
-
-      // Re-render with admin controls for admins
+      await saveQueueState(state);
       await renderHerdQueue(true, interaction);
       return;
     }
 
-    // Admin remove select
     if (interaction.isStringSelectMenu() && interaction.customId === "herd_admin_remove_select") {
       if (!isAdminMember(interaction)) {
         await interaction.followUp({ content: "Admin only.", ephemeral: true });
@@ -852,22 +837,14 @@ client.on("interactionCreate", async (interaction) => {
       if (!removeId) return;
 
       let state = await getQueueState();
-      state = clearStale(state);
 
       if (state.activeHerderId === removeId) {
         state.activeHerderId = null;
         state.activeSince = null;
       }
       state.queue = state.queue.filter((q) => q.userId !== removeId);
+
       await saveQueueState(state);
-
-      if (!state.activeHerderId && state.queue.length) {
-        const next = state.queue.shift();
-        state.activeHerderId = next.userId;
-        state.activeSince = Date.now();
-        await saveQueueState(state);
-      }
-
       await renderHerdQueue(true, interaction);
       await interaction.followUp({ content: `Removed <@${removeId}> from the queue.`, ephemeral: true });
       return;
@@ -892,17 +869,14 @@ client.once("clientReady", async () => {
     await ensureSchema();
     await initWeekStartsIfMissing();
 
-    // Ensure static messages exist
     await renderRanchBoard(false);
     await renderCampBoard(false);
     await renderHerdQueue(false);
 
-    // Backfill on start
     if (BACKFILL_ON_START) {
       console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
       const rInserted = await backfillChannel(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
       const cInserted = await backfillChannel(CAMP_INPUT_CHANNEL_ID, parseCamp, insertCampEvent, "CAMP");
-
       if (rInserted > 0) {
         await rebuildRanchTotals();
         await renderRanchBoard(false);
@@ -913,7 +887,6 @@ client.once("clientReady", async () => {
       }
     }
 
-    // Poll loops
     setInterval(async () => {
       try {
         const r = await pollOnce(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
@@ -938,21 +911,15 @@ client.once("clientReady", async () => {
       }
     }, BACKFILL_EVERY_MS);
 
-    // Keep queue fresh (auto-clears stale)
     setInterval(() => {
       renderHerdQueue(false).catch((e) => console.error("❌ renderHerdQueue:", e));
     }, 60_000);
 
-    // Weekly rollover checker
     setInterval(() => {
       rolloverIfDue().catch((e) => console.error("❌ rolloverIfDue:", e));
     }, 30_000);
 
-    console.log(
-      `✅ Running. Poll=${BACKFILL_EVERY_MS}ms | Weekly reset: Sat ${String(WEEKLY_HOUR).padStart(2, "0")}:${String(
-        WEEKLY_MINUTE
-      ).padStart(2, "0")} ${WEEKLY_TZ}`
-    );
+    console.log("✅ Running.");
   } catch (e) {
     console.error("❌ Startup failed:", e);
     process.exit(1);
