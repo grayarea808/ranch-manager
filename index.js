@@ -1,6 +1,6 @@
 // index.js — Beaver Falls Ranch + Camp Manager
-// ✅ Ranch: counts eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) from "Cattle Sale" logs
-// ✅ Camp: counts deliveries by SALE AMOUNT RANGES (so $1600 counts as Large) + stronger Discord: line user-id parsing
+// ✅ Ranch: eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) from Cattle Sale logs
+// ✅ Camp: deliveries classified by SALE AMOUNT RANGES (so $1600 counts as Large) + stronger Discord: line user-id parsing
 // ✅ 1 static message per channel (edited, no spam)
 // ✅ Poll refresh every 2000ms
 // ✅ Weekly rollover: marks current as FINAL + posts a fresh new message + resets tables
@@ -92,7 +92,7 @@ const PTS_SUPPLY = 1;
 const CAMP_LARGE_MIN = Number(process.env.CAMP_LARGE_MIN || 1400);
 const CAMP_MED_MIN = Number(process.env.CAMP_MED_MIN || 800);
 
-// Optional: for display/estimated totals (points system still drives payouts)
+// Optional: for display/estimated totals (points still drives payouts)
 const CAMP_DELIVERY_SMALL_VALUE = Number(process.env.CAMP_DELIVERY_SMALL || 500);
 const CAMP_DELIVERY_MED_VALUE = Number(process.env.CAMP_DELIVERY_MED || 950);
 const CAMP_DELIVERY_LARGE_VALUE = Number(process.env.CAMP_DELIVERY_LARGE || 1500);
@@ -332,7 +332,6 @@ function getUserIdFromMessage(message, text) {
   if (first?.id) return first.id;
 
   // 2) Prefer the "Discord:" line when present
-  // Example: "Discord: @Peter 359854613186215936"
   const discordLine = text.match(/Discord:\s*.*?(\d{17,19})\b/i);
   if (discordLine) return discordLine[1];
 
@@ -349,6 +348,13 @@ function getUserIdFromMessage(message, text) {
   return any ? any[1] : null;
 }
 
+// helper: find the LAST ": number" in a message (your ranch logs often end like ": 22")
+function lastColonNumber(text) {
+  const matches = [...text.matchAll(/:\s*(\d+)\b/g)];
+  if (!matches.length) return 0;
+  return Number(matches[matches.length - 1][1] || 0);
+}
+
 /* ================= PARSERS ================= */
 function parseRanch(message) {
   const text = extractAllText(message);
@@ -360,19 +366,19 @@ function parseRanch(message) {
   let eggs = 0;
   let milk = 0;
   let herd_profit = 0;
-  let cattle_sold = 0; // ✅ total number of animals SOLD
+  let cattle_sold = 0;
 
-  const eggsRegex =
-    /Added\s+Eggs[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/gi;
-  const milkRegex =
-    /Added\s+Milk[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/gi;
+  // ✅ SUPER forgiving ranch parsing (fixes your “inserted=0” problem)
+  // If the message contains "Added Eggs" anywhere, take the last ": number"
+  if (/Added\s+Eggs/i.test(text)) {
+    eggs += lastColonNumber(text);
+  }
 
-  let m;
-  while ((m = eggsRegex.exec(text)) !== null) eggs += Number(m[1] || 0);
-  while ((m = milkRegex.exec(text)) !== null) milk += Number(m[1] || 0);
+  if (/Added\s+Milk/i.test(text)) {
+    milk += lastColonNumber(text);
+  }
 
-  // ✅ Cattle Sale:
-  // "sold 5 Bison for 1200.0$"
+  // ✅ Cattle Sale parsing
   const sale = text.match(
     /sold\s+(\d+)\s+([A-Za-z]+)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
   );
@@ -387,7 +393,6 @@ function parseRanch(message) {
       ? CATTLE_BISON_DEDUCTION
       : CATTLE_DEFAULT_DEDUCTION;
 
-    // payout includes this, but we do NOT display profit/deductions text
     herd_profit += sell - deduction;
   }
 
@@ -572,9 +577,7 @@ async function renderRanchBoard(isFinal = false) {
     const p = players[i];
     const rank = medals[i] || `#${i + 1}`;
     const name = tagName(nameList[i]);
-
     const cattleText = p.cattleSold > 0 ? ` 🐄x${p.cattleSold}` : "";
-
     out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk}${cattleText} | 💰 **${money(
       p.payout
     )}**\n`;
@@ -595,8 +598,6 @@ function campMathRow(r) {
   const dl = Number(r.del_large);
   const deliveries = ds + dm + dl;
 
-  // This is only used to compute a display "Total Delivery Value".
-  // Payout is still points-based.
   const deliveryValue =
     ds * CAMP_DELIVERY_SMALL_VALUE +
     dm * CAMP_DELIVERY_MED_VALUE +
@@ -694,13 +695,12 @@ async function rolloverIfDue() {
 
   console.log(`🗓️ Weekly rollover triggered (${stamp} ${WEEKLY_TZ})`);
 
-  // finalize current
   await rebuildRanchTotals();
   await rebuildCampTotals();
   await renderRanchBoard(true);
   await renderCampBoard(true);
 
-  // create new current-week messages
+  // new current-week messages
   {
     const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
     const m = await ch.send({
@@ -716,7 +716,7 @@ async function rolloverIfDue() {
     await setBoardMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, m.id);
   }
 
-  // reset weekly tables
+  // reset week
   await pool.query(`TRUNCATE public.ranch_events`);
   await pool.query(`TRUNCATE public.ranch_totals`);
   await pool.query(`TRUNCATE public.camp_events`);
@@ -785,14 +785,7 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
 }
 
 /* ================= STARTUP ================= */
-// discord.js v15 uses "clientReady"; v14 uses "ready".
-// We attach to both safely (first one that fires will run; we guard to prevent double-run).
-let started = false;
-
-async function start() {
-  if (started) return;
-  started = true;
-
+client.once("clientReady", async () => {
   try {
     console.log(`🤖 Online as ${client.user.tag}`);
 
@@ -874,10 +867,7 @@ async function start() {
     console.error("❌ Startup failed:", e);
     process.exit(1);
   }
-}
-
-client.once("ready", start);
-client.once("clientReady", start);
+});
 
 /* ================= SHUTDOWN ================= */
 async function shutdown(signal) {
