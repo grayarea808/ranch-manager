@@ -1,3 +1,10 @@
+// index.js — Beaver Falls Ranch + Camp Manager
+// ✅ Ranch: counts eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) from "Cattle Sale" logs
+// ✅ Camp: counts deliveries by SALE AMOUNT RANGES (so $1600 counts as Large) + stronger Discord: line user-id parsing
+// ✅ 1 static message per channel (edited, no spam)
+// ✅ Poll refresh every 2000ms
+// ✅ Weekly rollover: marks current as FINAL + posts a fresh new message + resets tables
+
 import express from "express";
 import dotenv from "dotenv";
 import pg from "pg";
@@ -63,7 +70,7 @@ const POLL_EVERY_MS = 2000;
 
 // Weekly rollover schedule
 const WEEKLY_TZ = process.env.WEEKLY_ROLLOVER_TZ || "America/New_York";
-const WEEKLY_DOW = Number(process.env.WEEKLY_ROLLOVER_DOW ?? 6); // Sat
+const WEEKLY_DOW = Number(process.env.WEEKLY_ROLLOVER_DOW ?? 6); // Saturday
 const WEEKLY_HOUR = Number(process.env.WEEKLY_ROLLOVER_HOUR ?? 9);
 const WEEKLY_MINUTE = Number(process.env.WEEKLY_ROLLOVER_MINUTE ?? 0);
 
@@ -81,10 +88,14 @@ const PTS_MATERIAL = 2;
 const PTS_DELIVERY = 3;
 const PTS_SUPPLY = 1;
 
-// Range thresholds for sales -> tier
-// $1600 will count as large with these defaults
+// ✅ Delivery tiering by RANGE (fixes $1600)
 const CAMP_LARGE_MIN = Number(process.env.CAMP_LARGE_MIN || 1400);
 const CAMP_MED_MIN = Number(process.env.CAMP_MED_MIN || 800);
+
+// Optional: for display/estimated totals (points system still drives payouts)
+const CAMP_DELIVERY_SMALL_VALUE = Number(process.env.CAMP_DELIVERY_SMALL || 500);
+const CAMP_DELIVERY_MED_VALUE = Number(process.env.CAMP_DELIVERY_MED || 950);
+const CAMP_DELIVERY_LARGE_VALUE = Number(process.env.CAMP_DELIVERY_LARGE || 1500);
 
 /* ================= DB + APP ================= */
 const pool = new Pool({
@@ -119,9 +130,7 @@ client.on("error", (e) => console.error("❌ Discord error:", e));
 process.on("unhandledRejection", (r) =>
   console.error("❌ unhandledRejection:", r)
 );
-process.on("uncaughtException", (e) =>
-  console.error("❌ uncaughtException:", e)
-);
+process.on("uncaughtException", (e) => console.error("❌ uncaughtException:", e));
 
 /* ================= NAME RESOLUTION ================= */
 let guildCache = null;
@@ -151,6 +160,7 @@ async function displayNameFor(userId) {
     return `user-${String(userId).slice(-4)}`;
   }
 }
+
 function tagName(name) {
   return `@${name}`; // no ping
 }
@@ -317,15 +327,16 @@ function extractAllText(message) {
 }
 
 function getUserIdFromMessage(message, text) {
-  // 1) true mention
+  // 1) True mention object
   const first = message.mentions?.users?.first?.();
   if (first?.id) return first.id;
 
-  // 2) Discord: @Name 123456789012345678 (preferred)
+  // 2) Prefer the "Discord:" line when present
+  // Example: "Discord: @Peter 359854613186215936"
   const discordLine = text.match(/Discord:\s*.*?(\d{17,19})\b/i);
   if (discordLine) return discordLine[1];
 
-  // 3) mention markup
+  // 3) Mention markup
   const mention = text.match(/<@!?(\d{17,19})>/);
   if (mention) return mention[1];
 
@@ -333,7 +344,7 @@ function getUserIdFromMessage(message, text) {
   const atLine = text.match(/@\S+\s+(\d{17,19})\b/);
   if (atLine) return atLine[1];
 
-  // 5) last-resort any snowflake
+  // 5) Any snowflake
   const any = text.match(/\b(\d{17,19})\b/);
   return any ? any[1] : null;
 }
@@ -349,9 +360,7 @@ function parseRanch(message) {
   let eggs = 0;
   let milk = 0;
   let herd_profit = 0;
-
-  // ✅ total animals SOLD (not herding completions)
-  let cattle_sold = 0;
+  let cattle_sold = 0; // ✅ total number of animals SOLD
 
   const eggsRegex =
     /Added\s+Eggs[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/gi;
@@ -362,8 +371,8 @@ function parseRanch(message) {
   while ((m = eggsRegex.exec(text)) !== null) eggs += Number(m[1] || 0);
   while ((m = milkRegex.exec(text)) !== null) milk += Number(m[1] || 0);
 
-  // ✅ cattle sale example:
-  // Player @Peter ... sold 5 Bison for 1200.0$
+  // ✅ Cattle Sale:
+  // "sold 5 Bison for 1200.0$"
   const sale = text.match(
     /sold\s+(\d+)\s+([A-Za-z]+)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
   );
@@ -378,6 +387,7 @@ function parseRanch(message) {
       ? CATTLE_BISON_DEDUCTION
       : CATTLE_DEFAULT_DEDUCTION;
 
+    // payout includes this, but we do NOT display profit/deductions text
     herd_profit += sell - deduction;
   }
 
@@ -408,7 +418,7 @@ function parseCamp(message) {
   const mats = text.match(/Materials\s+added:\s*([0-9]+(?:\.[0-9]+)?)/i);
   if (mats) materials += Math.floor(Number(mats[1] || 0));
 
-  // ✅ Delivery sale -> tier by ranges (fixes $1600, $1550, etc)
+  // ✅ Delivery sale -> tier by RANGE (fixes $1600, $1550, etc)
   const sale = text.match(
     /Made\s+a\s+Sale\s+Of\s+\d+\s+Of\s+Stock\s+For\s+\$?([0-9]+(?:\.[0-9]+)?)/i
   );
@@ -512,14 +522,6 @@ async function ensureCurrentMessage(key, channelId, defaultText) {
   }
 }
 
-async function getBoardMessageId(key) {
-  const { rows } = await pool.query(
-    `SELECT message_id FROM public.bot_messages WHERE key=$1 LIMIT 1`,
-    [key]
-  );
-  return rows.length ? rows[0].message_id.toString() : null;
-}
-
 /* ================= RANCH RENDER ================= */
 async function renderRanchBoard(isFinal = false) {
   const key = "ranch_current_msg";
@@ -544,6 +546,7 @@ async function renderRanchBoard(isFinal = false) {
       const milk = Number(r.milk);
       const herdProfit = Number(r.herd_profit);
       const cattleSold = Number(r.cattle_sold);
+
       const payout = eggs * EGGS_PRICE + milk * MILK_PRICE + herdProfit;
       return { user_id: r.user_id.toString(), eggs, milk, cattleSold, payout };
     })
@@ -554,9 +557,7 @@ async function renderRanchBoard(isFinal = false) {
   const now = new Date();
   const range = `${fmtDate(weekStart)}–${fmtDate(now)}`;
 
-  let out = `🏆 **Beaver Falls — Weekly Ranch Ledger${
-    isFinal ? " (FINAL)" : ""
-  }**\n`;
+  let out = `🏆 **Beaver Falls — Weekly Ranch Ledger${isFinal ? " (FINAL)" : ""}**\n`;
   out += `📅 ${range}\n`;
   out += `🥚$${EGGS_PRICE} • 🥛$${MILK_PRICE}\n\n`;
 
@@ -571,7 +572,9 @@ async function renderRanchBoard(isFinal = false) {
     const p = players[i];
     const rank = medals[i] || `#${i + 1}`;
     const name = tagName(nameList[i]);
+
     const cattleText = p.cattleSold > 0 ? ` 🐄x${p.cattleSold}` : "";
+
     out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk}${cattleText} | 💰 **${money(
       p.payout
     )}**\n`;
@@ -592,10 +595,12 @@ function campMathRow(r) {
   const dl = Number(r.del_large);
   const deliveries = ds + dm + dl;
 
-  // Delivery value estimate based on tier counts
-  // (your payout is points-based anyway)
+  // This is only used to compute a display "Total Delivery Value".
+  // Payout is still points-based.
   const deliveryValue =
-    ds * 500 + dm * 950 + dl * 1500;
+    ds * CAMP_DELIVERY_SMALL_VALUE +
+    dm * CAMP_DELIVERY_MED_VALUE +
+    dl * CAMP_DELIVERY_LARGE_VALUE;
 
   const points =
     materials * PTS_MATERIAL + supplies * PTS_SUPPLY + deliveries * PTS_DELIVERY;
@@ -689,11 +694,13 @@ async function rolloverIfDue() {
 
   console.log(`🗓️ Weekly rollover triggered (${stamp} ${WEEKLY_TZ})`);
 
+  // finalize current
   await rebuildRanchTotals();
   await rebuildCampTotals();
   await renderRanchBoard(true);
   await renderCampBoard(true);
 
+  // create new current-week messages
   {
     const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
     const m = await ch.send({
@@ -709,6 +716,7 @@ async function rolloverIfDue() {
     await setBoardMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, m.id);
   }
 
+  // reset weekly tables
   await pool.query(`TRUNCATE public.ranch_events`);
   await pool.query(`TRUNCATE public.ranch_totals`);
   await pool.query(`TRUNCATE public.camp_events`);
@@ -743,6 +751,7 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
     const msgs = [...batch.values()].sort(
       (a, b) => a.createdTimestamp - b.createdTimestamp
     );
+
     for (const msg of msgs) {
       scanned++;
       const d = parseFn(msg);
@@ -750,6 +759,7 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
       const ok = await insertFn(msg.id, d);
       if (ok) inserted++;
     }
+
     lastId = msgs[0].id;
   }
 
@@ -775,7 +785,14 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
 }
 
 /* ================= STARTUP ================= */
-client.once("clientReady", async () => {
+// discord.js v15 uses "clientReady"; v14 uses "ready".
+// We attach to both safely (first one that fires will run; we guard to prevent double-run).
+let started = false;
+
+async function start() {
+  if (started) return;
+  started = true;
+
   try {
     console.log(`🤖 Online as ${client.user.tag}`);
 
@@ -811,6 +828,7 @@ client.once("clientReady", async () => {
       }
     }
 
+    // Ranch poll
     setInterval(async () => {
       try {
         const r = await pollOnce(
@@ -828,6 +846,7 @@ client.once("clientReady", async () => {
       }
     }, POLL_EVERY_MS);
 
+    // Camp poll
     setInterval(async () => {
       try {
         const c = await pollOnce(
@@ -845,6 +864,7 @@ client.once("clientReady", async () => {
       }
     }, POLL_EVERY_MS);
 
+    // Weekly rollover check
     setInterval(() => {
       rolloverIfDue().catch((e) => console.error("❌ rolloverIfDue:", e));
     }, 30_000);
@@ -854,7 +874,10 @@ client.once("clientReady", async () => {
     console.error("❌ Startup failed:", e);
     process.exit(1);
   }
-});
+}
+
+client.once("ready", start);
+client.once("clientReady", start);
 
 /* ================= SHUTDOWN ================= */
 async function shutdown(signal) {
