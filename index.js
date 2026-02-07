@@ -71,7 +71,7 @@ const pool = new pg.Pool({ connectionString: DATABASE_URL });
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // name resolve
+    GatewayIntentBits.GuildMembers, // resolve names
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
@@ -114,7 +114,7 @@ async function ensureTables() {
     );
   `);
 
-  // unique per message+kind so a single discord message can insert milk+eggs both
+  // unique per message+kind so one discord message can insert multiple kinds safely
   await pool.query(`
     DO $$
     BEGIN
@@ -216,8 +216,7 @@ function parseRanchMessage(content) {
   const eggsMatch = content.match(/Added\s+Eggs\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
   if (eggsMatch) events.push({ user_id: userId, kind: "eggs", qty: Number(eggsMatch[1]), amount: 0 });
 
-  // ✅ Cattle/animals sold (your old working format)
-  // "Player @Peter ... sold 5 Bison for 1200.0$"
+  // cattle sale: "sold 5 Bison for 1200.0$"
   const soldMatch = content.match(/sold\s+(\d+)\s+[A-Za-z ]+\s+for\s+([\d.]+)\$/i);
   if (soldMatch) {
     const qty = Number(soldMatch[1]);
@@ -251,7 +250,8 @@ function parseCampMessage(content) {
 }
 
 async function insertEvent(table, messageId, evt, createdAtIso) {
-  await pool.query(
+  // ON CONFLICT DO NOTHING -> rowCount tells us if it actually inserted
+  const res = await pool.query(
     `
     INSERT INTO ${table}(source_message_id, user_id, kind, qty, amount, created_at)
     VALUES ($1,$2,$3,$4,$5,$6)
@@ -259,6 +259,7 @@ async function insertEvent(table, messageId, evt, createdAtIso) {
     `,
     [String(messageId), String(evt.user_id), evt.kind, evt.qty, evt.amount, createdAtIso || new Date().toISOString()]
   );
+  return res.rowCount; // 1 if inserted, 0 if duplicate
 }
 
 // =====================
@@ -311,9 +312,9 @@ function fmtNextPayoutLabel(prefix) {
 }
 
 // =====================
-// TOTALS
+// TOTALS (ACTIVE ONLY)
 // =====================
-async function ranchTotals() {
+async function ranchTotalsActiveOnly() {
   const { rows } = await pool.query(`
     SELECT
       user_id,
@@ -324,23 +325,26 @@ async function ranchTotals() {
     GROUP BY user_id
   `);
 
-  const users = rows.map((r) => {
-    const milk = Number(r.milk || 0);
-    const eggs = Number(r.eggs || 0);
-    const cattleSold = Number(r.cattle_sold || 0);
+  const users = rows
+    .map((r) => {
+      const milk = Number(r.milk || 0);
+      const eggs = Number(r.eggs || 0);
+      const cattleSold = Number(r.cattle_sold || 0);
 
-    const milkPay = milk * RANCH_MILK_PRICE;
-    const eggsPay = eggs * RANCH_EGG_PRICE;
-    const total = milkPay + eggsPay; // (you only asked to show sold count, no payout add-on)
+      const milkPay = milk * RANCH_MILK_PRICE;
+      const eggsPay = eggs * RANCH_EGG_PRICE;
+      const total = milkPay + eggsPay;
 
-    return { user_id: r.user_id, milk, eggs, cattleSold, milkPay, eggsPay, total };
-  });
+      return { user_id: r.user_id, milk, eggs, cattleSold, milkPay, eggsPay, total };
+    })
+    // ✅ ONLY include users who did something
+    .filter((u) => (u.milk + u.eggs + u.cattleSold) > 0);
 
   users.sort((a, b) => b.total - a.total);
   return users;
 }
 
-async function campTotals() {
+async function campTotalsActiveOnly() {
   const { rows } = await pool.query(`
     SELECT
       user_id,
@@ -355,7 +359,7 @@ async function campTotals() {
   const totalDeliveryValue = rows.reduce((a, r) => a + Number(r.delivery_value || 0), 0);
   const payoutPool = totalDeliveryValue * (1 - CAMP_FEE_RATE);
 
-  const users = rows.map((r) => {
+  const usersRaw = rows.map((r) => {
     const materials = Number(r.materials || 0);
     const supplies = Number(r.supplies || 0);
     const deliveries = Number(r.deliveries || 0);
@@ -367,6 +371,10 @@ async function campTotals() {
 
     return { user_id: r.user_id, materials, supplies, deliveries, points };
   });
+
+  const users = usersRaw
+    // ✅ ONLY include users who did something
+    .filter((u) => (u.materials + u.supplies + u.deliveries) > 0);
 
   const totalPoints = users.reduce((a, u) => a + u.points, 0);
 
@@ -389,6 +397,23 @@ async function campTotals() {
 // EMBEDS
 // =====================
 async function makeRanchEmbed({ users, page, totalPages }) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 ${RANCH_NAME} — Page ${page + 1}/${Math.max(totalPages, 1)}`)
+    .setDescription(`📅 ${fmtNextPayoutLabel("Next Ranch Payout")}`);
+
+  // if no activity, keep it clean and don't list random zero users
+  if (users.length === 0) {
+    embed.addFields(
+      { name: "💰 Ranch Payout", value: `**${money(0)}**`, inline: true },
+      { name: "🥛", value: `**0**`, inline: true },
+      { name: "🥚", value: `**0**`, inline: true }
+    );
+    embed.addFields({ name: "🐄 Total Sold", value: `**0**`, inline: true });
+    embed.addFields({ name: "No activity yet", value: "Waiting for the first log of the week…", inline: false });
+    embed.setFooter({ text: `Total Ranch Profit: ${money(0)} • Today at ${etNow()}` });
+    return embed;
+  }
+
   const start = page * PAGE_SIZE;
   const slice = users.slice(start, start + PAGE_SIZE);
 
@@ -397,23 +422,16 @@ async function makeRanchEmbed({ users, page, totalPages }) {
   const totalPayout = users.reduce((a, u) => a + u.total, 0);
   const totalSold = users.reduce((a, u) => a + u.cattleSold, 0);
 
-  const embed = new EmbedBuilder()
-    .setTitle(`🏆 ${RANCH_NAME} — Page ${page + 1}/${Math.max(totalPages, 1)}`)
-    .setDescription(`📅 ${fmtNextPayoutLabel("Next Ranch Payout")}`);
-
-  // top “columns”
   embed.addFields(
     { name: "💰 Ranch Payout", value: `**${money(totalPayout)}**`, inline: true },
     { name: "🥛", value: `**${totalMilk.toLocaleString()}**`, inline: true },
     { name: "🥚", value: `**${totalEggs.toLocaleString()}**`, inline: true }
   );
 
-  // extra compact cattle total row
   embed.addFields({ name: "🐄 Total Sold", value: `**${totalSold.toLocaleString()}**`, inline: true });
 
   for (const u of slice) {
     const displayName = await resolveDisplayName(u.user_id);
-
     const value = [
       `🥛 Milk: ${u.milk} -> ${money(u.milkPay)}`,
       `🥚 Eggs: ${u.eggs} -> ${money(u.eggsPay)}`,
@@ -421,11 +439,7 @@ async function makeRanchEmbed({ users, page, totalPages }) {
       `💰 **Total: ${money(u.total)}**`,
     ].join("\n");
 
-    embed.addFields({
-      name: displayName,
-      value,
-      inline: true,
-    });
+    embed.addFields({ name: displayName, value, inline: true });
   }
 
   embed.setFooter({ text: `Total Ranch Profit: ${money(0)} • Today at ${etNow()}` });
@@ -433,15 +447,26 @@ async function makeRanchEmbed({ users, page, totalPages }) {
 }
 
 async function makeCampEmbed({ users, page, totalPages, totalDeliveryValue, campRevenue, totalPoints }) {
-  const start = page * PAGE_SIZE;
-  const slice = users.slice(start, start + PAGE_SIZE);
-
   const embed = new EmbedBuilder()
     .setTitle(`🏕️ ${CAMP_NAME} — Page ${page + 1}/${Math.max(totalPages, 1)}`)
     .setDescription(
       `📅 ${fmtNextPayoutLabel("Next Camp Payout")}\n` +
       `Payout Mode: Points (${Math.round(CAMP_FEE_RATE * 100)}% camp fee)`
     );
+
+  if (users.length === 0) {
+    embed.addFields(
+      { name: "🧾 Total Delivery Value", value: `**${money(0)}**`, inline: true },
+      { name: "🪙 Camp Revenue", value: `**${money(0)}**`, inline: true },
+      { name: "⭐ Total Points", value: `**0**`, inline: true }
+    );
+    embed.addFields({ name: "No activity yet", value: "Waiting for the first log of the week…", inline: false });
+    embed.setFooter({ text: `Today at ${etNow()}` });
+    return embed;
+  }
+
+  const start = page * PAGE_SIZE;
+  const slice = users.slice(start, start + PAGE_SIZE);
 
   embed.addFields(
     { name: "🧾 Total Delivery Value", value: `**${money(totalDeliveryValue)}**`, inline: true },
@@ -451,7 +476,6 @@ async function makeCampEmbed({ users, page, totalPages, totalDeliveryValue, camp
 
   for (const u of slice) {
     const displayName = await resolveDisplayName(u.user_id);
-
     const value = [
       `🪨 Materials: ${u.materials.toFixed(2)}`,
       `🚚 Deliveries: ${u.deliveries}`,
@@ -460,11 +484,7 @@ async function makeCampEmbed({ users, page, totalPages, totalDeliveryValue, camp
       `💰 **Payout: ${money(u.payout)}**`,
     ].join("\n");
 
-    embed.addFields({
-      name: displayName,
-      value,
-      inline: true,
-    });
+    embed.addFields({ name: displayName, value, inline: true });
   }
 
   embed.setFooter({ text: `Today at ${etNow()}` });
@@ -480,23 +500,22 @@ function makePagerRow(prefix, page, totalPages) {
       .setCustomId(`${prefix}_prev`)
       .setLabel("◀")
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(prevDisabled),
+      .setDisabled(prevDisabled || totalPages <= 1),
     new ButtonBuilder()
       .setCustomId(`${prefix}_next`)
       .setLabel("▶")
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(nextDisabled)
+      .setDisabled(nextDisabled || totalPages <= 1)
   );
 }
 
 // =====================
-// RENDER / UPDATE
+// RENDER / UPDATE (ONLY WHEN CHANGED)
 // =====================
 let editTimer = null;
 
 async function renderAllBoards() {
-  // ranch
-  const ranchUsers = await ranchTotals();
+  const ranchUsers = await ranchTotalsActiveOnly();
   const ranchTotalPages = Math.max(1, Math.ceil(ranchUsers.length / PAGE_SIZE));
   let ranchPage = Number((await getState("ranch_page")) || 0);
   if (Number.isNaN(ranchPage) || ranchPage < 0) ranchPage = 0;
@@ -511,8 +530,7 @@ async function renderAllBoards() {
   const ranchEmbed = await makeRanchEmbed({ users: ranchUsers, page: ranchPage, totalPages: ranchTotalPages });
   await ranchMsg.edit({ embeds: [ranchEmbed], components: [makePagerRow("ranch", ranchPage, ranchTotalPages)] });
 
-  // camp
-  const camp = await campTotals();
+  const camp = await campTotalsActiveOnly();
   const campUsers = camp.users;
   const campTotalPages = Math.max(1, Math.ceil(campUsers.length / PAGE_SIZE));
   let campPage = Number((await getState("camp_page")) || 0);
@@ -561,7 +579,7 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.deferUpdate();
 
     if (id.startsWith("ranch")) {
-      const ranchUsers = await ranchTotals();
+      const ranchUsers = await ranchTotalsActiveOnly();
       const totalPages = Math.max(1, Math.ceil(ranchUsers.length / PAGE_SIZE));
       let page = Number((await getState("ranch_page")) || 0);
       if (id === "ranch_prev") page = Math.max(0, page - 1);
@@ -578,7 +596,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (id.startsWith("camp")) {
-      const camp = await campTotals();
+      const camp = await campTotalsActiveOnly();
       const users = camp.users;
       const totalPages = Math.max(1, Math.ceil(users.length / PAGE_SIZE));
       let page = Number((await getState("camp_page")) || 0);
@@ -607,7 +625,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // =====================
-// POLL + BACKFILL
+// POLL + BACKFILL (RETURN INSERT COUNT)
 // =====================
 async function pollChannelOnce(channelId, parser, tableName, label) {
   const channel = await fetchChannel(channelId);
@@ -624,13 +642,13 @@ async function pollChannelOnce(channelId, parser, tableName, label) {
 
     for (const evt of events) {
       try {
-        await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
-        inserted++;
+        inserted += await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
       } catch {}
     }
   }
 
-  console.log(`${label} poll fetched=${msgs.size} inserted~=${inserted}`);
+  console.log(`${label} poll fetched=${msgs.size} inserted=${inserted}`);
+  return inserted;
 }
 
 async function backfillChannel(channelId, parser, tableName, maxMessages, label) {
@@ -655,8 +673,7 @@ async function backfillChannel(channelId, parser, tableName, maxMessages, label)
 
       for (const evt of events) {
         try {
-          await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
-          inserted++;
+          inserted += await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
         } catch {}
       }
 
@@ -664,7 +681,8 @@ async function backfillChannel(channelId, parser, tableName, maxMessages, label)
     }
   }
 
-  console.log(`📥 ${label} backfill scanned=${scanned} inserted~=${inserted}`);
+  console.log(`📥 ${label} backfill scanned=${scanned} inserted=${inserted}`);
+  return inserted;
 }
 
 // =====================
@@ -687,19 +705,46 @@ client.once("clientReady", async () => {
       components: [],
     });
 
+    let insertedAny = 0;
+
     if (BACKFILL_ON_START) {
       console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
-      await backfillChannel(RANCH_INPUT_CHANNEL_ID, parseRanchMessage, "ranch_events", BACKFILL_MAX_MESSAGES, "RANCH");
-      await backfillChannel(CAMP_INPUT_CHANNEL_ID, parseCampMessage, "camp_events", BACKFILL_MAX_MESSAGES, "CAMP");
+      insertedAny += await backfillChannel(
+        RANCH_INPUT_CHANNEL_ID,
+        parseRanchMessage,
+        "ranch_events",
+        BACKFILL_MAX_MESSAGES,
+        "RANCH"
+      );
+      insertedAny += await backfillChannel(
+        CAMP_INPUT_CHANNEL_ID,
+        parseCampMessage,
+        "camp_events",
+        BACKFILL_MAX_MESSAGES,
+        "CAMP"
+      );
     }
 
+    // ✅ render once at startup (shows "No activity yet" if empty)
     await renderAllBoards();
 
     setInterval(async () => {
       try {
-        await pollChannelOnce(RANCH_INPUT_CHANNEL_ID, parseRanchMessage, "ranch_events", "RANCH");
-        await pollChannelOnce(CAMP_INPUT_CHANNEL_ID, parseCampMessage, "camp_events", "CAMP");
-        scheduleUpdate();
+        const ranchInserted = await pollChannelOnce(
+          RANCH_INPUT_CHANNEL_ID,
+          parseRanchMessage,
+          "ranch_events",
+          "RANCH"
+        );
+        const campInserted = await pollChannelOnce(
+          CAMP_INPUT_CHANNEL_ID,
+          parseCampMessage,
+          "camp_events",
+          "CAMP"
+        );
+
+        // ✅ ONLY update boards if anything new was inserted
+        if ((ranchInserted + campInserted) > 0) scheduleUpdate();
       } catch (e) {
         console.error("❌ poll loop error:", e?.message || e);
       }
