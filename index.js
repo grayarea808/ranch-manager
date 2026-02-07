@@ -189,15 +189,23 @@ async function resolveDisplayName(userId) {
 // PARSERS
 // =====================
 function parseUserIdFromContent(content) {
+  // <@123>
   const m1 = content.match(/<@(\d{15,20})>/);
   if (m1) return m1[1];
 
+  // "Discord: @Name 123..."
   const m2 = content.match(/Discord:\s*@.*?(\d{15,20})/i);
   if (m2) return m2[1];
 
-  const m3 = content.match(/@\S[\s\S]{0,120}?(\d{15,20})/);
+  // Handles "@First Last 123..." (space after @)
+  const m2b = content.match(/@\s*[^0-9\n\r]{1,64}\s+(\d{15,20})/);
+  if (m2b) return m2b[1];
+
+  // Handles "@something ... 123" (no space after @)
+  const m3 = content.match(/@\S[\s\S]{0,180}?(\d{15,20})/);
   if (m3) return m3[1];
 
+  // fallback: any snowflake-looking number
   const m4 = content.match(/\b(\d{15,20})\b/);
   if (m4) return m4[1];
 
@@ -216,11 +224,12 @@ function parseRanchMessage(content) {
   const eggsMatch = content.match(/Added\s+Eggs\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
   if (eggsMatch) events.push({ user_id: userId, kind: "eggs", qty: Number(eggsMatch[1]), amount: 0 });
 
-  // cattle sale: "sold 5 Bison for 1200.0$"
-  const soldMatch = content.match(/sold\s+(\d+)\s+[A-Za-z ]+\s+for\s+([\d.]+)\$/i);
+  // cattle sale: "sold 2 Pronghorn for 256.0$"
+  // tolerant: commas + any animal text
+  const soldMatch = content.match(/sold\s+(\d+)\s+(.+?)\s+for\s+([\d.,]+)\$/i);
   if (soldMatch) {
     const qty = Number(soldMatch[1]);
-    const value = Number(soldMatch[2]);
+    const value = Number(String(soldMatch[3]).replace(/,/g, ""));
     events.push({ user_id: userId, kind: "cattle_sold", qty, amount: 0 });
     events.push({ user_id: userId, kind: "cattle_value", qty: 0, amount: value });
   }
@@ -250,7 +259,6 @@ function parseCampMessage(content) {
 }
 
 async function insertEvent(table, messageId, evt, createdAtIso) {
-  // ON CONFLICT DO NOTHING -> rowCount tells us if it actually inserted
   const res = await pool.query(
     `
     INSERT INTO ${table}(source_message_id, user_id, kind, qty, amount, created_at)
@@ -337,7 +345,6 @@ async function ranchTotalsActiveOnly() {
 
       return { user_id: r.user_id, milk, eggs, cattleSold, milkPay, eggsPay, total };
     })
-    // ✅ ONLY include users who did something
     .filter((u) => (u.milk + u.eggs + u.cattleSold) > 0);
 
   users.sort((a, b) => b.total - a.total);
@@ -372,9 +379,7 @@ async function campTotalsActiveOnly() {
     return { user_id: r.user_id, materials, supplies, deliveries, points };
   });
 
-  const users = usersRaw
-    // ✅ ONLY include users who did something
-    .filter((u) => (u.materials + u.supplies + u.deliveries) > 0);
+  const users = usersRaw.filter((u) => (u.materials + u.supplies + u.deliveries) > 0);
 
   const totalPoints = users.reduce((a, u) => a + u.points, 0);
 
@@ -401,14 +406,13 @@ async function makeRanchEmbed({ users, page, totalPages }) {
     .setTitle(`🏆 ${RANCH_NAME} — Page ${page + 1}/${Math.max(totalPages, 1)}`)
     .setDescription(`📅 ${fmtNextPayoutLabel("Next Ranch Payout")}`);
 
-  // if no activity, keep it clean and don't list random zero users
   if (users.length === 0) {
     embed.addFields(
       { name: "💰 Ranch Payout", value: `**${money(0)}**`, inline: true },
       { name: "🥛", value: `**0**`, inline: true },
-      { name: "🥚", value: `**0**`, inline: true }
+      { name: "🥚", value: `**0**`, inline: true },
+      { name: "🐄 Total Sold", value: `**0**`, inline: true }
     );
-    embed.addFields({ name: "🐄 Total Sold", value: `**0**`, inline: true });
     embed.addFields({ name: "No activity yet", value: "Waiting for the first log of the week…", inline: false });
     embed.setFooter({ text: `Total Ranch Profit: ${money(0)} • Today at ${etNow()}` });
     return embed;
@@ -425,10 +429,9 @@ async function makeRanchEmbed({ users, page, totalPages }) {
   embed.addFields(
     { name: "💰 Ranch Payout", value: `**${money(totalPayout)}**`, inline: true },
     { name: "🥛", value: `**${totalMilk.toLocaleString()}**`, inline: true },
-    { name: "🥚", value: `**${totalEggs.toLocaleString()}**`, inline: true }
+    { name: "🥚", value: `**${totalEggs.toLocaleString()}**`, inline: true },
+    { name: "🐄 Total Sold", value: `**${totalSold.toLocaleString()}**`, inline: true }
   );
-
-  embed.addFields({ name: "🐄 Total Sold", value: `**${totalSold.toLocaleString()}**`, inline: true });
 
   for (const u of slice) {
     const displayName = await resolveDisplayName(u.user_id);
@@ -451,7 +454,7 @@ async function makeCampEmbed({ users, page, totalPages, totalDeliveryValue, camp
     .setTitle(`🏕️ ${CAMP_NAME} — Page ${page + 1}/${Math.max(totalPages, 1)}`)
     .setDescription(
       `📅 ${fmtNextPayoutLabel("Next Camp Payout")}\n` +
-      `Payout Mode: Points (${Math.round(CAMP_FEE_RATE * 100)}% camp fee)`
+        `Payout Mode: Points (${Math.round(CAMP_FEE_RATE * 100)}% camp fee)`
     );
 
   if (users.length === 0) {
@@ -625,7 +628,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // =====================
-// POLL + BACKFILL (RETURN INSERT COUNT)
+// POLL + BACKFILL
 // =====================
 async function pollChannelOnce(channelId, parser, tableName, label) {
   const channel = await fetchChannel(channelId);
@@ -705,18 +708,16 @@ client.once("clientReady", async () => {
       components: [],
     });
 
-    let insertedAny = 0;
-
     if (BACKFILL_ON_START) {
       console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
-      insertedAny += await backfillChannel(
+      await backfillChannel(
         RANCH_INPUT_CHANNEL_ID,
         parseRanchMessage,
         "ranch_events",
         BACKFILL_MAX_MESSAGES,
         "RANCH"
       );
-      insertedAny += await backfillChannel(
+      await backfillChannel(
         CAMP_INPUT_CHANNEL_ID,
         parseCampMessage,
         "camp_events",
@@ -725,7 +726,6 @@ client.once("clientReady", async () => {
       );
     }
 
-    // ✅ render once at startup (shows "No activity yet" if empty)
     await renderAllBoards();
 
     setInterval(async () => {
@@ -743,7 +743,7 @@ client.once("clientReady", async () => {
           "CAMP"
         );
 
-        // ✅ ONLY update boards if anything new was inserted
+        // only update boards if anything new was inserted
         if ((ranchInserted + campInserted) > 0) scheduleUpdate();
       } catch (e) {
         console.error("❌ poll loop error:", e?.message || e);
