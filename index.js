@@ -39,23 +39,26 @@ const CAMP_NAME = process.env.CAMP_NAME || "Beaver Falls Camp";
 const RANCH_MILK_PRICE = Number(process.env.RANCH_MILK_PRICE || 1.25);
 const RANCH_EGG_PRICE = Number(process.env.RANCH_EGG_PRICE || 1.25);
 
+const PAGE_SIZE = Number(process.env.PAGE_SIZE || 7);
+
 // camp points weights
 const CAMP_MATERIALS_PTS = Number(process.env.CAMP_MATERIALS_PTS || 2);
 const CAMP_DELIVERY_PTS = Number(process.env.CAMP_DELIVERY_PTS || 3);
 const CAMP_SUPPLIES_PTS = Number(process.env.CAMP_SUPPLIES_PTS || 1);
 const CAMP_FEE_RATE = Number(process.env.CAMP_FEE_RATE || 0.30); // 30%
 
-// delivery values (you can tweak)
-const CAMP_DELIVERY_SMALL = Number(process.env.CAMP_DELIVERY_SMALL || 500);
-const CAMP_DELIVERY_MED = Number(process.env.CAMP_DELIVERY_MED || 950);
-const CAMP_DELIVERY_LARGE = Number(process.env.CAMP_DELIVERY_LARGE || 1500);
-
-const PAGE_SIZE = Number(process.env.PAGE_SIZE || 7);
-
 function must(name) {
   if (!process.env[name]) throw new Error(`❌ Missing Railway variable: ${name}`);
 }
-["DISCORD_TOKEN", "DATABASE_URL", "GUILD_ID", "RANCH_INPUT_CHANNEL_ID", "RANCH_OUTPUT_CHANNEL_ID", "CAMP_INPUT_CHANNEL_ID", "CAMP_OUTPUT_CHANNEL_ID"].forEach(must);
+[
+  "DISCORD_TOKEN",
+  "DATABASE_URL",
+  "GUILD_ID",
+  "RANCH_INPUT_CHANNEL_ID",
+  "RANCH_OUTPUT_CHANNEL_ID",
+  "CAMP_INPUT_CHANNEL_ID",
+  "CAMP_OUTPUT_CHANNEL_ID",
+].forEach(must);
 
 // =====================
 // APP + DB + DISCORD
@@ -68,7 +71,7 @@ const pool = new pg.Pool({ connectionString: DATABASE_URL });
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // IMPORTANT for name resolving
+    GatewayIntentBits.GuildMembers, // name resolve
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
@@ -149,7 +152,7 @@ async function setState(key, value) {
 }
 
 // =====================
-// NAME RESOLVING (THIS IS THE FIX)
+// NAME RESOLVING
 // =====================
 const nameCache = new Map(); // userId -> name
 async function resolveDisplayName(userId) {
@@ -158,15 +161,17 @@ async function resolveDisplayName(userId) {
 
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
-    // Try member fetch first (gives nickname / server display)
     const member = await guild.members.fetch(userId).catch(() => null);
     if (member) {
-      const name = member.displayName || member.user?.globalName || member.user?.username || `user-${String(userId).slice(-4)}`;
+      const name =
+        member.displayName ||
+        member.user?.globalName ||
+        member.user?.username ||
+        `user-${String(userId).slice(-4)}`;
       nameCache.set(userId, name);
       return name;
     }
 
-    // fallback: user fetch
     const user = await client.users.fetch(userId).catch(() => null);
     if (user) {
       const name = user.globalName || user.username || `user-${String(userId).slice(-4)}`;
@@ -190,7 +195,7 @@ function parseUserIdFromContent(content) {
   const m2 = content.match(/Discord:\s*@.*?(\d{15,20})/i);
   if (m2) return m2[1];
 
-  const m3 = content.match(/@\S[\s\S]{0,80}?(\d{15,20})/);
+  const m3 = content.match(/@\S[\s\S]{0,120}?(\d{15,20})/);
   if (m3) return m3[1];
 
   const m4 = content.match(/\b(\d{15,20})\b/);
@@ -211,13 +216,19 @@ function parseRanchMessage(content) {
   const eggsMatch = content.match(/Added\s+Eggs\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
   if (eggsMatch) events.push({ user_id: userId, kind: "eggs", qty: Number(eggsMatch[1]), amount: 0 });
 
+  // ✅ Cattle/animals sold (your old working format)
+  // "Player @Peter ... sold 5 Bison for 1200.0$"
+  const soldMatch = content.match(/sold\s+(\d+)\s+[A-Za-z ]+\s+for\s+([\d.]+)\$/i);
+  if (soldMatch) {
+    const qty = Number(soldMatch[1]);
+    const value = Number(soldMatch[2]);
+    events.push({ user_id: userId, kind: "cattle_sold", qty, amount: 0 });
+    events.push({ user_id: userId, kind: "cattle_value", qty: 0, amount: value });
+  }
+
   return events;
 }
 
-// Camp examples you showed:
-// "Delivered Supplies: 42"
-// "Donated ... / Materials added: 1.0"
-// "Made a Sale Of 100 Of Stock For $1600"
 function parseCampMessage(content) {
   const userId = parseUserIdFromContent(content);
   if (!userId) return [];
@@ -307,7 +318,8 @@ async function ranchTotals() {
     SELECT
       user_id,
       SUM(CASE WHEN kind='milk' THEN qty ELSE 0 END) AS milk,
-      SUM(CASE WHEN kind='eggs' THEN qty ELSE 0 END) AS eggs
+      SUM(CASE WHEN kind='eggs' THEN qty ELSE 0 END) AS eggs,
+      SUM(CASE WHEN kind='cattle_sold' THEN qty ELSE 0 END) AS cattle_sold
     FROM ranch_events
     GROUP BY user_id
   `);
@@ -315,10 +327,13 @@ async function ranchTotals() {
   const users = rows.map((r) => {
     const milk = Number(r.milk || 0);
     const eggs = Number(r.eggs || 0);
+    const cattleSold = Number(r.cattle_sold || 0);
+
     const milkPay = milk * RANCH_MILK_PRICE;
     const eggsPay = eggs * RANCH_EGG_PRICE;
-    const total = milkPay + eggsPay;
-    return { user_id: r.user_id, milk, eggs, milkPay, eggsPay, total };
+    const total = milkPay + eggsPay; // (you only asked to show sold count, no payout add-on)
+
+    return { user_id: r.user_id, milk, eggs, cattleSold, milkPay, eggsPay, total };
   });
 
   users.sort((a, b) => b.total - a.total);
@@ -337,7 +352,6 @@ async function campTotals() {
     GROUP BY user_id
   `);
 
-  // Player payout pool is 70% of delivery_value (30% camp fee)
   const totalDeliveryValue = rows.reduce((a, r) => a + Number(r.delivery_value || 0), 0);
   const payoutPool = totalDeliveryValue * (1 - CAMP_FEE_RATE);
 
@@ -372,7 +386,7 @@ async function campTotals() {
 }
 
 // =====================
-// EMBEDS (NAMES NOT IDS)
+// EMBEDS
 // =====================
 async function makeRanchEmbed({ users, page, totalPages }) {
   const start = page * PAGE_SIZE;
@@ -381,16 +395,21 @@ async function makeRanchEmbed({ users, page, totalPages }) {
   const totalMilk = users.reduce((a, u) => a + u.milk, 0);
   const totalEggs = users.reduce((a, u) => a + u.eggs, 0);
   const totalPayout = users.reduce((a, u) => a + u.total, 0);
+  const totalSold = users.reduce((a, u) => a + u.cattleSold, 0);
 
   const embed = new EmbedBuilder()
     .setTitle(`🏆 ${RANCH_NAME} — Page ${page + 1}/${Math.max(totalPages, 1)}`)
     .setDescription(`📅 ${fmtNextPayoutLabel("Next Ranch Payout")}`);
 
+  // top “columns”
   embed.addFields(
     { name: "💰 Ranch Payout", value: `**${money(totalPayout)}**`, inline: true },
     { name: "🥛", value: `**${totalMilk.toLocaleString()}**`, inline: true },
     { name: "🥚", value: `**${totalEggs.toLocaleString()}**`, inline: true }
   );
+
+  // extra compact cattle total row
+  embed.addFields({ name: "🐄 Total Sold", value: `**${totalSold.toLocaleString()}**`, inline: true });
 
   for (const u of slice) {
     const displayName = await resolveDisplayName(u.user_id);
@@ -398,11 +417,12 @@ async function makeRanchEmbed({ users, page, totalPages }) {
     const value = [
       `🥛 Milk: ${u.milk} -> ${money(u.milkPay)}`,
       `🥚 Eggs: ${u.eggs} -> ${money(u.eggsPay)}`,
+      `🐄 Sold: ${u.cattleSold}`,
       `💰 **Total: ${money(u.total)}**`,
     ].join("\n");
 
     embed.addFields({
-      name: displayName, // ✅ NAME not <@id>
+      name: displayName,
       value,
       inline: true,
     });
@@ -423,7 +443,6 @@ async function makeCampEmbed({ users, page, totalPages, totalDeliveryValue, camp
       `Payout Mode: Points (${Math.round(CAMP_FEE_RATE * 100)}% camp fee)`
     );
 
-  // top row similar “columns”
   embed.addFields(
     { name: "🧾 Total Delivery Value", value: `**${money(totalDeliveryValue)}**`, inline: true },
     { name: "🪙 Camp Revenue", value: `**${money(campRevenue)}**`, inline: true },
@@ -442,7 +461,7 @@ async function makeCampEmbed({ users, page, totalPages, totalDeliveryValue, camp
     ].join("\n");
 
     embed.addFields({
-      name: displayName, // ✅ NAME not <@id>
+      name: displayName,
       value,
       inline: true,
     });
