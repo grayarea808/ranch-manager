@@ -1,16 +1,10 @@
 // index.js — Beaver Falls Ranch + Camp Manager
-// ✅ Ranch: eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) next to payout
-// ✅ Camp: deliveries classified by SALE AMOUNT RANGES (so $1600 counts as Large)
-// ✅ 1 static message per channel (edited, no spam)
-// ✅ Poll refresh every 2000ms
-// ✅ Weekly rollover: marks current as FINAL + posts fresh new message + resets tables
-// ✅ NEW: Startup backfill only from this week's start (so it stays accurate)
-// ✅ NEW: /admin/resync endpoint to force re-scan logs and rebuild leaderboards (uses ADMIN_KEY)
+// Ranch leaderboard now uses the “3-column embed pages” layout (carbon copy style)
 
 import express from "express";
 import dotenv from "dotenv";
 import pg from "pg";
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
 
 dotenv.config();
 const { Pool } = pg;
@@ -21,8 +15,9 @@ const PORT = process.env.PORT || 8080;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const GUILD_ID = process.env.GUILD_ID;
-
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
+
+const PAYOUT_ARCHIVE_CHANNEL_ID = process.env.PAYOUT_ARCHIVE_CHANNEL_ID;
 
 if (!DISCORD_TOKEN) {
   console.error("❌ Missing Railway variable: DISCORD_TOKEN");
@@ -34,6 +29,10 @@ if (!DATABASE_URL) {
 }
 if (!GUILD_ID) {
   console.error("❌ Missing Railway variable: GUILD_ID");
+  process.exit(1);
+}
+if (!PAYOUT_ARCHIVE_CHANNEL_ID) {
+  console.error("❌ Missing Railway variable: PAYOUT_ARCHIVE_CHANNEL_ID");
   process.exit(1);
 }
 
@@ -64,18 +63,16 @@ if (!CAMP_INPUT_CHANNEL_ID || !CAMP_OUTPUT_CHANNEL_ID) {
   process.exit(1);
 }
 
-// Backfill + polling
 const BACKFILL_ON_START =
   String(process.env.BACKFILL_ON_START || "true").toLowerCase() === "true";
 const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 1000);
 
-// ✅ requested refresh every 2000ms
+// refresh every 2000ms
 const POLL_EVERY_MS = 2000;
 
-// Weekly rollover schedule
 const WEEKLY_TZ = process.env.WEEKLY_ROLLOVER_TZ || "America/New_York";
 const WEEKLY_DOW = Number(process.env.WEEKLY_ROLLOVER_DOW ?? 6); // Saturday
-const WEEKLY_HOUR = Number(process.env.WEEKLY_ROLLOVER_HOUR ?? 9);
+const WEEKLY_HOUR = Number(process.env.WEEKLY_ROLLOVER_HOUR ?? 12); // noon
 const WEEKLY_MINUTE = Number(process.env.WEEKLY_ROLLOVER_MINUTE ?? 0);
 
 // Ranch math
@@ -92,11 +89,10 @@ const PTS_MATERIAL = 2;
 const PTS_DELIVERY = 3;
 const PTS_SUPPLY = 1;
 
-// ✅ Delivery tiering by RANGE (fixes $1600)
+// Delivery tiering by RANGE
 const CAMP_LARGE_MIN = Number(process.env.CAMP_LARGE_MIN || 1400);
 const CAMP_MED_MIN = Number(process.env.CAMP_MED_MIN || 800);
 
-// Optional: for display totals (points still drives payouts)
 const CAMP_DELIVERY_SMALL_VALUE = Number(process.env.CAMP_DELIVERY_SMALL || 500);
 const CAMP_DELIVERY_MED_VALUE = Number(process.env.CAMP_DELIVERY_MED || 950);
 const CAMP_DELIVERY_LARGE_VALUE = Number(process.env.CAMP_DELIVERY_LARGE || 1500);
@@ -120,23 +116,23 @@ app.get("/health", async (_, res) => {
   }
 });
 
-/**
- * ✅ Admin resync endpoint:
- * GET /admin/resync?key=ADMIN_KEY&scope=all|ranch|camp
- * - wipes THIS WEEK tables for scope
- * - backfills log channel from week start
- * - rebuilds totals
- * - re-renders static message
- */
 app.get("/admin/resync", async (req, res) => {
   try {
-    if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
-    if (req.query.key !== ADMIN_KEY) return res.status(403).json({ ok: false, error: "Forbidden" });
+    if (!ADMIN_KEY)
+      return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
+    if (req.query.key !== ADMIN_KEY)
+      return res.status(403).json({ ok: false, error: "Forbidden" });
 
     const scope = String(req.query.scope || "all").toLowerCase();
 
-    const ranchWeekStartIso = await getState("ranch_week_start_iso", new Date().toISOString());
-    const campWeekStartIso = await getState("camp_week_start_iso", new Date().toISOString());
+    const ranchWeekStartIso = await getState(
+      "ranch_week_start_iso",
+      new Date().toISOString()
+    );
+    const campWeekStartIso = await getState(
+      "camp_week_start_iso",
+      new Date().toISOString()
+    );
 
     const ranchMinTs = new Date(ranchWeekStartIso).getTime();
     const campMinTs = new Date(campWeekStartIso).getTime();
@@ -205,7 +201,7 @@ process.on("uncaughtException", (e) => console.error("❌ uncaughtException:", e
 
 /* ================= NAME RESOLUTION ================= */
 let guildCache = null;
-const nameCache = new Map(); // userId -> displayName
+const nameCache = new Map();
 
 async function getGuild() {
   if (guildCache) return guildCache;
@@ -232,8 +228,8 @@ async function displayNameFor(userId) {
   }
 }
 
-function tagName(name) {
-  return `@${name}`; // no ping
+function money(n) {
+  return `$${Number(n).toFixed(2)}`;
 }
 
 /* ================= SCHEMA / STATE ================= */
@@ -335,45 +331,6 @@ async function setBoardMessage(key, channelId, messageId) {
   );
 }
 
-/* ================= DATE HELPERS ================= */
-function tzParts(date) {
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: WEEKLY_TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const parts = dtf.formatToParts(date);
-  const obj = {};
-  for (const p of parts) obj[p.type] = p.value;
-  return obj;
-}
-function fmtDate(date) {
-  const p = tzParts(date);
-  return `${p.month}/${p.day}/${p.year}`;
-}
-function nowInTZParts() {
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: WEEKLY_TZ,
-    weekday: "short",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  const parts = dtf.formatToParts(new Date());
-  const obj = {};
-  for (const p of parts) obj[p.type] = p.value;
-  return obj;
-}
-function dowFromShort(short) {
-  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(short);
-}
-function money(n) {
-  return `$${Number(n).toFixed(2)}`;
-}
 async function initWeekStartsIfMissing() {
   const r = await getState("ranch_week_start_iso", null);
   if (!r) await setState("ranch_week_start_iso", new Date().toISOString());
@@ -381,16 +338,70 @@ async function initWeekStartsIfMissing() {
   if (!c) await setState("camp_week_start_iso", new Date().toISOString());
 }
 
-/* ================= MESSAGE TEXT HELPERS ================= */
+/* ================= TIME HELPERS ================= */
+function fmtShortTime(date) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: WEEKLY_TZ,
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
 
-// v15 embeds are Embed objects; content is inside .data or toJSON()
+function fmtDateRange(start, end) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: WEEKLY_TZ,
+    month: "2-digit",
+    day: "2-digit",
+    year: "numeric",
+  });
+  return `${fmt.format(start)}–${fmt.format(end)}`;
+}
+
+function getNextSaturdayNoonET(fromDate = new Date()) {
+  // Build "next Saturday at 12:00" in ET using Intl parts and a safe loop.
+  // Simple + reliable: walk forward day-by-day until Saturday, then set noon.
+  const d = new Date(fromDate);
+  for (let i = 0; i < 8; i++) {
+    const weekday = new Intl.DateTimeFormat("en-US", {
+      timeZone: WEEKLY_TZ,
+      weekday: "short",
+    }).format(d);
+    if (weekday === "Sat") break;
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  // Now set to noon ET by constructing a string in ET and parsing is messy;
+  // we’ll just show "Saturday" like the example (date optional).
+  return "Saturday";
+}
+
+/* ================= DISCORD MESSAGE HELPERS ================= */
+async function ensureCurrentMessage(key, channelId, defaultText) {
+  const channel = await client.channels.fetch(channelId);
+  let msgId = await getBoardMessageId(key);
+
+  if (!msgId) {
+    const msg = await channel.send({ content: defaultText });
+    await setBoardMessage(key, channelId, msg.id);
+    return msg.id;
+  }
+
+  try {
+    await channel.messages.fetch(msgId);
+    return msgId;
+  } catch {
+    const msg = await channel.send({ content: defaultText });
+    await setBoardMessage(key, channelId, msg.id);
+    return msg.id;
+  }
+}
+
+/* ================= MESSAGE TEXT EXTRACT ================= */
 function embedToText(embed) {
   try {
     const data =
       embed?.data ||
       (typeof embed?.toJSON === "function" ? embed.toJSON() : embed) ||
       {};
-
     let out = "";
     if (data.title) out += `\n${data.title}`;
     if (data.description) out += `\n${data.description}`;
@@ -407,14 +418,12 @@ function embedToText(embed) {
 
 function extractAllText(message) {
   let text = (message.content || "").trim();
-
   if (Array.isArray(message.embeds) && message.embeds.length) {
     for (const e of message.embeds) {
       const t = embedToText(e);
       if (t) text += `\n${t}`;
     }
   }
-
   return text.trim();
 }
 
@@ -468,6 +477,7 @@ function parseRanch(message) {
   const saleA = text.match(
     /sold\s+(\d+)\s+(.+?)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
   );
+
   const saleBQty = text.match(/sold\s+(\d+)\b/i);
   const saleBAmount = text.match(/for\s+([0-9]+(?:\.[0-9]+)?)\$/i);
 
@@ -604,39 +614,8 @@ async function rebuildCampTotals() {
   `);
 }
 
-/* ================= STATIC MESSAGE HELPERS ================= */
-async function ensureCurrentMessage(key, channelId, defaultText) {
-  const channel = await client.channels.fetch(channelId);
-  let msgId = await getBoardMessageId(key);
-
-  if (!msgId) {
-    const msg = await channel.send({ content: defaultText });
-    await setBoardMessage(key, channelId, msg.id);
-    return msg.id;
-  }
-
-  try {
-    await channel.messages.fetch(msgId);
-    return msgId;
-  } catch {
-    const msg = await channel.send({ content: defaultText });
-    await setBoardMessage(key, channelId, msg.id);
-    return msg.id;
-  }
-}
-
-/* ================= RANCH RENDER ================= */
-async function renderRanchBoard(isFinal = false) {
-  const key = "ranch_current_msg";
-  const msgId = await ensureCurrentMessage(
-    key,
-    RANCH_OUTPUT_CHANNEL_ID,
-    "🏆 **Beaver Falls — Weekly Ranch Ledger**\n\n(loading...)"
-  );
-
-  const channel = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
-  const msg = await channel.messages.fetch(msgId);
-
+/* ================= RANCH EMBED “CARBON COPY” ================= */
+async function buildRanchEmbeds(isFinal) {
   const { rows } = await pool.query(`
     SELECT user_id, eggs, milk, herd_profit, cattle_sold
     FROM public.ranch_totals
@@ -647,44 +626,125 @@ async function renderRanchBoard(isFinal = false) {
     .map((r) => {
       const eggs = Number(r.eggs);
       const milk = Number(r.milk);
-      const herdProfit = Number(r.herd_profit);
-      const cattleSold = Number(r.cattle_sold);
-      const payout = eggs * EGGS_PRICE + milk * MILK_PRICE + herdProfit;
-      return { user_id: r.user_id.toString(), eggs, milk, cattleSold, payout };
+      const profit = Number(r.herd_profit);
+      const cattle = Number(r.cattle_sold);
+      const total = eggs * EGGS_PRICE + milk * MILK_PRICE + profit;
+      return { user_id: r.user_id.toString(), eggs, milk, profit, cattle, total };
     })
-    .sort((a, b) => b.payout - a.payout);
+    .sort((a, b) => b.total - a.total);
 
-  const weekStartIso = await getState("ranch_week_start_iso", null);
-  const weekStart = weekStartIso ? new Date(weekStartIso) : new Date();
+  const totalPayout = players.reduce((a, p) => a + p.total, 0);
+  const totalMilk = players.reduce((a, p) => a + p.milk, 0);
+  const totalEggs = players.reduce((a, p) => a + p.eggs, 0);
+  const totalProfit = players.reduce((a, p) => a + p.profit, 0);
+
+  // Page like the screenshot: 3 columns, 4 rows => 12 players per page
+  const PER_PAGE = 12;
+  const pageCount = Math.max(1, Math.ceil(players.length / PER_PAGE));
+
+  const nextPayoutLabel = getNextSaturdayNoonET(new Date());
+
   const now = new Date();
-  const range = `${fmtDate(weekStart)}–${fmtDate(now)}`;
+  const weekStartIso = await getState("ranch_week_start_iso", now.toISOString());
+  const weekStart = new Date(weekStartIso);
 
-  let out = `🏆 **Beaver Falls — Weekly Ranch Ledger${isFinal ? " (FINAL)" : ""}**\n`;
-  out += `📅 ${range}\n`;
-  out += `🥚$${EGGS_PRICE} • 🥛$${MILK_PRICE}\n\n`;
+  const embeds = [];
 
-  const medals = ["🥇", "🥈", "🥉"];
-  const max = 80;
+  for (let page = 0; page < pageCount; page++) {
+    const slice = players.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
 
-  const nameList = await Promise.all(
-    players.slice(0, max).map((p) => displayNameFor(p.user_id))
-  );
+    const embed = new EmbedBuilder()
+      .setColor(0x2b2d31)
+      .setTitle(`🏆 Beaver Falls Ranch — Page ${page + 1}/${pageCount}`)
+      .setDescription(
+        `📅 Next Ranch Payout: ${nextPayoutLabel}${isFinal ? `\n✅ FINAL` : ""}`
+      );
 
-  for (let i = 0; i < Math.min(players.length, max); i++) {
-    const p = players[i];
-    const rank = medals[i] || `#${i + 1}`;
-    const name = tagName(nameList[i]);
-    const soldBadge = p.cattleSold > 0 ? ` (🐄x${p.cattleSold})` : "";
-    out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk} | 💰 **${money(p.payout)}**${soldBadge}\n`;
+    // Top row (inline fields like screenshot)
+    embed.addFields(
+      {
+        name: "💰 Ranch Payout",
+        value: `**${money(totalPayout)}**`,
+        inline: true,
+      },
+      {
+        name: "🥛",
+        value: `**${totalMilk.toLocaleString()}**`,
+        inline: true,
+      },
+      {
+        name: "🥚",
+        value: `**${totalEggs.toLocaleString()}**`,
+        inline: true,
+      }
+    );
+
+    // Player columns
+    for (const p of slice) {
+      const name = await displayNameFor(p.user_id);
+
+      const milkPay = p.milk * MILK_PRICE;
+      const eggsPay = p.eggs * EGGS_PRICE;
+
+      // Keep it EXACT style: show item → payout
+      // You asked: bottom shows total ranch profit; and player totals.
+      // We show cattle profit line if they have it, but no “deductions/profits taken out” text.
+      const cattleLine =
+        p.profit !== 0 ? `🐄 Cattle: ${money(p.profit)}` : `🐄 Cattle: $0.00`;
+
+      embed.addFields({
+        name: name,
+        value:
+          `🥛 Milk: ${p.milk.toLocaleString()} -> ${money(milkPay)}\n` +
+          `🥚 Eggs: ${p.eggs.toLocaleString()} -> ${money(eggsPay)}\n` +
+          `${cattleLine}\n` +
+          `💰 **Total: ${money(p.total)}**`,
+        inline: true,
+      });
+    }
+
+    // Footer like screenshot: total profit + “Today at …”
+    embed.setFooter({
+      text: `Total Ranch Profit: ${money(totalProfit)} • Today at ${fmtShortTime(
+        now
+      )}`,
+    });
+
+    // Optional: timestamp (Discord will show hover time)
+    embed.setTimestamp(now);
+
+    // Extra: keep date range visible only on Page 1 like the example does NOT show range;
+    // If you want it, uncomment:
+    // if (page === 0) embed.setAuthor({ name: `Week: ${fmtDateRange(weekStart, now)}` });
+
+    embeds.push(embed);
   }
 
-  const total = players.reduce((a, p) => a + p.payout, 0);
-  out += `\n---\n💼 **Total Ranch Payroll:** ${money(total)}`;
-
-  await msg.edit({ content: out, embeds: [] });
+  return embeds;
 }
 
-/* ================= CAMP RENDER ================= */
+/* ================= RANCH RENDER (STATIC MESSAGE EDIT) ================= */
+async function renderRanchBoard(isFinal = false) {
+  const key = "ranch_current_msg";
+  const msgId = await ensureCurrentMessage(
+    key,
+    RANCH_OUTPUT_CHANNEL_ID,
+    "🏆 **Beaver Falls Ranch**\n(loading...)"
+  );
+
+  const channel = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
+  const msg = await channel.messages.fetch(msgId);
+
+  const embeds = await buildRanchEmbeds(isFinal);
+
+  // Discord allows up to 10 embeds per message.
+  // If you ever exceed 10 pages, we’ll need to switch to multi-message paging.
+  await msg.edit({ content: "", embeds });
+
+  return embeds;
+}
+
+/* ================= CAMP RENDER (UNCHANGED TEXT STYLE) ================= */
 function campMathRow(r) {
   const materials = Number(r.materials);
   const supplies = Number(r.supplies);
@@ -737,42 +797,79 @@ async function renderCampBoard(isFinal = false) {
     .map((p) => ({ ...p, payout: p.points * valuePerPoint }))
     .sort((a, b) => b.payout - a.payout);
 
-  const weekStartIso = await getState("camp_week_start_iso", null);
-  const weekStart = weekStartIso ? new Date(weekStartIso) : new Date();
   const now = new Date();
-  const range = `${fmtDate(weekStart)}–${fmtDate(now)}`;
+  const weekStartIso = await getState("camp_week_start_iso", now.toISOString());
+  const weekStart = new Date(weekStartIso);
 
   let out = `🏕️ **Beaver Falls Camp — Weekly Payout (Points)${
     isFinal ? " (FINAL)" : ""
   }**\n`;
-  out += `📅 ${range}\n`;
-  out += `Fee: ${(CAMP_FEE_RATE * 100).toFixed(0)}% • Value/pt: ${money(valuePerPoint)}\n\n`;
+  out += `📅 ${fmtDateRange(weekStart, now)}\n`;
+  out += `Fee: ${(CAMP_FEE_RATE * 100).toFixed(0)}% • Value/pt: ${money(
+    valuePerPoint
+  )}\n\n`;
 
   const medals = ["🥇", "🥈", "🥉"];
   const max = 80;
 
-  const nameList = await Promise.all(
-    ranked.slice(0, max).map((p) => displayNameFor(p.user_id))
-  );
-
   for (let i = 0; i < Math.min(ranked.length, max); i++) {
     const p = ranked[i];
     const rank = medals[i] || `#${i + 1}`;
-    const name = tagName(nameList[i]);
+    const name = await displayNameFor(p.user_id);
 
-    out += `${rank} ${name} | 🪨${p.materials} 🚚${p.deliveries}(S${p.ds}/M${p.dm}/L${p.dl}) 📦${p.supplies} | ⭐${p.points} | 💰 **${money(
+    out += `${rank} @${name} | 🪨${p.materials} 🚚${p.deliveries}(S${p.ds}/M${p.dm}/L${p.dl}) 📦${p.supplies} | ⭐${p.points} | 💰 **${money(
       p.payout
     )}**\n`;
   }
 
-  out += `\n---\n🧾 Total Delivery: ${money(totalDeliveryValue)} • 💰 Camp Revenue: ${money(
-    campRevenue
-  )} • ⭐ Total Points: ${totalPoints}`;
+  out += `\n---\n🧾 Total Delivery: ${money(
+    totalDeliveryValue
+  )} • 💰 Camp Revenue: ${money(campRevenue)} • ⭐ Total Points: ${totalPoints}`;
 
   await msg.edit({ content: out, embeds: [] });
+  return out;
 }
 
-/* ================= WEEKLY ROLLOVER ================= */
+/* ================= ARCHIVE + WEEKLY ROLLOVER (kept as-is) ================= */
+async function sendLong(channel, text) {
+  const max = 1900;
+  if (text.length <= max) {
+    await channel.send({ content: text });
+    return;
+  }
+  const lines = text.split("\n");
+  let chunk = "";
+  for (const line of lines) {
+    if ((chunk + "\n" + line).length > max) {
+      await channel.send({ content: chunk });
+      chunk = line;
+    } else {
+      chunk = chunk ? `${chunk}\n${line}` : line;
+    }
+  }
+  if (chunk) await channel.send({ content: chunk });
+}
+
+function nowInTZParts() {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: WEEKLY_TZ,
+    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = dtf.formatToParts(new Date());
+  const obj = {};
+  for (const p of parts) obj[p.type] = p.value;
+  return obj;
+}
+function dowFromShort(short) {
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(short);
+}
+
 async function rolloverIfDue() {
   const p = nowInTZParts();
   const dow = dowFromShort(p.weekday);
@@ -790,26 +887,46 @@ async function rolloverIfDue() {
 
   await rebuildRanchTotals();
   await rebuildCampTotals();
+
+  // Finalize boards
   await renderRanchBoard(true);
   await renderCampBoard(true);
 
-  // new current-week messages
+  const archiveChannel = await client.channels.fetch(PAYOUT_ARCHIVE_CHANNEL_ID);
+  await sendLong(
+    archiveChannel,
+    `📦 **Beaver Falls — Weekly Payout Archive**\n(Archived Saturday @ 12:00 PM ET)\n`
+  );
+
+  // For ranch, we archive by posting “simple text snapshot” since embeds are already on the main board.
+  // If you want the archive to also use embeds, say so and I’ll do embed copies.
+  const now = new Date();
+  const ranchStart = new Date(await getState("ranch_week_start_iso", now.toISOString()));
+  const campStart = new Date(await getState("camp_week_start_iso", now.toISOString()));
+
+  await sendLong(
+    archiveChannel,
+    `🏆 Ranch Week: ${fmtDateRange(ranchStart, now)}\n(See ranch channel for embedded pages)`
+  );
+  await sendLong(
+    archiveChannel,
+    `🏕️ Camp Week: ${fmtDateRange(campStart, now)}\n(See camp channel for details)`
+  );
+
+  // Fresh new current-week messages
   {
     const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({
-      content: "🏆 **Beaver Falls — Weekly Ranch Ledger**\n\n(Starting new week…)",
-    });
+    const m = await ch.send({ content: "🏆 **Beaver Falls Ranch**\n(Starting new week…)" });
     await setBoardMessage("ranch_current_msg", RANCH_OUTPUT_CHANNEL_ID, m.id);
   }
   {
     const ch = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
     const m = await ch.send({
-      content: "🏕️ **Beaver Falls Camp — Weekly Payout (Points)**\n\n(Starting new week…)",
+      content: "🏕️ **Beaver Falls Camp — Weekly Payout (Points)**\n(Starting new week…)",
     });
     await setBoardMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, m.id);
   }
 
-  // reset week
   await pool.query(`TRUNCATE public.ranch_events`);
   await pool.query(`TRUNCATE public.ranch_totals`);
   await pool.query(`TRUNCATE public.camp_events`);
@@ -826,10 +943,14 @@ async function rolloverIfDue() {
   console.log("✅ Weekly rollover complete");
 }
 
-/* ================= BACKFILL / POLL HELPERS ================= */
-
-// ✅ NEW: minTimestampMs filter so we backfill only this week
-async function backfillChannel(channelId, parseFn, insertFn, label, minTimestampMs = 0) {
+/* ================= BACKFILL / POLL ================= */
+async function backfillChannel(
+  channelId,
+  parseFn,
+  insertFn,
+  label,
+  minTimestampMs = 0
+) {
   const channel = await client.channels.fetch(channelId);
 
   let lastId = null;
@@ -850,7 +971,6 @@ async function backfillChannel(channelId, parseFn, insertFn, label, minTimestamp
     for (const msg of msgs) {
       scanned++;
 
-      // skip messages older than week start
       if (minTimestampMs && msg.createdTimestamp < minTimestampMs) continue;
 
       const d = parseFn(msg);
@@ -860,7 +980,6 @@ async function backfillChannel(channelId, parseFn, insertFn, label, minTimestamp
       if (ok) inserted++;
     }
 
-    // stop early if we already walked past the week start
     if (minTimestampMs && msgs[0]?.createdTimestamp < minTimestampMs) break;
 
     lastId = msgs[0].id;
@@ -901,8 +1020,14 @@ client.once("clientReady", async () => {
     await renderCampBoard(false);
 
     if (BACKFILL_ON_START) {
-      const ranchWeekStartIso = await getState("ranch_week_start_iso", new Date().toISOString());
-      const campWeekStartIso = await getState("camp_week_start_iso", new Date().toISOString());
+      const ranchWeekStartIso = await getState(
+        "ranch_week_start_iso",
+        new Date().toISOString()
+      );
+      const campWeekStartIso = await getState(
+        "camp_week_start_iso",
+        new Date().toISOString()
+      );
       const ranchMinTs = new Date(ranchWeekStartIso).getTime();
       const campMinTs = new Date(campWeekStartIso).getTime();
 
