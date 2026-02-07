@@ -1,14 +1,8 @@
 // index.js — Beaver Falls Ranch + Camp Manager (Railway + Discord + Postgres)
-// ✅ Ranch: carbon-copy 3-column embed pages like the screenshot (Page 1/2)
-// ✅ Camp: compact text leaderboard (no giant “square embed”)
-// ✅ Exact next payout date: Saturday @ 12:00 PM ET (shows “Saturday, Feb 7” style)
-// ✅ Poll every 2000ms (only re-renders when new events inserted)
-// ✅ Weekly rollover: Saturday 12:00 PM ET
-//    - marks current boards FINAL
-//    - posts an archive summary in PAYOUT_ARCHIVE_CHANNEL_ID
-//    - creates new fresh current-week boards (static message per channel)
-//    - resets week tables
-// ✅ /admin/resync supports ?key=...&scope=all|ranch|camp&week_start=YYYY-MM-DD (ET week start)
+// Ranch = embed columns (inline fields, 3 columns per row)
+// Camp  = embed columns matching Ranch (inline fields, 3 columns per row) + top-3 badges
+// Poll  = 2000ms
+// Weekly rollover = Saturday 12:00 PM ET, posts archive + creates new weekly messages
 
 import express from "express";
 import dotenv from "dotenv";
@@ -26,7 +20,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const GUILD_ID = process.env.GUILD_ID;
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
-const PAYOUT_ARCHIVE_CHANNEL_ID = process.env.PAYOUT_ARCHIVE_CHANNEL_ID; // archive channel for weekly finals
+const PAYOUT_ARCHIVE_CHANNEL_ID = process.env.PAYOUT_ARCHIVE_CHANNEL_ID;
 
 // Channels
 const RANCH_INPUT_CHANNEL_ID =
@@ -38,7 +32,7 @@ const CAMP_INPUT_CHANNEL_ID = process.env.CAMP_INPUT_CHANNEL_ID;
 const CAMP_OUTPUT_CHANNEL_ID = process.env.CAMP_OUTPUT_CHANNEL_ID;
 
 // Poll/backfill
-const POLL_EVERY_MS = Number(process.env.POLL_EVERY_MS || 2000); // requested 2000ms
+const POLL_EVERY_MS = Number(process.env.POLL_EVERY_MS || 2000);
 const BACKFILL_ON_START = String(process.env.BACKFILL_ON_START || "true").toLowerCase() === "true";
 const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 1000);
 const DEBUG = String(process.env.debug || "false").toLowerCase() === "true";
@@ -65,7 +59,7 @@ const CAMP_DELIVERY_SMALL_VALUE = Number(process.env.CAMP_DELIVERY_SMALL || 500)
 const CAMP_DELIVERY_MED_VALUE = Number(process.env.CAMP_DELIVERY_MED || 950);
 const CAMP_DELIVERY_LARGE_VALUE = Number(process.env.CAMP_DELIVERY_LARGE || 1500);
 
-// classify “Made a Sale … $X” into S/M/L by amount (tweak if needed)
+// classify “Made a Sale … $X” into S/M/L by amount
 const CAMP_LARGE_MIN = Number(process.env.CAMP_LARGE_MIN || 1400);
 const CAMP_MED_MIN = Number(process.env.CAMP_MED_MIN || 800);
 
@@ -108,7 +102,7 @@ app.get("/health", async (_, res) => {
 // Admin resync:
 // - key required
 // - scope: all|ranch|camp
-// - week_start optional: YYYY-MM-DD (interpreted in ET, midnight ET)
+// - week_start optional: YYYY-MM-DD (ET)
 app.get("/admin/resync", async (req, res) => {
   try {
     if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
@@ -120,7 +114,6 @@ app.get("/admin/resync", async (req, res) => {
     let weekStartIso = null;
     const weekStartParam = String(req.query.week_start || "").trim();
     if (weekStartParam) {
-      // interpret YYYY-MM-DD as midnight ET
       const m = weekStartParam.match(/^(\d{4})-(\d{2})-(\d{2})$/);
       if (!m) return res.status(400).json({ ok: false, error: "week_start must be YYYY-MM-DD" });
 
@@ -242,7 +235,7 @@ function fmtDateRange(start, end) {
   return `${fmt.format(start)}–${fmt.format(end)}`;
 }
 
-/* ================= EXACT “NEXT SAT @ NOON ET” LABEL ================= */
+/* ================= NEXT SAT @ NOON ET LABEL ================= */
 function tzOffsetMinutes(date, timeZone) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -294,7 +287,7 @@ function dowFromShort(short) {
 }
 
 function addDaysYMD(year, month, day, addDays) {
-  const ms = Date.UTC(year, month - 1, day, 12, 0, 0); // noon UTC avoids DST midnight weirdness
+  const ms = Date.UTC(year, month - 1, day, 12, 0, 0);
   const d = new Date(ms + addDays * 24 * 60 * 60 * 1000);
   return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
 }
@@ -309,10 +302,9 @@ function nextSaturdayNoonLabelET(timeZone = "America/New_York") {
   const hour = Number(p.hour);
   const minute = Number(p.minute);
 
-  const dow = dowFromShort(p.weekday); // 0..6
+  const dow = dowFromShort(p.weekday);
   let daysUntilSat = (6 - dow + 7) % 7;
 
-  // If already Sat and at/after noon => next Sat
   const isSat = daysUntilSat === 0;
   const atOrAfterNoon = hour > 12 || (hour === 12 && minute >= 0);
   if (isSat && atOrAfterNoon) daysUntilSat = 7;
@@ -524,8 +516,6 @@ function parseRanch(message) {
   if (/Eggs\s+Added|Added\s+Eggs/i.test(text)) eggs += lastColonNumber(text);
   if (/Milk\s+Added|Added\s+Milk/i.test(text)) milk += lastColonNumber(text);
 
-  // Example:
-  // Player @Peter ... sold 5 Bison for 1200.0$
   const sale = text.match(/sold\s+(\d+)\s+(.+?)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i);
   if (sale) {
     const qty = Number(sale[1] || 0);
@@ -536,14 +526,6 @@ function parseRanch(message) {
 
     const deduction = animal.includes("bison") ? CATTLE_BISON_DEDUCTION : CATTLE_DEFAULT_DEDUCTION;
     herd_profit += sell - deduction;
-  } else {
-    // fallback if format varies
-    const qtyM = text.match(/sold\s+(\d+)\b/i);
-    const amtM = text.match(/for\s+([0-9]+(?:\.[0-9]+)?)\$/i);
-    if (qtyM && amtM) {
-      cattle_sold += Number(qtyM[1] || 0);
-      herd_profit += Number(amtM[1] || 0) - CATTLE_DEFAULT_DEDUCTION;
-    }
   }
 
   if (eggs === 0 && milk === 0 && herd_profit === 0 && cattle_sold === 0) return null;
@@ -555,10 +537,6 @@ function parseCamp(message) {
   const text = extractAllText(message);
   if (!text) return null;
 
-  // We count:
-  // - Delivered Supplies: X
-  // - Donated ... / Materials added: 1.0
-  // - Made a Sale Of ... For $1600
   if (!/Delivered\s+Supplies|Materials\s+added|Made\s+a\s+Sale\s+Of/i.test(text)) {
     return null;
   }
@@ -654,7 +632,7 @@ async function rebuildCampTotals() {
   `);
 }
 
-/* ================= RANCH: CARBON-COPY EMBED PAGES ================= */
+/* ================= RANCH: EMBED COLUMNS ================= */
 async function buildRanchEmbeds(isFinal) {
   const { rows } = await pool.query(`
     SELECT user_id, eggs, milk, herd_profit, cattle_sold
@@ -680,11 +658,11 @@ async function buildRanchEmbeds(isFinal) {
 
   const now = new Date();
   const nextPayoutLabel = nextSaturdayNoonLabelET(WEEKLY_TZ);
+  const weekStartIso = await getState("ranch_week_start_iso", now.toISOString());
+  const weekStart = new Date(weekStartIso);
 
-  // 3 columns x 4 rows = 12 per page (like the screenshot)
-  const PER_PAGE = 12;
+  const PER_PAGE = 12; // 3 columns x 4 rows
   const pageCount = Math.max(1, Math.ceil(players.length / PER_PAGE));
-
   const embeds = [];
 
   for (let page = 0; page < pageCount; page++) {
@@ -693,9 +671,13 @@ async function buildRanchEmbeds(isFinal) {
     const embed = new EmbedBuilder()
       .setColor(0x2b2d31)
       .setTitle(`🏆 Beaver Falls Ranch — Page ${page + 1}/${pageCount}`)
-      .setDescription(`📅 Next Ranch Payout: ${nextPayoutLabel}${isFinal ? `\n✅ FINAL` : ""}`);
+      .setDescription(
+        `📅 Next Ranch Payout: ${nextPayoutLabel}${isFinal ? `\n✅ FINAL` : ""}\n📅 ${fmtDateRange(
+          weekStart,
+          now
+        )}\n🥚 $${EGGS_PRICE.toFixed(2)} • 🥛 $${MILK_PRICE.toFixed(2)}`
+      );
 
-    // Top totals row (inline)
     embed.addFields(
       { name: "💰 Ranch Payout", value: `**${money(totalPayout)}**`, inline: true },
       { name: "🥛", value: `**${totalMilk.toLocaleString()}**`, inline: true },
@@ -707,15 +689,12 @@ async function buildRanchEmbeds(isFinal) {
       const milkPay = p.milk * MILK_PRICE;
       const eggsPay = p.eggs * EGGS_PRICE;
 
-      // ✅ Adds "total animals sold" without showing deductions/profit formula text
-      const cattleLine = `🐄 Sold: ${p.cattleSold.toLocaleString()} • Cattle: ${money(p.profit)}`;
-
       embed.addFields({
         name: name,
         value:
           `🥛 Milk: ${p.milk.toLocaleString()} -> ${money(milkPay)}\n` +
           `🥚 Eggs: ${p.eggs.toLocaleString()} -> ${money(eggsPay)}\n` +
-          `${cattleLine}\n` +
+          `🐄 Sold: ${p.cattleSold.toLocaleString()} • Cattle: ${money(p.profit)}\n` +
           `💰 **Total: ${money(p.total)}**`,
         inline: true,
       });
@@ -725,7 +704,6 @@ async function buildRanchEmbeds(isFinal) {
       text: `Total Ranch Profit: ${money(totalProfit)} • Today at ${fmtShortTime(now)}`,
     });
     embed.setTimestamp(now);
-
     embeds.push(embed);
   }
 
@@ -737,20 +715,17 @@ async function renderRanchBoard(isFinal = false) {
   const msgId = await ensureCurrentMessage(
     key,
     RANCH_OUTPUT_CHANNEL_ID,
-    "🏆 **Beaver Falls Ranch**\n(loading...)"
+    "🏆 Beaver Falls Ranch (loading...)"
   );
 
   const channel = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
   const msg = await channel.messages.fetch(msgId);
 
   const embeds = await buildRanchEmbeds(isFinal);
-
-  // Discord allows up to 10 embeds per message.
-  // If you go beyond 10 pages someday, we’ll split across multiple messages.
   await msg.edit({ content: "", embeds });
 }
 
-/* ================= CAMP: COMPACT TEXT LEADERBOARD ================= */
+/* ================= CAMP: EMBED COLUMNS (MATCH RANCH) ================= */
 function campMathRow(r) {
   const materials = Number(r.materials);
   const supplies = Number(r.supplies);
@@ -767,66 +742,96 @@ function campMathRow(r) {
   return { materials, supplies, ds, dm, dl, deliveries, deliveryValue, points };
 }
 
-async function renderCampBoard(isFinal = false) {
-  const key = "camp_current_msg";
-  const msgId = await ensureCurrentMessage(
-    key,
-    CAMP_OUTPUT_CHANNEL_ID,
-    "🏕️ **Beaver Falls Camp — Weekly Payout (Points)**\n\n(loading...)"
-  );
-
-  const channel = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
-  const msg = await channel.messages.fetch(msgId);
-
+async function buildCampEmbeds(isFinal) {
   const { rows } = await pool.query(`
     SELECT user_id, materials, supplies, del_small, del_med, del_large
     FROM public.camp_totals
     WHERE materials>0 OR supplies>0 OR del_small>0 OR del_med>0 OR del_large>0
   `);
 
-  const players = rows.map((r) => ({ user_id: String(r.user_id), ...campMathRow(r) }));
+  const raw = rows.map((r) => ({ user_id: String(r.user_id), ...campMathRow(r) }));
 
-  const totalDeliveryValue = players.reduce((a, p) => a + p.deliveryValue, 0);
-  const totalPoints = players.reduce((a, p) => a + p.points, 0);
+  const totalDeliveryValue = raw.reduce((a, p) => a + p.deliveryValue, 0);
+  const totalPoints = raw.reduce((a, p) => a + p.points, 0);
 
   const playerPool = totalDeliveryValue * (1 - CAMP_FEE_RATE);
   const campRevenue = totalDeliveryValue * CAMP_FEE_RATE;
   const valuePerPoint = totalPoints > 0 ? playerPool / totalPoints : 0;
 
-  const ranked = players
+  const players = raw
     .map((p) => ({ ...p, payout: p.points * valuePerPoint }))
     .sort((a, b) => b.payout - a.payout);
 
   const now = new Date();
+  const nextPayoutLabel = nextSaturdayNoonLabelET(WEEKLY_TZ);
   const weekStartIso = await getState("camp_week_start_iso", now.toISOString());
   const weekStart = new Date(weekStartIso);
 
-  const nextPayoutLabel = nextSaturdayNoonLabelET(WEEKLY_TZ);
+  const PER_PAGE = 12; // 3 columns x 4 rows
+  const pageCount = Math.max(1, Math.ceil(players.length / PER_PAGE));
+  const embeds = [];
 
-  let out = `🏕️ **Beaver Falls Camp — Weekly Payout (Points)${isFinal ? " (FINAL)" : ""}**\n`;
-  out += `📅 Next Camp Payout: ${nextPayoutLabel}\n`;
-  out += `📅 ${fmtDateRange(weekStart, now)}\n`;
-  out += `Fee: ${(CAMP_FEE_RATE * 100).toFixed(0)}% • Value/pt: ${money(valuePerPoint)}\n\n`;
+  const medals = ["🥇 ", "🥈 ", "🥉 "];
 
-  // Compact lines (minimal scrolling)
-  const medals = ["🥇", "🥈", "🥉"];
-  const maxLines = 60; // keep it readable
+  for (let page = 0; page < pageCount; page++) {
+    const slice = players.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
 
-  for (let i = 0; i < Math.min(ranked.length, maxLines); i++) {
-    const p = ranked[i];
-    const rank = medals[i] || `#${i + 1}`;
-    const name = await displayNameFor(p.user_id);
+    const embed = new EmbedBuilder()
+      .setColor(0x2b2d31)
+      .setTitle(`🏕️ Beaver Falls Camp — Page ${page + 1}/${pageCount}`)
+      .setDescription(
+        `📅 Next Camp Payout: ${nextPayoutLabel}${isFinal ? `\n✅ FINAL` : ""}\nPayout Mode: Points (${(
+          CAMP_FEE_RATE * 100
+        ).toFixed(0)}% camp fee)\n📅 ${fmtDateRange(weekStart, now)}`
+      );
 
-    out += `${rank} @${name} | 🪨${p.materials} 🚚${p.deliveries}(S${p.ds}/M${p.dm}/L${p.dl}) 📦${p.supplies} | ⭐${p.points} | 💰 **${money(
-      p.payout
-    )}**\n`;
+    // top totals row
+    embed.addFields(
+      { name: "💰 Camp Payout", value: `**${money(playerPool)}**`, inline: true },
+      { name: "⭐ Points", value: `**${totalPoints.toLocaleString()}**`, inline: true },
+      { name: "🧾 Delivery Value", value: `**${money(totalDeliveryValue)}**`, inline: true }
+    );
+
+    for (let i = 0; i < slice.length; i++) {
+      const p = slice[i];
+      const globalRank = page * PER_PAGE + i; // 0-based
+      const badge = globalRank < 3 ? medals[globalRank] : "";
+      const name = await displayNameFor(p.user_id);
+
+      embed.addFields({
+        name: `${badge}${name}`,
+        value:
+          `🪨 Materials: ${p.materials}\n` +
+          `🚚 Deliveries: ${p.deliveries} (S:${p.ds} M:${p.dm} L:${p.dl})\n` +
+          `📦 Supplies: ${p.supplies}\n` +
+          `⭐ Points: ${p.points}\n` +
+          `💰 **Payout: ${money(p.payout)}**`,
+        inline: true,
+      });
+    }
+
+    embed.setFooter({
+      text: `🪙 Camp Revenue: ${money(campRevenue)} • Value/pt: ${money(valuePerPoint)} • Today at ${fmtShortTime(
+        now
+      )}`,
+    });
+    embed.setTimestamp(now);
+
+    embeds.push(embed);
   }
 
-  out += `\n---\n🧾 Total Delivery: ${money(totalDeliveryValue)} • 💰 Camp Revenue: ${money(
-    campRevenue
-  )} • ⭐ Total Points: ${totalPoints}`;
+  return embeds;
+}
 
-  await msg.edit({ content: out, embeds: [] });
+async function renderCampBoard(isFinal = false) {
+  const key = "camp_current_msg";
+  const msgId = await ensureCurrentMessage(key, CAMP_OUTPUT_CHANNEL_ID, "🏕️ Beaver Falls Camp (loading...)");
+
+  const channel = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
+  const msg = await channel.messages.fetch(msgId);
+
+  const embeds = await buildCampEmbeds(isFinal);
+  await msg.edit({ content: "", embeds });
 }
 
 /* ================= ARCHIVE HELPERS ================= */
@@ -847,7 +852,7 @@ async function sendLong(channel, text) {
   if (chunk) await channel.send({ content: chunk });
 }
 
-/* ================= WEEKLY ROLLOVER (Sat @ 12:00 ET) ================= */
+/* ================= WEEKLY ROLLOVER ================= */
 function nowInTZParts() {
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone: WEEKLY_TZ,
@@ -880,15 +885,12 @@ async function weeklyRolloverIfDue() {
 
   console.log(`🗓️ Weekly rollover triggered (${stamp} ${WEEKLY_TZ})`);
 
-  // Make sure totals are current
   await rebuildRanchTotals();
   await rebuildCampTotals();
 
-  // Mark boards FINAL (edits only; no spam)
   await renderRanchBoard(true);
   await renderCampBoard(true);
 
-  // Archive post (single channel)
   const archiveChannel = await client.channels.fetch(PAYOUT_ARCHIVE_CHANNEL_ID);
 
   const now = new Date();
@@ -903,19 +905,18 @@ async function weeklyRolloverIfDue() {
     )}**\n🏕️ Camp Week: **${fmtDateRange(campStart, now)}**\n\n(Boards in their channels are marked FINAL.)`
   );
 
-  // Create new current-week messages (so last week can be “archived” by history)
+  // new weekly messages
   {
     const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏆 **Beaver Falls Ranch**\n(Starting new week…)" });
+    const m = await ch.send({ content: "🏆 Beaver Falls Ranch (Starting new week…)" });
     await setBoardMessage("ranch_current_msg", RANCH_OUTPUT_CHANNEL_ID, m.id);
   }
   {
     const ch = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏕️ **Beaver Falls Camp — Weekly Payout (Points)**\n(Starting new week…)" });
+    const m = await ch.send({ content: "🏕️ Beaver Falls Camp (Starting new week…)" });
     await setBoardMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, m.id);
   }
 
-  // Reset week data
   await pool.query(`TRUNCATE public.ranch_events`);
   await pool.query(`TRUNCATE public.ranch_totals`);
   await pool.query(`TRUNCATE public.camp_events`);
@@ -925,7 +926,6 @@ async function weeklyRolloverIfDue() {
   await setState("ranch_week_start_iso", nowIso);
   await setState("camp_week_start_iso", nowIso);
 
-  // Render clean week
   await renderRanchBoard(false);
   await renderCampBoard(false);
 
@@ -994,7 +994,7 @@ client.once("clientReady", async () => {
     await initWeekStartsIfMissing();
     await getGuild();
 
-    // Ensure current messages exist and render once
+    // first render
     await renderRanchBoard(false);
     await renderCampBoard(false);
 
@@ -1030,7 +1030,7 @@ client.once("clientReady", async () => {
       }
     }
 
-    // Poll loops (only re-render when inserted > 0)
+    // poll loops
     setInterval(async () => {
       try {
         const r = await pollOnce(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
@@ -1055,7 +1055,7 @@ client.once("clientReady", async () => {
       }
     }, POLL_EVERY_MS);
 
-    // Weekly rollover checker (every 30s)
+    // rollover checker
     setInterval(() => {
       weeklyRolloverIfDue().catch((e) => console.error("❌ weeklyRolloverIfDue:", e));
     }, 30_000);
