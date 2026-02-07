@@ -1,5 +1,13 @@
 import express from "express";
-import { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} from "discord.js";
 import pg from "pg";
 
 // =====================
@@ -17,7 +25,7 @@ const RANCH_OUTPUT_CHANNEL_ID = process.env.RANCH_OUTPUT_CHANNEL_ID;
 const CAMP_INPUT_CHANNEL_ID = process.env.CAMP_INPUT_CHANNEL_ID;
 const CAMP_OUTPUT_CHANNEL_ID = process.env.CAMP_OUTPUT_CHANNEL_ID;
 
-const CONTROL_CHANNEL_ID = process.env.CONTROL_CHANNEL_ID; // where the reset embed lives
+const CONTROL_CHANNEL_ID = process.env.CONTROL_CHANNEL_ID;
 const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "")
   .split(",")
   .map((s) => s.trim())
@@ -27,7 +35,7 @@ const BACKFILL_ON_START = String(process.env.BACKFILL_ON_START || "true") === "t
 const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 300);
 const POLL_EVERY_MS = Number(process.env.BACKFILL_EVERY_MS || 300000);
 
-const LEADERBOARD_DEBOUNCE_MS = 2000; // requested
+const LEADERBOARD_DEBOUNCE_MS = 2000; // refresh every 2000ms
 
 const RANCH_NAME = process.env.RANCH_NAME || "Beaver Falls";
 const CAMP_NAME = process.env.CAMP_NAME || "Beaver Falls Camp";
@@ -70,7 +78,6 @@ const client = new Client({
 // DB MIGRATION (SAFE)
 // =====================
 async function ensureTablesAndMigrate() {
-  // bot_state always exists
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bot_state (
       key TEXT PRIMARY KEY,
@@ -79,7 +86,6 @@ async function ensureTablesAndMigrate() {
     );
   `);
 
-  // Ensure ranch_events exists (if it doesn't, create fresh)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ranch_events (
       id BIGSERIAL PRIMARY KEY,
@@ -92,7 +98,6 @@ async function ensureTablesAndMigrate() {
     );
   `);
 
-  // Ensure camp_events exists
   await pool.query(`
     CREATE TABLE IF NOT EXISTS camp_events (
       id BIGSERIAL PRIMARY KEY,
@@ -105,28 +110,6 @@ async function ensureTablesAndMigrate() {
     );
   `);
 
-  // If you had older schemas, add missing cols (won’t fail if already there)
-  await pool.query(`
-    ALTER TABLE ranch_events
-      ADD COLUMN IF NOT EXISTS source_message_id BIGINT,
-      ADD COLUMN IF NOT EXISTS user_id BIGINT,
-      ADD COLUMN IF NOT EXISTS kind TEXT,
-      ADD COLUMN IF NOT EXISTS qty NUMERIC NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS amount NUMERIC NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-  `);
-
-  await pool.query(`
-    ALTER TABLE camp_events
-      ADD COLUMN IF NOT EXISTS source_message_id BIGINT,
-      ADD COLUMN IF NOT EXISTS user_id BIGINT,
-      ADD COLUMN IF NOT EXISTS kind TEXT,
-      ADD COLUMN IF NOT EXISTS qty NUMERIC NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS amount NUMERIC NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-  `);
-
-  // Unique indexes for dedupe
   await pool.query(`
     DO $$
     BEGIN
@@ -175,20 +158,19 @@ async function fetchChannel(channelId) {
   return ch;
 }
 
-async function ensureSingleMessage(channelId, stateKey, initialContent, extra = {}) {
+async function ensureSingleMessage(channelId, stateKey, initialPayload) {
   const ch = await fetchChannel(channelId);
   let msgId = await getState(stateKey);
 
   if (msgId) {
     try {
-      const msg = await ch.messages.fetch(msgId);
-      return msg;
+      return await ch.messages.fetch(msgId);
     } catch {
-      // deleted -> recreate
+      // deleted, recreate
     }
   }
 
-  const msg = await ch.send({ content: initialContent, ...extra });
+  const msg = await ch.send(initialPayload);
   await setState(stateKey, msg.id);
   return msg;
 }
@@ -201,7 +183,7 @@ function parseUserId(text) {
   if (m1) return m1[1];
   const m2 = text.match(/Discord:\s*@.*?(\d{15,20})/i);
   if (m2) return m2[1];
-  const m3 = text.match(/@[\w\-\.\s]+\s+(\d{15,20})/); // @name 123...
+  const m3 = text.match(/@[\w\-\.\s]+\s+(\d{15,20})/);
   if (m3) return m3[1];
   return null;
 }
@@ -217,11 +199,7 @@ function parseRanchLog(text) {
   if (milk) return { user_id: userId, kind: "milk", qty: Number(milk[1]), amount: 0 };
 
   const sale = text.match(/sold\s+(\d+)\s+([A-Za-z ]+)\s+for\s+([\d.]+)\$/i);
-  if (sale) {
-    const animals = Number(sale[1]);
-    const value = Number(sale[3]);
-    return { user_id: userId, kind: "cattle_sale", qty: animals, amount: value };
-  }
+  if (sale) return { user_id: userId, kind: "cattle_sale", qty: Number(sale[1]), amount: Number(sale[3]) };
 
   return null;
 }
@@ -236,7 +214,6 @@ function parseCampLog(text) {
   const mats = text.match(/Materials added:\s*([\d.]+)/i);
   if (mats) return { user_id: userId, kind: "materials", qty: Number(mats[1]), amount: 0 };
 
-  // "Made a Sale Of 100 Of Stock For $1900"
   const sale = text.match(/Made a Sale Of\s+\d+\s+Of Stock For\s+\$?([\d.]+)/i);
   if (sale) return { user_id: userId, kind: "delivery", qty: 1, amount: Number(sale[1]) };
 
@@ -269,7 +246,7 @@ async function insertCampEvent(messageId, evt, createdAtIso) {
 }
 
 // =====================
-// RENDER BOARDS
+// RENDER HELPERS
 // =====================
 function money(n) {
   return `$${Number(n).toFixed(2)}`;
@@ -277,7 +254,16 @@ function money(n) {
 function badge(i) {
   return i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
 }
+function etTime(ts = new Date()) {
+  return ts.toLocaleString("en-US", { timeZone: "America/New_York" });
+}
+function etTimeShort(ts = new Date()) {
+  return ts.toLocaleTimeString("en-US", { timeZone: "America/New_York" });
+}
 
+// =====================
+// QUERIES
+// =====================
 async function ranchTotalsSince(weekStartIso) {
   const { rows } = await pool.query(
     `
@@ -306,32 +292,6 @@ async function ranchTotalsSince(weekStartIso) {
 
   users.sort((a, b) => b.payout - a.payout);
   return users;
-}
-
-async function renderRanchBoard() {
-  const weekStartIso = (await getState("ranch_week_start")) || new Date().toISOString();
-  const users = await ranchTotalsSince(weekStartIso);
-
-  const totalMilk = users.reduce((a, u) => a + u.milk, 0);
-  const totalEggs = users.reduce((a, u) => a + u.eggs, 0);
-  const totalAnimals = users.reduce((a, u) => a + u.animals_sold, 0);
-  const totalPayout = users.reduce((a, u) => a + u.payout, 0);
-
-  const lines = [];
-  lines.push(`🏆 **${RANCH_NAME} Ranch — Weekly Ledger**`);
-  lines.push(`🥛 **${totalMilk.toLocaleString()}** • 🥚 **${totalEggs.toLocaleString()}** • 🐄 **Sold: ${totalAnimals.toLocaleString()}**`);
-  lines.push(`💰 **Total Ranch Payout:** ${money(totalPayout)}`);
-  lines.push("");
-
-  const max = Math.min(users.length, 25);
-  for (let i = 0; i < max; i++) {
-    const u = users[i];
-    lines.push(`${badge(i)} <@${u.user_id}> — 🥛${u.milk} 🥚${u.eggs} 🐄${u.animals_sold} — **${money(u.payout)}**`);
-  }
-  if (users.length > max) lines.push(`\n…and **${users.length - max}** more`);
-
-  lines.push(`\n_Last updated: ${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York" })} ET_`);
-  return lines.join("\n");
 }
 
 async function campTotalsSince(weekStartIso) {
@@ -366,7 +326,47 @@ async function campTotalsSince(weekStartIso) {
   return users;
 }
 
-async function renderCampBoard() {
+// =====================
+// EMBED RENDERERS (THIS IS YOUR “COLUMNS”)
+// =====================
+async function buildRanchEmbed() {
+  const weekStartIso = (await getState("ranch_week_start")) || new Date().toISOString();
+  const users = await ranchTotalsSince(weekStartIso);
+
+  const totalMilk = users.reduce((a, u) => a + u.milk, 0);
+  const totalEggs = users.reduce((a, u) => a + u.eggs, 0);
+  const totalAnimals = users.reduce((a, u) => a + u.animals_sold, 0);
+  const totalPayout = users.reduce((a, u) => a + u.payout, 0);
+
+  // Player list in the main embed description
+  const lines = [];
+  const max = Math.min(users.length, 15); // keeps it clean like your screenshot
+  for (let i = 0; i < max; i++) {
+    const u = users[i];
+    lines.push(
+      `${badge(i)} <@${u.user_id}> — **${money(u.payout)}**  _(🥛${u.milk} • 🥚${u.eggs} • 🐄${u.animals_sold})_`
+    );
+  }
+  if (users.length > max) lines.push(`…and **${users.length - max}** more`);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 ${RANCH_NAME} Ranch`)
+    .setDescription(lines.join("\n") || "_No activity yet this week._")
+    // 3-column header like your screenshot
+    .addFields(
+      { name: "💰 Ranch Payout", value: `**${money(totalPayout)}**`, inline: true },
+      { name: "🥛 Total Milk", value: `**${totalMilk.toLocaleString()}**`, inline: true },
+      { name: "🥚 Total Eggs", value: `**${totalEggs.toLocaleString()}**`, inline: true }
+    )
+    // bottom “profit/time” line (you asked for total ranch profit at bottom — you can define profit later)
+    .setFooter({
+      text: `🐄 Sold: ${totalAnimals.toLocaleString()} • Updated ${etTimeShort()} ET`,
+    });
+
+  return { embed };
+}
+
+async function buildCampEmbed() {
   const weekStartIso = (await getState("camp_week_start")) || new Date().toISOString();
   const users = await campTotalsSince(weekStartIso);
 
@@ -376,21 +376,28 @@ async function renderCampBoard() {
   const totalPoints = users.reduce((a, u) => a + u.points, 0);
 
   const lines = [];
-  lines.push(`🏕️ **${CAMP_NAME} — Weekly Ledger**`);
-  lines.push(`Payout Mode: **Points (30% camp fee)**`);
-  lines.push(`🧾 Delivery Value: **${money(totalDelivery)}** • 🪙 Camp Revenue: **${money(campRevenue)}**`);
-  lines.push(`⭐ Total Points: **${totalPoints.toLocaleString()}** • 💰 Player Payouts: **${money(totalPayout)}**`);
-  lines.push("");
-
-  const max = Math.min(users.length, 25);
+  const max = Math.min(users.length, 15);
   for (let i = 0; i < max; i++) {
     const u = users[i];
-    lines.push(`${badge(i)} <@${u.user_id}> — 🪨${u.materials} 📦${u.supplies} 🚚${u.deliveries} ⭐${u.points} — **${money(u.payout)}**`);
+    lines.push(
+      `${badge(i)} <@${u.user_id}> — **${money(u.payout)}**  _(⭐${u.points} • 🪨${u.materials} • 📦${u.supplies} • 🚚${u.deliveries})_`
+    );
   }
-  if (users.length > max) lines.push(`\n…and **${users.length - max}** more`);
+  if (users.length > max) lines.push(`…and **${users.length - max}** more`);
 
-  lines.push(`\n_Last updated: ${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York" })} ET_`);
-  return lines.join("\n");
+  const embed = new EmbedBuilder()
+    .setTitle(`🏕️ ${CAMP_NAME}`)
+    .setDescription(lines.join("\n") || "_No activity yet this week._")
+    .addFields(
+      { name: "💰 Player Payouts", value: `**${money(totalPayout)}**`, inline: true },
+      { name: "🧾 Delivery Value", value: `**${money(totalDelivery)}**`, inline: true },
+      { name: "🪙 Camp Revenue (30%)", value: `**${money(campRevenue)}**`, inline: true }
+    )
+    .setFooter({
+      text: `⭐ Total Points: ${totalPoints.toLocaleString()} • Updated ${etTimeShort()} ET`,
+    });
+
+  return { embed };
 }
 
 // =====================
@@ -402,23 +409,29 @@ let campTimer = null;
 async function scheduleRanchUpdate() {
   clearTimeout(ranchTimer);
   ranchTimer = setTimeout(async () => {
-    const msg = await ensureSingleMessage(RANCH_OUTPUT_CHANNEL_ID, "ranch_board_msg", "🏆 Loading ranch board…");
-    const content = await renderRanchBoard();
-    await msg.edit({ content });
+    const msg = await ensureSingleMessage(RANCH_OUTPUT_CHANNEL_ID, "ranch_board_msg", {
+      content: "",
+      embeds: [new EmbedBuilder().setTitle("Loading…")],
+    });
+    const { embed } = await buildRanchEmbed();
+    await msg.edit({ content: "", embeds: [embed] });
   }, LEADERBOARD_DEBOUNCE_MS);
 }
 
 async function scheduleCampUpdate() {
   clearTimeout(campTimer);
   campTimer = setTimeout(async () => {
-    const msg = await ensureSingleMessage(CAMP_OUTPUT_CHANNEL_ID, "camp_board_msg", "🏕️ Loading camp board…");
-    const content = await renderCampBoard();
-    await msg.edit({ content });
+    const msg = await ensureSingleMessage(CAMP_OUTPUT_CHANNEL_ID, "camp_board_msg", {
+      content: "",
+      embeds: [new EmbedBuilder().setTitle("Loading…")],
+    });
+    const { embed } = await buildCampEmbed();
+    await msg.edit({ content: "", embeds: [embed] });
   }, LEADERBOARD_DEBOUNCE_MS);
 }
 
 // =====================
-// CONTROL PANEL
+// CONTROL PANEL (RESET)
 // =====================
 function isAdmin(userId) {
   return ADMIN_USER_IDS.includes(String(userId));
@@ -426,13 +439,16 @@ function isAdmin(userId) {
 
 function panelEmbed() {
   return new EmbedBuilder()
-    .setTitle("🛠️ Beaver Falls Control Panel")
-    .setDescription("Reset weekly boards to **0** (starts new week from now).")
-    .addFields(
-      { name: "Ranch Board", value: `<#${RANCH_OUTPUT_CHANNEL_ID}>`, inline: true },
-      { name: "Camp Board", value: `<#${CAMP_OUTPUT_CHANNEL_ID}>`, inline: true }
+    .setTitle("🛠️ Reset Panel")
+    .setDescription(
+      [
+        "Reset weekly boards to **0** (starts a new week from *now*).",
+        "",
+        `Ranch board: <#${RANCH_OUTPUT_CHANNEL_ID}>`,
+        `Camp board: <#${CAMP_OUTPUT_CHANNEL_ID}>`,
+      ].join("\n")
     )
-    .setFooter({ text: "Admin-only controls via ADMIN_USER_IDS." });
+    .setFooter({ text: "Admin-only via ADMIN_USER_IDS" });
 }
 
 function panelRows() {
@@ -449,34 +465,32 @@ function panelRows() {
 }
 
 async function ensureControlPanel() {
-  const msg = await ensureSingleMessage(CONTROL_CHANNEL_ID, "control_panel_msg", "Loading control panel…", {
+  const msg = await ensureSingleMessage(CONTROL_CHANNEL_ID, "control_panel_msg", {
+    content: "",
     embeds: [panelEmbed()],
     components: panelRows(),
   });
   await msg.edit({ content: "", embeds: [panelEmbed()], components: panelRows() });
 }
 
-// Buttons
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
 
   try {
     await interaction.deferReply({ ephemeral: true });
 
-    if (!isAdmin(interaction.user.id)) {
-      return interaction.editReply("❌ Not authorized.");
-    }
+    if (!isAdmin(interaction.user.id)) return interaction.editReply("❌ Not authorized.");
+
+    const now = new Date().toISOString();
 
     if (interaction.customId === "reset_ranch" || interaction.customId === "reset_all") {
-      await setState("ranch_week_start", new Date().toISOString());
+      await setState("ranch_week_start", now);
       await scheduleRanchUpdate();
     }
-
     if (interaction.customId === "reset_camp" || interaction.customId === "reset_all") {
-      await setState("camp_week_start", new Date().toISOString());
+      await setState("camp_week_start", now);
       await scheduleCampUpdate();
     }
-
     if (interaction.customId === "refresh_all") {
       await scheduleRanchUpdate();
       await scheduleCampUpdate();
@@ -572,7 +586,7 @@ async function startLoops() {
 }
 
 // =====================
-// ADMIN HTTP (optional)
+// ADMIN HTTP RESET (optional)
 // =====================
 app.get("/admin/reset", async (req, res) => {
   try {
@@ -600,8 +614,14 @@ client.once("clientReady", async () => {
     console.log(`🤖 Online as ${client.user.tag}`);
     await ensureTablesAndMigrate();
 
-    await ensureSingleMessage(RANCH_OUTPUT_CHANNEL_ID, "ranch_board_msg", "🏆 Loading ranch board…");
-    await ensureSingleMessage(CAMP_OUTPUT_CHANNEL_ID, "camp_board_msg", "🏕️ Loading camp board…");
+    await ensureSingleMessage(RANCH_OUTPUT_CHANNEL_ID, "ranch_board_msg", {
+      content: "",
+      embeds: [new EmbedBuilder().setTitle("🏆 Loading…")],
+    });
+    await ensureSingleMessage(CAMP_OUTPUT_CHANNEL_ID, "camp_board_msg", {
+      content: "",
+      embeds: [new EmbedBuilder().setTitle("🏕️ Loading…")],
+    });
 
     await ensureControlPanel();
     await startLoops();
