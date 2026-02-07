@@ -1,5 +1,4 @@
 // index.js — Beaver Falls Ranch + Camp Manager
-// FIX: Ranch inserted=0 was because ranch logs are EMBEDS; extractor now reads embed.data / toJSON.
 // ✅ Ranch: eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) from Cattle Sale logs
 // ✅ Camp: deliveries classified by SALE AMOUNT RANGES (so $1600 counts as Large) + stronger Discord: line user-id parsing
 // ✅ 1 static message per channel (edited, no spam)
@@ -400,7 +399,6 @@ function parseRanch(message) {
   let herd_profit = 0;
   let cattle_sold = 0;
 
-  // Accept BOTH styles: "Eggs Added" title or "Added Eggs ..." line
   if (/Eggs\s+Added|Added\s+Eggs/i.test(text)) {
     eggs += lastColonNumber(text);
   }
@@ -409,14 +407,20 @@ function parseRanch(message) {
     milk += lastColonNumber(text);
   }
 
-  // Cattle Sale
-  const sale = text.match(
-    /sold\s+(\d+)\s+([A-Za-z]+)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
+  // ✅ IMPROVED CATTLE SALE parsing (handles line breaks + multi-word animals)
+  // Pattern A: "sold 5 Bison for 1200.0$"
+  const saleA = text.match(
+    /sold\s+(\d+)\s+(.+?)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
   );
-  if (sale) {
-    const qty = Number(sale[1] || 0);
-    const animal = sale[2].toLowerCase();
-    const sell = Number(sale[3]);
+
+  // Pattern B fallback (rare formatting)
+  const saleBQty = text.match(/sold\s+(\d+)\b/i);
+  const saleBAmount = text.match(/for\s+([0-9]+(?:\.[0-9]+)?)\$/i);
+
+  if (saleA) {
+    const qty = Number(saleA[1] || 0);
+    const animal = String(saleA[2] || "").trim().toLowerCase();
+    const sell = Number(saleA[3] || 0);
 
     cattle_sold += qty;
 
@@ -425,6 +429,12 @@ function parseRanch(message) {
       : CATTLE_DEFAULT_DEDUCTION;
 
     herd_profit += sell - deduction;
+  } else if (saleBQty && saleBAmount) {
+    const qty = Number(saleBQty[1] || 0);
+    const sell = Number(saleBAmount[1] || 0);
+    // if we can't identify animal reliably, default deduction
+    cattle_sold += qty;
+    herd_profit += sell - CATTLE_DEFAULT_DEDUCTION;
   }
 
   if (eggs === 0 && milk === 0 && herd_profit === 0 && cattle_sold === 0)
@@ -611,10 +621,13 @@ async function renderRanchBoard(isFinal = false) {
     const p = players[i];
     const rank = medals[i] || `#${i + 1}`;
     const name = tagName(nameList[i]);
-    const cattleText = p.cattleSold > 0 ? ` 🐄x${p.cattleSold}` : "";
-    out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk}${cattleText} | 💰 **${money(
+
+    // ✅ SHOW animals sold next to payout
+    const soldBadge = p.cattleSold > 0 ? ` (🐄x${p.cattleSold})` : "";
+
+    out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk} | 💰 **${money(
       p.payout
-    )}**\n`;
+    )}**${soldBadge}\n`;
   }
 
   const total = players.reduce((a, p) => a + p.payout, 0);
@@ -775,9 +788,6 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
   let scanned = 0;
   let inserted = 0;
 
-  // debug sampling if ranch stays 0
-  let debugSamples = 0;
-
   while (scanned < BACKFILL_MAX_MESSAGES) {
     const limit = Math.min(100, BACKFILL_MAX_MESSAGES - scanned);
     const batch = await channel.messages.fetch(
@@ -792,17 +802,6 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
     for (const msg of msgs) {
       scanned++;
       const d = parseFn(msg);
-
-      if (!d && DEBUG && label === "RANCH" && debugSamples < 3) {
-        const t = extractAllText(msg);
-        console.log(
-          `🧪 RANCH sample msg=${msg.id} contentLen=${(msg.content || "").length} embedCount=${
-            msg.embeds?.length || 0
-          } text="${t.slice(0, 220).replace(/\n/g, " | ")}"`
-        );
-        debugSamples++;
-      }
-
       if (!d) continue;
 
       const ok = await insertFn(msg.id, d);
@@ -821,23 +820,11 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
   const batch = await channel.messages.fetch({ limit: 100 });
 
   let inserted = 0;
-  let debugSamples = 0;
 
   for (const msg of batch.values()) {
     const d = parseFn(msg);
-
-    if (!d && DEBUG && label === "RANCH" && debugSamples < 1) {
-      const t = extractAllText(msg);
-      // only log 1 per poll tick
-      console.log(
-        `🧪 RANCH poll sample msg=${msg.id} contentLen=${(msg.content || "").length} embedCount=${
-          msg.embeds?.length || 0
-        } text="${t.slice(0, 220).replace(/\n/g, " | ")}"`
-      );
-      debugSamples++;
-    }
-
     if (!d) continue;
+
     const ok = await insertFn(msg.id, d);
     if (ok) inserted++;
   }
