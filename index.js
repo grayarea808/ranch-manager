@@ -23,21 +23,17 @@ const RANCH_OUTPUT_CHANNEL_ID = process.env.RANCH_OUTPUT_CHANNEL_ID;
 
 const LEADERBOARD_DEBOUNCE_MS = Number(process.env.LEADERBOARD_DEBOUNCE_MS || 2000);
 const POLL_EVERY_MS = Number(process.env.BACKFILL_EVERY_MS || 300000);
+
 const BACKFILL_ON_START = String(process.env.BACKFILL_ON_START || "true") === "true";
 const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 300);
 
 const RANCH_NAME = process.env.RANCH_NAME || "Beaver Falls Ranch";
 
-// For exact screenshot math set these to 1.10
+// prices
 const RANCH_MILK_PRICE = Number(process.env.RANCH_MILK_PRICE || 1.25);
 const RANCH_EGG_PRICE = Number(process.env.RANCH_EGG_PRICE || 1.25);
 
 const PAGE_SIZE = Number(process.env.RANCH_PAGE_SIZE || 7);
-
-// “Profit” line at bottom of screenshot.
-// If you already have a profit formula, plug it in here.
-// Default: profit = total cattle sales (common for “ranch profit”)
-const PROFIT_MODE = (process.env.RANCH_PROFIT_MODE || "cattle").toLowerCase(); // cattle | none
 
 function must(name) {
   if (!process.env[name]) throw new Error(`❌ Missing Railway variable: ${name}`);
@@ -73,8 +69,8 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS ranch_events (
       id BIGSERIAL PRIMARY KEY,
       source_message_id BIGINT,
-      user_id BIGINT,
-      kind TEXT,
+      user_id BIGINT NOT NULL,
+      kind TEXT NOT NULL,
       qty NUMERIC NOT NULL DEFAULT 0,
       amount NUMERIC NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -85,10 +81,10 @@ async function ensureTables() {
     DO $$
     BEGIN
       IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes WHERE tablename='ranch_events' AND indexname='ranch_events_source_message_id_uq'
+        SELECT 1 FROM pg_indexes WHERE tablename='ranch_events' AND indexname='ranch_events_source_message_id_kind_uq'
       ) THEN
-        CREATE UNIQUE INDEX ranch_events_source_message_id_uq
-          ON ranch_events(source_message_id)
+        CREATE UNIQUE INDEX ranch_events_source_message_id_kind_uq
+          ON ranch_events(source_message_id, kind)
           WHERE source_message_id IS NOT NULL;
       END IF;
     END $$;
@@ -110,33 +106,48 @@ async function setState(key, value) {
 }
 
 // =====================
-// PARSE LOGS
+// PARSE LOGS (FIXED FOR YOUR FORMAT)
 // =====================
-function parseUserId(text) {
-  const m1 = text.match(/<@(\d{15,20})>/);
+
+function parseUserIdFromContent(content) {
+  // 1) <@123>
+  const m1 = content.match(/<@(\d{15,20})>/);
   if (m1) return m1[1];
-  const m2 = text.match(/Discord:\s*@.*?(\d{15,20})/i);
+
+  // 2) "Discord: @Name 123..."
+  const m2 = content.match(/Discord:\s*@.*?(\d{15,20})/i);
   if (m2) return m2[1];
-  const m3 = text.match(/@[\w\-\.\s]+\s+(\d{15,20})/);
+
+  // 3) "@Name 757902520529059842 something"
+  // grabs the first long snowflake-like number after an @name
+  const m3 = content.match(/@\S[\s\S]{0,80}?(\d{15,20})/);
   if (m3) return m3[1];
+
+  // 4) any standalone snowflake in message
+  const m4 = content.match(/\b(\d{15,20})\b/);
+  if (m4) return m4[1];
+
   return null;
 }
 
-function parseRanchLog(text) {
-  const userId = parseUserId(text);
-  if (!userId) return null;
+function parseRanchMessage(content) {
+  const userId = parseUserIdFromContent(content);
+  if (!userId) return [];
 
-  const eggs = text.match(/Added Eggs.*?:\s*(\d+)/i);
-  if (eggs) return { user_id: userId, kind: "eggs", qty: Number(eggs[1]), amount: 0 };
+  const events = [];
 
-  const milk = text.match(/Added Milk.*?:\s*(\d+)/i);
-  if (milk) return { user_id: userId, kind: "milk", qty: Number(milk[1]), amount: 0 };
+  // IMPORTANT: your message can include BOTH milk and eggs lines in the same message
+  const milkMatch = content.match(/Added\s+Milk\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
+  if (milkMatch) events.push({ user_id: userId, kind: "milk", qty: Number(milkMatch[1]), amount: 0 });
 
-  // Sales: "sold 5 Bison for 1200.0$"
-  const sale = text.match(/sold\s+(\d+)\s+([A-Za-z ]+)\s+for\s+([\d.]+)\$/i);
-  if (sale) return { user_id: userId, kind: "cattle_sale", qty: Number(sale[1]), amount: Number(sale[3]) };
+  const eggsMatch = content.match(/Added\s+Eggs\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
+  if (eggsMatch) events.push({ user_id: userId, kind: "eggs", qty: Number(eggsMatch[1]), amount: 0 });
 
-  return null;
+  // optional cattle sale if you want it later
+  const sale = content.match(/sold\s+(\d+)\s+[A-Za-z ]+\s+for\s+([\d.]+)\$/i);
+  if (sale) events.push({ user_id: userId, kind: "cattle_sale", qty: Number(sale[1]), amount: Number(sale[2]) });
+
+  return events;
 }
 
 async function insertRanchEvent(messageId, evt, createdAtIso) {
@@ -144,7 +155,7 @@ async function insertRanchEvent(messageId, evt, createdAtIso) {
     `
     INSERT INTO ranch_events(source_message_id, user_id, kind, qty, amount, created_at)
     VALUES ($1,$2,$3,$4,$5,$6)
-    ON CONFLICT (source_message_id) DO NOTHING
+    ON CONFLICT (source_message_id, kind) DO NOTHING
     `,
     [
       String(messageId),
@@ -173,9 +184,7 @@ async function ensureSingleMessage(channelId, stateKey, initialPayload) {
   if (msgId) {
     try {
       return await ch.messages.fetch(msgId);
-    } catch {
-      // deleted; recreate
-    }
+    } catch {}
   }
 
   const msg = await ch.send(initialPayload);
@@ -192,58 +201,40 @@ function money(n) {
 function etNow() {
   return new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
 }
-function nextSaturdayNoonET(from = new Date()) {
-  // returns Date object (ET-ish display only; logic is UTC based but fine for “next payout” label)
-  const d = new Date(from);
-  const day = d.getUTCDay(); // 0=Sun
-  // We want next Saturday
-  const daysUntilSat = (6 - day + 7) % 7 || 7;
-  d.setUTCDate(d.getUTCDate() + daysUntilSat);
-  // 12:00 PM ET ≈ 17:00 UTC (winter) / 16:00 UTC (summer). For label only:
-  return d;
-}
 function fmtNextPayoutLabel() {
-  // Just a label like the screenshot; doesn’t need exact time conversion
-  const d = nextSaturdayNoonET(new Date());
-  const label = d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" });
-  return `Saturday, ${label}`;
+  // simple label
+  const now = new Date();
+  // next Saturday
+  const d = new Date(now);
+  const day = d.getDay(); // local; ok for label
+  const diff = (6 - day + 7) % 7 || 7;
+  d.setDate(d.getDate() + diff);
+  return d.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "America/New_York",
+  });
 }
 
-async function ranchTotalsSince(weekStartIso) {
-  const { rows } = await pool.query(
-    `
+async function ranchTotals() {
+  const { rows } = await pool.query(`
     SELECT
       user_id,
       SUM(CASE WHEN kind='milk' THEN qty ELSE 0 END) AS milk,
-      SUM(CASE WHEN kind='eggs' THEN qty ELSE 0 END) AS eggs,
-      SUM(CASE WHEN kind='cattle_sale' THEN amount ELSE 0 END) AS cattle_amount
+      SUM(CASE WHEN kind='eggs' THEN qty ELSE 0 END) AS eggs
     FROM ranch_events
-    WHERE created_at >= $1::timestamptz
-      AND kind IS NOT NULL
     GROUP BY user_id
-    `,
-    [weekStartIso]
-  );
+  `);
 
   const users = rows.map((r) => {
     const milk = Number(r.milk || 0);
     const eggs = Number(r.eggs || 0);
-    const cattle = Number(r.cattle_amount || 0);
-
     const milkPay = milk * RANCH_MILK_PRICE;
     const eggsPay = eggs * RANCH_EGG_PRICE;
-
-    const total = milkPay + eggsPay + cattle;
-
-    return {
-      user_id: r.user_id,
-      milk,
-      eggs,
-      cattle,
-      milkPay,
-      eggsPay,
-      total,
-    };
+    const total = milkPay + eggsPay;
+    return { user_id: r.user_id, milk, eggs, milkPay, eggsPay, total };
   });
 
   users.sort((a, b) => b.total - a.total);
@@ -251,7 +242,7 @@ async function ranchTotalsSince(weekStartIso) {
 }
 
 // =====================
-// 1:1 EMBED LAYOUT (YOUR SCREENSHOT)
+// EMBED LAYOUT
 // =====================
 function makeRanchEmbed({ users, page, totalPages }) {
   const start = page * PAGE_SIZE;
@@ -260,34 +251,24 @@ function makeRanchEmbed({ users, page, totalPages }) {
   const totalMilk = users.reduce((a, u) => a + u.milk, 0);
   const totalEggs = users.reduce((a, u) => a + u.eggs, 0);
   const totalPayout = users.reduce((a, u) => a + u.total, 0);
-  const totalProfit =
-    PROFIT_MODE === "cattle"
-      ? users.reduce((a, u) => a + u.cattle, 0)
-      : 0;
 
-  // Title matches exactly: "🏆 Baba Yaga Ranch — Page 1/1"
   const embed = new EmbedBuilder()
     .setTitle(`🏆 ${RANCH_NAME} — Page ${page + 1}/${Math.max(totalPages, 1)}`)
-    // Next payout line is in the embed description (like screenshot)
     .setDescription(`📅 Next Ranch Payout: ${fmtNextPayoutLabel()}`);
 
-  // Top “columns”: payout + totals
   embed.addFields(
     { name: "💰 Ranch Payout", value: `**${money(totalPayout)}**`, inline: true },
     { name: "🥛", value: `**${totalMilk.toLocaleString()}**`, inline: true },
     { name: "🥚", value: `**${totalEggs.toLocaleString()}**`, inline: true }
   );
 
-  // Player blocks: inline fields -> Discord shows 3 columns
   for (const u of slice) {
     const value = [
       `🥛 Milk: ${u.milk} -> ${money(u.milkPay)}`,
       `🥚 Eggs: ${u.eggs} -> ${money(u.eggsPay)}`,
-      `🐄 Cattle: ${money(u.cattle)}`,
       `💰 **Total: ${money(u.total)}**`,
     ].join("\n");
 
-    // name should show their Discord tag/mention exactly like the screenshot
     embed.addFields({
       name: `<@${u.user_id}>`,
       value,
@@ -295,7 +276,7 @@ function makeRanchEmbed({ users, page, totalPages }) {
     });
   }
 
-  embed.setFooter({ text: `Total Ranch Profit: ${money(totalProfit)} • Today at ${etNow()}` });
+  embed.setFooter({ text: `Total Ranch Profit: ${money(0)} • Today at ${etNow()}` });
   return embed;
 }
 
@@ -323,14 +304,12 @@ function makePagerRow(page, totalPages) {
 let ranchEditTimer = null;
 
 async function renderRanchBoard() {
-  const weekStartIso = (await getState("ranch_week_start")) || new Date().toISOString();
-  const users = await ranchTotalsSince(weekStartIso);
-
+  const users = await ranchTotals();
   const totalPages = Math.max(1, Math.ceil(users.length / PAGE_SIZE));
+
   let page = Number((await getState("ranch_page")) || 0);
   if (Number.isNaN(page) || page < 0) page = 0;
   if (page > totalPages - 1) page = totalPages - 1;
-
   await setState("ranch_page", page);
 
   const msg = await ensureSingleMessage(RANCH_OUTPUT_CHANNEL_ID, "ranch_board_msg", {
@@ -356,18 +335,16 @@ function scheduleRanchUpdate() {
 }
 
 // =====================
-// BUTTON INTERACTIONS
+// BUTTONS
 // =====================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
-
   if (interaction.customId !== "ranch_prev" && interaction.customId !== "ranch_next") return;
 
   try {
     await interaction.deferUpdate();
 
-    const weekStartIso = (await getState("ranch_week_start")) || new Date().toISOString();
-    const users = await ranchTotalsSince(weekStartIso);
+    const users = await ranchTotals();
     const totalPages = Math.max(1, Math.ceil(users.length / PAGE_SIZE));
 
     let page = Number((await getState("ranch_page")) || 0);
@@ -395,20 +372,23 @@ client.on("interactionCreate", async (interaction) => {
 // =====================
 async function pollRanchOnce() {
   const channel = await fetchChannel(RANCH_INPUT_CHANNEL_ID);
-  const msgs = await channel.messages.fetch({ limit: 100 });
+  const msgs = await channel.messages.fetch({ limit: 50 });
 
   let inserted = 0;
+
   for (const [, m] of msgs) {
     const content = (m.content || "").trim();
     if (!content) continue;
 
-    const evt = parseRanchLog(content);
-    if (!evt) continue;
+    const events = parseRanchMessage(content);
+    if (!events.length) continue;
 
-    try {
-      await insertRanchEvent(m.id, evt, m.createdAt?.toISOString());
-      inserted++;
-    } catch {}
+    for (const evt of events) {
+      try {
+        await insertRanchEvent(m.id, evt, m.createdAt?.toISOString());
+        inserted++;
+      } catch {}
+    }
   }
 
   console.log(`RANCH poll fetched=${msgs.size} inserted~=${inserted}`);
@@ -431,13 +411,15 @@ async function backfillRanch(maxMessages) {
       const content = (m.content || "").trim();
       if (!content) continue;
 
-      const evt = parseRanchLog(content);
-      if (!evt) continue;
+      const events = parseRanchMessage(content);
+      if (!events.length) continue;
 
-      try {
-        await insertRanchEvent(m.id, evt, m.createdAt?.toISOString());
-        inserted++;
-      } catch {}
+      for (const evt of events) {
+        try {
+          await insertRanchEvent(m.id, evt, m.createdAt?.toISOString());
+          inserted++;
+        } catch {}
+      }
 
       if (scanned >= maxMessages) break;
     }
@@ -452,15 +434,9 @@ async function backfillRanch(maxMessages) {
 client.once("clientReady", async () => {
   try {
     console.log(`🤖 Online as ${client.user.tag}`);
-
     await ensureTables();
 
-    if (!(await getState("ranch_week_start"))) {
-      await setState("ranch_week_start", new Date().toISOString());
-    }
-    if (!(await getState("ranch_page"))) {
-      await setState("ranch_page", 0);
-    }
+    if (!(await getState("ranch_page"))) await setState("ranch_page", 0);
 
     await ensureSingleMessage(RANCH_OUTPUT_CHANNEL_ID, "ranch_board_msg", {
       embeds: [new EmbedBuilder().setTitle("Loading…")],
@@ -491,5 +467,4 @@ client.once("clientReady", async () => {
 });
 
 client.login(DISCORD_TOKEN);
-
 app.listen(PORT, () => console.log(`🚀 Web listening on ${PORT}`));
