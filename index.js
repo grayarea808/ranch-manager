@@ -1,9 +1,11 @@
 // index.js — Beaver Falls Ranch + Camp Manager
-// ✅ Ranch: eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) from Cattle Sale logs
-// ✅ Camp: deliveries classified by SALE AMOUNT RANGES (so $1600 counts as Large) + stronger Discord: line user-id parsing
+// ✅ Ranch: eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) next to payout
+// ✅ Camp: deliveries classified by SALE AMOUNT RANGES (so $1600 counts as Large)
 // ✅ 1 static message per channel (edited, no spam)
 // ✅ Poll refresh every 2000ms
-// ✅ Weekly rollover: marks current as FINAL + posts a fresh new message + resets tables
+// ✅ Weekly rollover: marks current as FINAL + posts fresh new message + resets tables
+// ✅ NEW: Startup backfill only from this week's start (so it stays accurate)
+// ✅ NEW: /admin/resync endpoint to force re-scan logs and rebuild leaderboards (uses ADMIN_KEY)
 
 import express from "express";
 import dotenv from "dotenv";
@@ -19,6 +21,8 @@ const PORT = process.env.PORT || 8080;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const GUILD_ID = process.env.GUILD_ID;
+
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
 
 if (!DISCORD_TOKEN) {
   console.error("❌ Missing Railway variable: DISCORD_TOKEN");
@@ -104,6 +108,8 @@ const pool = new Pool({
 });
 
 const app = express();
+app.use(express.json());
+
 app.get("/", (_, res) => res.status(200).send("Beaver Falls Manager ✅"));
 app.get("/health", async (_, res) => {
   try {
@@ -113,6 +119,71 @@ app.get("/health", async (_, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+/**
+ * ✅ Admin resync endpoint:
+ * GET /admin/resync?key=ADMIN_KEY&scope=all|ranch|camp
+ * - wipes THIS WEEK tables for scope
+ * - backfills log channel from week start
+ * - rebuilds totals
+ * - re-renders static message
+ */
+app.get("/admin/resync", async (req, res) => {
+  try {
+    if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
+    if (req.query.key !== ADMIN_KEY) return res.status(403).json({ ok: false, error: "Forbidden" });
+
+    const scope = String(req.query.scope || "all").toLowerCase();
+
+    const ranchWeekStartIso = await getState("ranch_week_start_iso", new Date().toISOString());
+    const campWeekStartIso = await getState("camp_week_start_iso", new Date().toISOString());
+
+    const ranchMinTs = new Date(ranchWeekStartIso).getTime();
+    const campMinTs = new Date(campWeekStartIso).getTime();
+
+    const out = { ranch: null, camp: null };
+
+    if (scope === "all" || scope === "ranch") {
+      await pool.query(`TRUNCATE public.ranch_events`);
+      await pool.query(`TRUNCATE public.ranch_totals`);
+
+      const inserted = await backfillChannel(
+        RANCH_INPUT_CHANNEL_ID,
+        parseRanch,
+        insertRanchEvent,
+        "RANCH",
+        ranchMinTs
+      );
+      await rebuildRanchTotals();
+      await renderRanchBoard(false);
+
+      out.ranch = { inserted, week_start: ranchWeekStartIso };
+    }
+
+    if (scope === "all" || scope === "camp") {
+      await pool.query(`TRUNCATE public.camp_events`);
+      await pool.query(`TRUNCATE public.camp_totals`);
+
+      const inserted = await backfillChannel(
+        CAMP_INPUT_CHANNEL_ID,
+        parseCamp,
+        insertCampEvent,
+        "CAMP",
+        campMinTs
+      );
+      await rebuildCampTotals();
+      await renderCampBoard(false);
+
+      out.camp = { inserted, week_start: campWeekStartIso };
+    }
+
+    return res.json({ ok: true, ...out });
+  } catch (e) {
+    console.error("❌ /admin/resync error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 const server = app.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Web listening on ${PORT}`)
 );
@@ -337,7 +408,6 @@ function embedToText(embed) {
 function extractAllText(message) {
   let text = (message.content || "").trim();
 
-  // embeds
   if (Array.isArray(message.embeds) && message.embeds.length) {
     for (const e of message.embeds) {
       const t = embedToText(e);
@@ -349,28 +419,22 @@ function extractAllText(message) {
 }
 
 function getUserIdFromMessage(message, text) {
-  // 1) Mention object
   const first = message.mentions?.users?.first?.();
   if (first?.id) return first.id;
 
-  // 2) Prefer "Discord:" line
   const discordLine = text.match(/Discord:\s*.*?(\d{17,19})\b/i);
   if (discordLine) return discordLine[1];
 
-  // 3) Mention markup
   const mention = text.match(/<@!?(\d{17,19})>/);
   if (mention) return mention[1];
 
-  // 4) "@name 123..."
   const atLine = text.match(/@\S+\s+(\d{17,19})\b/);
   if (atLine) return atLine[1];
 
-  // 5) Any snowflake
   const any = text.match(/\b(\d{17,19})\b/);
   return any ? any[1] : null;
 }
 
-// helper: find the LAST ": number"
 function lastColonNumber(text) {
   const matches = [...text.matchAll(/:\s*(\d+)\b/g)];
   if (!matches.length) return 0;
@@ -382,7 +446,6 @@ function parseRanch(message) {
   const text = extractAllText(message);
   if (!text) return null;
 
-  // quick filter so we don't parse random chat
   if (
     !/Eggs\s+Added|Milk\s+Added|Added\s+Eggs|Added\s+Milk|Cattle\s+Sale|sold\s+\d+/i.test(
       text
@@ -399,21 +462,12 @@ function parseRanch(message) {
   let herd_profit = 0;
   let cattle_sold = 0;
 
-  if (/Eggs\s+Added|Added\s+Eggs/i.test(text)) {
-    eggs += lastColonNumber(text);
-  }
+  if (/Eggs\s+Added|Added\s+Eggs/i.test(text)) eggs += lastColonNumber(text);
+  if (/Milk\s+Added|Added\s+Milk/i.test(text)) milk += lastColonNumber(text);
 
-  if (/Milk\s+Added|Added\s+Milk/i.test(text)) {
-    milk += lastColonNumber(text);
-  }
-
-  // ✅ IMPROVED CATTLE SALE parsing (handles line breaks + multi-word animals)
-  // Pattern A: "sold 5 Bison for 1200.0$"
   const saleA = text.match(
     /sold\s+(\d+)\s+(.+?)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
   );
-
-  // Pattern B fallback (rare formatting)
   const saleBQty = text.match(/sold\s+(\d+)\b/i);
   const saleBAmount = text.match(/for\s+([0-9]+(?:\.[0-9]+)?)\$/i);
 
@@ -432,7 +486,7 @@ function parseRanch(message) {
   } else if (saleBQty && saleBAmount) {
     const qty = Number(saleBQty[1] || 0);
     const sell = Number(saleBAmount[1] || 0);
-    // if we can't identify animal reliably, default deduction
+
     cattle_sold += qty;
     herd_profit += sell - CATTLE_DEFAULT_DEDUCTION;
   }
@@ -595,7 +649,6 @@ async function renderRanchBoard(isFinal = false) {
       const milk = Number(r.milk);
       const herdProfit = Number(r.herd_profit);
       const cattleSold = Number(r.cattle_sold);
-
       const payout = eggs * EGGS_PRICE + milk * MILK_PRICE + herdProfit;
       return { user_id: r.user_id.toString(), eggs, milk, cattleSold, payout };
     })
@@ -621,13 +674,8 @@ async function renderRanchBoard(isFinal = false) {
     const p = players[i];
     const rank = medals[i] || `#${i + 1}`;
     const name = tagName(nameList[i]);
-
-    // ✅ SHOW animals sold next to payout
     const soldBadge = p.cattleSold > 0 ? ` (🐄x${p.cattleSold})` : "";
-
-    out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk} | 💰 **${money(
-      p.payout
-    )}**${soldBadge}\n`;
+    out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk} | 💰 **${money(p.payout)}**${soldBadge}\n`;
   }
 
   const total = players.reduce((a, p) => a + p.payout, 0);
@@ -698,9 +746,7 @@ async function renderCampBoard(isFinal = false) {
     isFinal ? " (FINAL)" : ""
   }**\n`;
   out += `📅 ${range}\n`;
-  out += `Fee: ${(CAMP_FEE_RATE * 100).toFixed(0)}% • Value/pt: ${money(
-    valuePerPoint
-  )}\n\n`;
+  out += `Fee: ${(CAMP_FEE_RATE * 100).toFixed(0)}% • Value/pt: ${money(valuePerPoint)}\n\n`;
 
   const medals = ["🥇", "🥈", "🥉"];
   const max = 80;
@@ -719,9 +765,9 @@ async function renderCampBoard(isFinal = false) {
     )}**\n`;
   }
 
-  out += `\n---\n🧾 Total Delivery: ${money(
-    totalDeliveryValue
-  )} • 💰 Camp Revenue: ${money(campRevenue)} • ⭐ Total Points: ${totalPoints}`;
+  out += `\n---\n🧾 Total Delivery: ${money(totalDeliveryValue)} • 💰 Camp Revenue: ${money(
+    campRevenue
+  )} • ⭐ Total Points: ${totalPoints}`;
 
   await msg.edit({ content: out, embeds: [] });
 }
@@ -781,7 +827,9 @@ async function rolloverIfDue() {
 }
 
 /* ================= BACKFILL / POLL HELPERS ================= */
-async function backfillChannel(channelId, parseFn, insertFn, label) {
+
+// ✅ NEW: minTimestampMs filter so we backfill only this week
+async function backfillChannel(channelId, parseFn, insertFn, label, minTimestampMs = 0) {
   const channel = await client.channels.fetch(channelId);
 
   let lastId = null;
@@ -801,12 +849,19 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
 
     for (const msg of msgs) {
       scanned++;
+
+      // skip messages older than week start
+      if (minTimestampMs && msg.createdTimestamp < minTimestampMs) continue;
+
       const d = parseFn(msg);
       if (!d) continue;
 
       const ok = await insertFn(msg.id, d);
       if (ok) inserted++;
     }
+
+    // stop early if we already walked past the week start
+    if (minTimestampMs && msgs[0]?.createdTimestamp < minTimestampMs) break;
 
     lastId = msgs[0].id;
   }
@@ -846,18 +901,25 @@ client.once("clientReady", async () => {
     await renderCampBoard(false);
 
     if (BACKFILL_ON_START) {
+      const ranchWeekStartIso = await getState("ranch_week_start_iso", new Date().toISOString());
+      const campWeekStartIso = await getState("camp_week_start_iso", new Date().toISOString());
+      const ranchMinTs = new Date(ranchWeekStartIso).getTime();
+      const campMinTs = new Date(campWeekStartIso).getTime();
+
       console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
       const rInserted = await backfillChannel(
         RANCH_INPUT_CHANNEL_ID,
         parseRanch,
         insertRanchEvent,
-        "RANCH"
+        "RANCH",
+        ranchMinTs
       );
       const cInserted = await backfillChannel(
         CAMP_INPUT_CHANNEL_ID,
         parseCamp,
         insertCampEvent,
-        "CAMP"
+        "CAMP",
+        campMinTs
       );
 
       if (rInserted > 0) {
