@@ -1,8 +1,3 @@
-// index.js — Beaver Falls Ranch + Camp Manager
-// Adds: Weekly archive posting of FULL payout embeds to history channel
-// Adds: Paid tracking UI (select + Mark Paid / Unmark Paid) for Ranch + Camp
-// Stores paid status in Postgres (survives restarts)
-
 import express from "express";
 import dotenv from "dotenv";
 import pg from "pg";
@@ -45,10 +40,10 @@ const BACKFILL_ON_START = String(process.env.BACKFILL_ON_START || "true").toLowe
 const BACKFILL_MAX_MESSAGES = Number(process.env.BACKFILL_MAX_MESSAGES || 1000);
 const DEBUG = String(process.env.debug || "false").toLowerCase() === "true";
 
-// Weekly rollover (Saturday noon ET)
+// Weekly rollover: Saturday 12:00 PM ET
 const WEEKLY_TZ = process.env.WEEKLY_ROLLOVER_TZ || "America/New_York";
 const WEEKLY_DOW = Number(process.env.WEEKLY_ROLLOVER_DOW ?? 6); // Sat
-const WEEKLY_HOUR = Number(process.env.WEEKLY_ROLLOVER_HOUR ?? 12); // 12:00
+const WEEKLY_HOUR = Number(process.env.WEEKLY_ROLLOVER_HOUR ?? 12); // 12
 const WEEKLY_MINUTE = Number(process.env.WEEKLY_ROLLOVER_MINUTE ?? 0);
 
 // Ranch pricing
@@ -106,10 +101,97 @@ app.get("/health", async (_, res) => {
   }
 });
 
-// Admin resync:
-// - key required
-// - scope: all|ranch|camp
-// - week_start optional: YYYY-MM-DD (ET)
+/**
+ * Cleanup duplicates safely:
+ * - Does NOT touch DB totals/events.
+ * - Deletes bot-authored messages in output + archive channels
+ *   except the current pinned/recorded message_ids and 1 archive per week stamp.
+ *
+ * /admin/cleanup?key=...&scope=all|ranch|camp|archive&keep_current=1&keep_archives_per_week=1
+ */
+app.get("/admin/cleanup", async (req, res) => {
+  try {
+    if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
+    if (String(req.query.key || "") !== ADMIN_KEY)
+      return res.status(403).json({ ok: false, error: "Forbidden" });
+
+    const scope = String(req.query.scope || "all").toLowerCase();
+    const keepCurrent = String(req.query.keep_current ?? "1") === "1";
+    const keepArchivesPerWeek = String(req.query.keep_archives_per_week ?? "1") === "1";
+
+    const out = { ok: true, deleted: { ranch: 0, camp: 0, archive: 0 } };
+
+    const botUserId = client.user?.id;
+    if (!botUserId) return res.status(400).json({ ok: false, error: "Bot not ready yet" });
+
+    const keepIds = new Set();
+
+    // Keep the known "current board" messages
+    if (keepCurrent) {
+      const rId = await getBoardMessageId("ranch_current_msg");
+      const cId = await getBoardMessageId("camp_current_msg");
+      if (rId) keepIds.add(String(rId));
+      if (cId) keepIds.add(String(cId));
+    }
+
+    // Keep one archive header per week by stamp
+    // We store archive stamps in bot_state like: archive_done:2026-01-31
+    // and also keep the message_id if recorded.
+    const archiveKeep = new Set();
+    if (keepArchivesPerWeek) {
+      const { rows } = await pool.query(
+        `SELECT key, value FROM public.bot_state WHERE key LIKE 'archive_msgid:%'`
+      );
+      for (const r of rows) {
+        if (r.value) archiveKeep.add(String(r.value));
+      }
+    }
+
+    async function cleanupChannel(channelId, which) {
+      const channel = await client.channels.fetch(channelId);
+      let deleted = 0;
+
+      // Scan recent messages; adjust if you need deeper.
+      let lastId = null;
+      for (let page = 0; page < 10; page++) {
+        const batch = await channel.messages.fetch(lastId ? { limit: 100, before: lastId } : { limit: 100 });
+        if (!batch.size) break;
+
+        const msgs = [...batch.values()];
+        lastId = msgs[msgs.length - 1].id;
+
+        for (const m of msgs) {
+          if (m.author?.id !== botUserId) continue;
+
+          if (keepIds.has(m.id)) continue;
+          if (which === "archive" && archiveKeep.has(m.id)) continue;
+
+          // Only delete bot-created posts; safe for numbers because DB is source of truth.
+          await m.delete().catch(() => {});
+          deleted++;
+        }
+      }
+      return deleted;
+    }
+
+    if (scope === "all" || scope === "ranch") {
+      out.deleted.ranch = await cleanupChannel(RANCH_OUTPUT_CHANNEL_ID, "ranch");
+    }
+    if (scope === "all" || scope === "camp") {
+      out.deleted.camp = await cleanupChannel(CAMP_OUTPUT_CHANNEL_ID, "camp");
+    }
+    if (scope === "all" || scope === "archive") {
+      out.deleted.archive = await cleanupChannel(PAYOUT_ARCHIVE_CHANNEL_ID, "archive");
+    }
+
+    res.json(out);
+  } catch (e) {
+    console.error("❌ /admin/cleanup error:", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Admin resync (same as before, kept)
 app.get("/admin/resync", async (req, res) => {
   try {
     if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
@@ -117,8 +199,8 @@ app.get("/admin/resync", async (req, res) => {
       return res.status(403).json({ ok: false, error: "Forbidden" });
 
     const scope = String(req.query.scope || "all").toLowerCase();
-
     let weekStartIso = null;
+
     const weekStartParam = String(req.query.week_start || "").trim();
     if (weekStartParam) {
       const m = weekStartParam.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -137,7 +219,6 @@ app.get("/admin/resync", async (req, res) => {
     }
 
     const minTs = new Date(weekStartIso).getTime();
-
     const out = { ok: true, week_start: weekStartIso, ranch: null, camp: null };
 
     if (scope === "all" || scope === "ranch") {
@@ -170,10 +251,10 @@ app.get("/admin/resync", async (req, res) => {
       out.camp = { inserted };
     }
 
-    return res.json(out);
+    res.json(out);
   } catch (e) {
     console.error("❌ /admin/resync error:", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
@@ -327,6 +408,47 @@ function nextSaturdayNoonLabelET(timeZone = "America/New_York") {
   }).format(targetUtcDate);
 }
 
+/**
+ * Compute the UTC time for the current week's rollover (Saturday 12:00 ET),
+ * and the previous week's start.
+ * This is used to ensure rollover runs ONCE per week even across restarts.
+ */
+function computeRolloverUtcForWeek(now = new Date()) {
+  const p = getTzParts(now, WEEKLY_TZ);
+  const year = Number(p.year);
+  const month = Number(p.month);
+  const day = Number(p.day);
+  const dow = dowFromShort(p.weekday);
+
+  // Find this week's Saturday (target DOW)
+  const daysBackToSat = (dow - WEEKLY_DOW + 7) % 7;
+  const satYMD = addDaysYMD(year, month, day, -daysBackToSat);
+
+  // Rollover moment in UTC
+  const rolloverUtc = zonedTimeToUtcDate(
+    { ...satYMD, hour: WEEKLY_HOUR, minute: WEEKLY_MINUTE },
+    WEEKLY_TZ
+  );
+
+  // If we're before this week's rollover moment, shift back a week
+  if (now.getTime() < rolloverUtc.getTime()) {
+    const prevSatYMD = addDaysYMD(satYMD.year, satYMD.month, satYMD.day, -7);
+    const prevRolloverUtc = zonedTimeToUtcDate(
+      { ...prevSatYMD, hour: WEEKLY_HOUR, minute: WEEKLY_MINUTE },
+      WEEKLY_TZ
+    );
+    return { rolloverUtc: prevRolloverUtc, stampYMD: prevSatYMD };
+  }
+
+  return { rolloverUtc, stampYMD: satYMD };
+}
+
+function ymdStamp(ymd) {
+  const mm = String(ymd.month).padStart(2, "0");
+  const dd = String(ymd.day).padStart(2, "0");
+  return `${ymd.year}-${mm}-${dd}`;
+}
+
 /* ================= SCHEMA / STATE ================= */
 async function ensureSchema() {
   await pool.query(`
@@ -385,10 +507,9 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    -- Paid tracking per scope + week
     CREATE TABLE IF NOT EXISTS public.paid_status (
-      scope TEXT NOT NULL,                -- 'ranch' or 'camp'
-      week_start_iso TEXT NOT NULL,       -- matches ranch_week_start_iso / camp_week_start_iso
+      scope TEXT NOT NULL,
+      week_start_iso TEXT NOT NULL,
       user_id BIGINT NOT NULL,
       is_paid BOOLEAN NOT NULL DEFAULT FALSE,
       paid_at TIMESTAMPTZ NULL,
@@ -434,10 +555,11 @@ async function setBoardMessage(key, channelId, messageId) {
 }
 
 async function initWeekStartsIfMissing() {
+  const nowIso = new Date().toISOString();
   const r = await getState("ranch_week_start_iso", null);
-  if (!r) await setState("ranch_week_start_iso", new Date().toISOString());
+  if (!r) await setState("ranch_week_start_iso", nowIso);
   const c = await getState("camp_week_start_iso", null);
-  if (!c) await setState("camp_week_start_iso", new Date().toISOString());
+  if (!c) await setState("camp_week_start_iso", nowIso);
 }
 
 /* ================= PAID STATUS ================= */
@@ -453,7 +575,6 @@ async function getPaidMap(scope, weekStartIso) {
 
 async function ensurePaidRows(scope, weekStartIso, userIds) {
   if (!userIds.length) return;
-  // Insert missing rows
   const values = userIds.map((id, i) => `($1, $2, $${i + 3}::bigint)`).join(",");
   const params = [scope, weekStartIso, ...userIds.map(String)];
   await pool.query(
@@ -486,20 +607,20 @@ async function ensureCurrentMessage(key, channelId, defaultText) {
   const channel = await client.channels.fetch(channelId);
   let msgId = await getBoardMessageId(key);
 
-  if (!msgId) {
-    const msg = await channel.send({ content: defaultText });
-    await setBoardMessage(key, channelId, msg.id);
-    return msg.id;
+  // If we already recorded a message id, always prefer editing it.
+  if (msgId) {
+    try {
+      const msg = await channel.messages.fetch(msgId);
+      if (msg) return msg.id;
+    } catch {
+      // If it was deleted, we will create a new one and overwrite the stored ID.
+    }
   }
 
-  try {
-    await channel.messages.fetch(msgId);
-    return msgId;
-  } catch {
-    const msg = await channel.send({ content: defaultText });
-    await setBoardMessage(key, channelId, msg.id);
-    return msg.id;
-  }
+  // No stored msg, or fetch failed => create exactly ONE new message and store it.
+  const msg = await channel.send({ content: defaultText });
+  await setBoardMessage(key, channelId, msg.id);
+  return msg.id;
 }
 
 /* ================= MESSAGE TEXT EXTRACT ================= */
@@ -588,7 +709,6 @@ function parseRanch(message) {
   }
 
   if (eggs === 0 && milk === 0 && herd_profit === 0 && cattle_sold === 0) return null;
-
   return { userId: String(userId), eggs, milk, herd_profit, cattle_sold };
 }
 
@@ -691,8 +811,8 @@ async function rebuildCampTotals() {
   `);
 }
 
-/* ================= PAID UI STATE (per-admin selection) ================= */
-const selectedUserByAdmin = new Map(); // key: `${scope}:${adminId}` -> userId
+/* ================= PAID UI ================= */
+const selectedUserByAdmin = new Map();
 function selKey(scope, adminId) {
   return `${scope}:${String(adminId)}`;
 }
@@ -707,16 +827,22 @@ function isAdminInteraction(interaction) {
   );
 }
 
-/* ================= COMPONENT BUILDERS ================= */
+function fmtWeekShort(weekStartIso) {
+  try {
+    const d = new Date(weekStartIso);
+    return new Intl.DateTimeFormat("en-US", { timeZone: WEEKLY_TZ, month: "2-digit", day: "2-digit" }).format(d);
+  } catch {
+    return "wk";
+  }
+}
+
 async function buildPaidComponents(scope, playersUserIds, weekStartIso) {
-  // Paginate select options (25 max)
   const pageKey = `${scope}_paid_page`;
   const page = Number(await getState(pageKey, "0"));
 
   const perPage = 25;
   const maxPage = Math.max(0, Math.ceil(playersUserIds.length / perPage) - 1);
   const clampedPage = Math.max(0, Math.min(page, maxPage));
-
   if (clampedPage !== page) await setState(pageKey, String(clampedPage));
 
   const slice = playersUserIds.slice(clampedPage * perPage, (clampedPage + 1) * perPage);
@@ -737,15 +863,8 @@ async function buildPaidComponents(scope, playersUserIds, weekStartIso) {
 
   const row1 = new ActionRowBuilder().addComponents(select);
 
-  const btnMark = new ButtonBuilder()
-    .setCustomId(`paid_mark:${scope}`)
-    .setLabel("✅ Mark Paid")
-    .setStyle(ButtonStyle.Success);
-
-  const btnUnmark = new ButtonBuilder()
-    .setCustomId(`paid_unmark:${scope}`)
-    .setLabel("↩️ Unmark Paid")
-    .setStyle(ButtonStyle.Secondary);
+  const btnMark = new ButtonBuilder().setCustomId(`paid_mark:${scope}`).setLabel("✅ Mark Paid").setStyle(ButtonStyle.Success);
+  const btnUnmark = new ButtonBuilder().setCustomId(`paid_unmark:${scope}`).setLabel("↩️ Unmark Paid").setStyle(ButtonStyle.Secondary);
 
   const btnPrev = new ButtonBuilder()
     .setCustomId(`paid_prev:${scope}`)
@@ -769,18 +888,7 @@ async function buildPaidComponents(scope, playersUserIds, weekStartIso) {
   return [row1, row2];
 }
 
-function fmtWeekShort(weekStartIso) {
-  try {
-    const d = new Date(weekStartIso);
-    return new Intl.DateTimeFormat("en-US", { timeZone: WEEKLY_TZ, month: "2-digit", day: "2-digit" }).format(
-      d
-    );
-  } catch {
-    return "wk";
-  }
-}
-
-/* ================= RANCH: EMBED COLUMNS ================= */
+/* ================= RANCH EMBEDS ================= */
 async function buildRanchEmbeds(isFinal) {
   const { rows } = await pool.query(`
     SELECT user_id, eggs, milk, herd_profit, cattle_sold
@@ -804,7 +912,6 @@ async function buildRanchEmbeds(isFinal) {
   const weekStartIso = await getState("ranch_week_start_iso", now.toISOString());
   const weekStart = new Date(weekStartIso);
 
-  // ensure paid rows exist for all players
   await ensurePaidRows("ranch", weekStartIso, players.map((p) => p.user_id));
   const paidMap = await getPaidMap("ranch", weekStartIso);
 
@@ -813,7 +920,7 @@ async function buildRanchEmbeds(isFinal) {
   const totalEggs = players.reduce((a, p) => a + p.eggs, 0);
   const totalProfit = players.reduce((a, p) => a + p.profit, 0);
 
-  const PER_PAGE = 12; // 3 cols x 4 rows
+  const PER_PAGE = 12;
   const pageCount = Math.max(1, Math.ceil(players.length / PER_PAGE));
   const embeds = [];
 
@@ -824,10 +931,7 @@ async function buildRanchEmbeds(isFinal) {
       .setColor(0x2b2d31)
       .setTitle(`🏆 Beaver Falls Ranch — Page ${page + 1}/${pageCount}`)
       .setDescription(
-        `📅 Next Ranch Payout: ${nextPayoutLabel}${isFinal ? `\n✅ FINAL` : ""}\n📅 ${fmtDateRange(
-          weekStart,
-          now
-        )}\n🥚 $${EGGS_PRICE.toFixed(2)} • 🥛 $${MILK_PRICE.toFixed(2)}`
+        `📅 Next Ranch Payout: ${nextPayoutLabel}${isFinal ? `\n✅ FINAL` : ""}\n📅 ${fmtDateRange(weekStart, now)}\n🥚 $${EGGS_PRICE.toFixed(2)} • 🥛 $${MILK_PRICE.toFixed(2)}`
       );
 
     embed.addFields(
@@ -855,9 +959,7 @@ async function buildRanchEmbeds(isFinal) {
       });
     }
 
-    embed.setFooter({
-      text: `Total Ranch Profit: ${money(totalProfit)} • Today at ${fmtShortTime(now)}`,
-    });
+    embed.setFooter({ text: `Total Ranch Profit: ${money(totalProfit)} • Today at ${fmtShortTime(now)}` });
     embed.setTimestamp(now);
     embeds.push(embed);
   }
@@ -866,9 +968,7 @@ async function buildRanchEmbeds(isFinal) {
 }
 
 async function renderRanchBoard(isFinal = false) {
-  const key = "ranch_current_msg";
-  const msgId = await ensureCurrentMessage(key, RANCH_OUTPUT_CHANNEL_ID, "🏆 Beaver Falls Ranch (loading...)");
-
+  const msgId = await ensureCurrentMessage("ranch_current_msg", RANCH_OUTPUT_CHANNEL_ID, "🏆 Beaver Falls Ranch (loading...)");
   const channel = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
   const msg = await channel.messages.fetch(msgId);
 
@@ -878,7 +978,7 @@ async function renderRanchBoard(isFinal = false) {
   await msg.edit({ content: "", embeds, components });
 }
 
-/* ================= CAMP: EMBED (matches your screenshot style) ================= */
+/* ================= CAMP EMBEDS ================= */
 function campMathRow(r) {
   const materials = Number(r.materials);
   const supplies = Number(r.supplies);
@@ -887,9 +987,7 @@ function campMathRow(r) {
   const dl = Number(r.del_large);
   const deliveries = ds + dm + dl;
 
-  const deliveryValue =
-    ds * CAMP_DELIVERY_SMALL_VALUE + dm * CAMP_DELIVERY_MED_VALUE + dl * CAMP_DELIVERY_LARGE_VALUE;
-
+  const deliveryValue = ds * CAMP_DELIVERY_SMALL_VALUE + dm * CAMP_DELIVERY_MED_VALUE + dl * CAMP_DELIVERY_LARGE_VALUE;
   const points = materials * PTS_MATERIAL + supplies * PTS_SUPPLY + deliveries * PTS_DELIVERY;
 
   return { materials, supplies, ds, dm, dl, deliveries, deliveryValue, points };
@@ -920,11 +1018,10 @@ async function buildCampEmbeds(isFinal) {
   const weekStartIso = await getState("camp_week_start_iso", now.toISOString());
   const weekStart = new Date(weekStartIso);
 
-  // ensure paid rows exist for all players
   await ensurePaidRows("camp", weekStartIso, players.map((p) => p.user_id));
   const paidMap = await getPaidMap("camp", weekStartIso);
 
-  const PER_EMBED = 12; // 3 cols x 4 rows
+  const PER_EMBED = 12;
   const embedCount = Math.max(1, Math.ceil(players.length / PER_EMBED));
   const embeds = [];
 
@@ -936,9 +1033,9 @@ async function buildCampEmbeds(isFinal) {
       .setTitle(`🏕️ Beaver Falls Camp`)
       .setDescription(
         `📅 Next Camp Payout: ${nextPayoutLabel}\n` +
-          `Payout Mode: Points (${Math.round(CAMP_FEE_RATE * 100)}% camp fee)\n` +
-          `Camp Payout Days: Saturday` +
-          (isFinal ? `\n✅ FINAL\n📅 ${fmtDateRange(weekStart, now)}` : "")
+        `Payout Mode: Points (${Math.round(CAMP_FEE_RATE * 100)}% camp fee)\n` +
+        `Camp Payout Days: Saturday` +
+        (isFinal ? `\n✅ FINAL\n📅 ${fmtDateRange(weekStart, now)}` : "")
       );
 
     for (const p of slice) {
@@ -957,11 +1054,8 @@ async function buildCampEmbeds(isFinal) {
     }
 
     embed.setFooter({
-      text: `🧾 Total Delivery Value: ${money(totalDeliveryValue)} • 🪙 Camp Revenue: ${money(
-        campRevenue
-      )} • Today at ${fmtShortTime(now)}`,
+      text: `🧾 Total Delivery Value: ${money(totalDeliveryValue)} • 🪙 Camp Revenue: ${money(campRevenue)} • Today at ${fmtShortTime(now)}`,
     });
-
     embed.setTimestamp(now);
     embeds.push(embed);
   }
@@ -970,9 +1064,7 @@ async function buildCampEmbeds(isFinal) {
 }
 
 async function renderCampBoard(isFinal = false) {
-  const key = "camp_current_msg";
-  const msgId = await ensureCurrentMessage(key, CAMP_OUTPUT_CHANNEL_ID, "🏕️ Beaver Falls Camp (loading...)");
-
+  const msgId = await ensureCurrentMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, "🏕️ Beaver Falls Camp (loading...)");
   const channel = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
   const msg = await channel.messages.fetch(msgId);
 
@@ -982,188 +1074,109 @@ async function renderCampBoard(isFinal = false) {
   await msg.edit({ content: "", embeds, components });
 }
 
-/* ================= ARCHIVE (FULL EMBEDS) ================= */
+/* ================= ARCHIVE HELPERS ================= */
 async function sendEmbedsInBatches(channel, embeds) {
-  // Discord max 10 embeds per message
   for (let i = 0; i < embeds.length; i += 10) {
-    const chunk = embeds.slice(i, i + 10);
-    await channel.send({ embeds: chunk });
+    await channel.send({ embeds: embeds.slice(i, i + 10) });
   }
 }
 
-/* ================= WEEKLY ROLLOVER ================= */
-function nowInTZParts() {
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone: WEEKLY_TZ,
-    weekday: "short",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  const parts = dtf.formatToParts(new Date());
-  const obj = {};
-  for (const p of parts) obj[p.type] = p.value;
-  return obj;
+/**
+ * HARD DUPLICATE FIX:
+ * - Weekly rollover is guarded by:
+ *   1) PG advisory lock (only one instance can run it at a time)
+ *   2) A DB stamp key `weekly_rollover_done:<YYYY-MM-DD>` so it runs ONCE per week, ever.
+ */
+async function tryAdvisoryLock() {
+  // stable lock id (int) — just pick a constant
+  const { rows } = await pool.query(`SELECT pg_try_advisory_lock(74201911) AS ok`);
+  return rows?.[0]?.ok === true;
+}
+async function releaseAdvisoryLock() {
+  await pool.query(`SELECT pg_advisory_unlock(74201911)`);
 }
 
 async function weeklyRolloverIfDue() {
-  const p = nowInTZParts();
-  const dow = dowFromShort(p.weekday);
-  const hh = Number(p.hour);
-  const mm = Number(p.minute);
-
-  if (dow !== WEEKLY_DOW) return;
-  if (hh !== WEEKLY_HOUR || mm !== WEEKLY_MINUTE) return;
-
-  const stamp = `${p.year}-${p.month}-${p.day}`;
-  const last = await getState("weekly_rollover_stamp", "");
-  if (last === stamp) return;
-
-  console.log(`🗓️ Weekly rollover triggered (${stamp} ${WEEKLY_TZ})`);
-
-  // rebuild totals before final render + archive
-  await rebuildRanchTotals();
-  await rebuildCampTotals();
-
-  // render FINAL in-place
-  await renderRanchBoard(true);
-  await renderCampBoard(true);
-
-  // archive: post FULL embeds (final) to payout history channel
-  const archiveChannel = await client.channels.fetch(PAYOUT_ARCHIVE_CHANNEL_ID);
-
   const now = new Date();
-  const ranchStartIso = await getState("ranch_week_start_iso", now.toISOString());
-  const campStartIso = await getState("camp_week_start_iso", now.toISOString());
-  const ranchStart = new Date(ranchStartIso);
-  const campStart = new Date(campStartIso);
+  const { rolloverUtc, stampYMD } = computeRolloverUtcForWeek(now);
+  const stamp = ymdStamp(stampYMD);
 
-  await archiveChannel.send({
-    content:
-      `📦 **Beaver Falls — Weekly Payout Archive**\n` +
-      `🗓️ **${fmtDateRange(ranchStart, now)}** (Ranch) • **${fmtDateRange(
-        campStart,
-        now
-      )}** (Camp)\n` +
-      `⏰ Archived Saturday @ 12:00 PM ET\n` +
-      `✅ Paid checkmarks were tracked on the live boards.`,
-  });
+  // only run at/after rollover moment
+  if (now.getTime() < rolloverUtc.getTime()) return;
 
-  // build final embeds again and post them to archive (so it’s a real archive snapshot)
-  const ranchFinal = await buildRanchEmbeds(true);
-  const campFinal = await buildCampEmbeds(true);
-  await sendEmbedsInBatches(archiveChannel, ranchFinal.embeds);
-  await sendEmbedsInBatches(archiveChannel, campFinal.embeds);
+  // DB stamp makes it idempotent
+  const doneKey = `weekly_rollover_done:${stamp}`;
+  const already = await getState(doneKey, "");
+  if (already === "true") return;
 
-  // new weekly messages (fresh boards)
-  {
-    const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏆 Beaver Falls Ranch (Starting new week…)" });
-    await setBoardMessage("ranch_current_msg", RANCH_OUTPUT_CHANNEL_ID, m.id);
-  }
-  {
-    const ch = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏕️ Beaver Falls Camp (Starting new week…)" });
-    await setBoardMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, m.id);
-  }
+  // Advisory lock prevents two instances (or overlapping calls)
+  const locked = await tryAdvisoryLock();
+  if (!locked) return;
 
-  // wipe weekly data + paid status is per week_start_iso, so it naturally becomes "old week"
-  await pool.query(`TRUNCATE public.ranch_events`);
-  await pool.query(`TRUNCATE public.ranch_totals`);
-  await pool.query(`TRUNCATE public.camp_events`);
-  await pool.query(`TRUNCATE public.camp_totals`);
-
-  const nowIso = new Date().toISOString();
-  await setState("ranch_week_start_iso", nowIso);
-  await setState("camp_week_start_iso", nowIso);
-
-  // reset UI paging and admin selections
-  await setState("ranch_paid_page", "0");
-  await setState("camp_paid_page", "0");
-  selectedUserByAdmin.clear();
-
-  // render new week boards
-  await renderRanchBoard(false);
-  await renderCampBoard(false);
-
-  await setState("weekly_rollover_stamp", stamp);
-  console.log("✅ Weekly rollover complete");
-}
-
-/* ================= INTERACTIONS (Paid UI) ================= */
-client.on("interactionCreate", async (interaction) => {
   try {
-    if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
+    // check again inside lock
+    const already2 = await getState(doneKey, "");
+    if (already2 === "true") return;
 
-    // Always ack quickly to avoid "interaction failed"
-    if (interaction.isButton()) await interaction.deferUpdate();
-    if (interaction.isStringSelectMenu()) await interaction.deferUpdate();
+    console.log(`🗓️ Weekly rollover RUNNING for week stamp ${stamp} (${WEEKLY_TZ})`);
 
-    if (!isAdminInteraction(interaction)) {
-      // Do not spam channel, just ignore quietly
-      return;
-    }
+    // Ensure totals are current, then render FINAL boards
+    await rebuildRanchTotals();
+    await rebuildCampTotals();
+    await renderRanchBoard(true);
+    await renderCampBoard(true);
 
-    const id = interaction.customId || "";
-    const isSelect = interaction.isStringSelectMenu();
+    // Archive full embeds to history ONCE
+    const archiveChannel = await client.channels.fetch(PAYOUT_ARCHIVE_CHANNEL_ID);
 
-    // paid_select:<scope>
-    if (isSelect && id.startsWith("paid_select:")) {
-      const scope = id.split(":")[1];
-      const value = interaction.values?.[0];
-      if (!value) return;
+    const ranchStartIso = await getState("ranch_week_start_iso", now.toISOString());
+    const campStartIso = await getState("camp_week_start_iso", now.toISOString());
+    const ranchStart = new Date(ranchStartIso);
+    const campStart = new Date(campStartIso);
 
-      selectedUserByAdmin.set(selKey(scope, interaction.user.id), value);
-      return;
-    }
+    const headerMsg = await archiveChannel.send({
+      content:
+        `📦 **Beaver Falls — Weekly Payout Archive**\n` +
+        `🗓️ **${fmtDateRange(ranchStart, now)}** (Ranch) • **${fmtDateRange(campStart, now)}** (Camp)\n` +
+        `⏰ Archived Saturday @ 12:00 PM ET\n` +
+        `✅ Paid checkmarks were tracked on the live boards.`,
+    });
 
-    // Buttons:
-    // paid_mark:<scope> / paid_unmark:<scope> / paid_prev:<scope> / paid_next:<scope>
-    if (!interaction.isButton()) return;
-    const [action, scope] = id.split(":");
-    if (!scope) return;
+    // record archive header msgid so cleanup can preserve one per week
+    await setState(`archive_msgid:${stamp}`, headerMsg.id);
 
-    const weekStartIso =
-      scope === "ranch"
-        ? await getState("ranch_week_start_iso", new Date().toISOString())
-        : await getState("camp_week_start_iso", new Date().toISOString());
+    const ranchFinal = await buildRanchEmbeds(true);
+    const campFinal = await buildCampEmbeds(true);
+    await sendEmbedsInBatches(archiveChannel, ranchFinal.embeds);
+    await sendEmbedsInBatches(archiveChannel, campFinal.embeds);
 
-    if (action === "paid_prev") {
-      const pageKey = `${scope}_paid_page`;
-      const cur = Number(await getState(pageKey, "0"));
-      await setState(pageKey, String(Math.max(0, cur - 1)));
-      if (scope === "ranch") await renderRanchBoard(false);
-      else await renderCampBoard(false);
-      return;
-    }
+    // Start NEW week without spamming multiple "new boards":
+    // We REUSE the same current message IDs and simply wipe data + rerender.
+    // (No new posts in ranch/camp channels => no duplicates.)
+    await pool.query(`TRUNCATE public.ranch_events`);
+    await pool.query(`TRUNCATE public.ranch_totals`);
+    await pool.query(`TRUNCATE public.camp_events`);
+    await pool.query(`TRUNCATE public.camp_totals`);
 
-    if (action === "paid_next") {
-      const pageKey = `${scope}_paid_page`;
-      const cur = Number(await getState(pageKey, "0"));
-      await setState(pageKey, String(cur + 1));
-      if (scope === "ranch") await renderRanchBoard(false);
-      else await renderCampBoard(false);
-      return;
-    }
+    const nowIso = now.toISOString();
+    await setState("ranch_week_start_iso", nowIso);
+    await setState("camp_week_start_iso", nowIso);
 
-    if (action === "paid_mark" || action === "paid_unmark") {
-      const selected = selectedUserByAdmin.get(selKey(scope, interaction.user.id));
-      if (!selected) return;
+    // reset paging/selection
+    await setState("ranch_paid_page", "0");
+    await setState("camp_paid_page", "0");
+    selectedUserByAdmin.clear();
 
-      const isPaid = action === "paid_mark";
-      await setPaid(scope, weekStartIso, selected, isPaid, interaction.user.id);
+    await renderRanchBoard(false);
+    await renderCampBoard(false);
 
-      if (scope === "ranch") await renderRanchBoard(false);
-      else await renderCampBoard(false);
-      return;
-    }
-  } catch (e) {
-    console.error("❌ interactionCreate error:", e);
+    // mark done
+    await setState(doneKey, "true");
+    console.log("✅ Weekly rollover complete (idempotent)");
+  } finally {
+    await releaseAdvisoryLock().catch(() => {});
   }
-});
+}
 
 /* ================= BACKFILL / POLL ================= */
 async function backfillChannel(channelId, parseFn, insertFn, label, minTimestampMs = 0) {
@@ -1216,6 +1229,69 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
   return inserted;
 }
 
+/* ================= INTERACTIONS ================= */
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
+
+    // ack fast
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate().catch(() => {});
+    }
+
+    if (!isAdminInteraction(interaction)) return;
+
+    const id = interaction.customId || "";
+    const isSelect = interaction.isStringSelectMenu();
+
+    if (isSelect && id.startsWith("paid_select:")) {
+      const scope = id.split(":")[1];
+      const value = interaction.values?.[0];
+      if (!value) return;
+      selectedUserByAdmin.set(selKey(scope, interaction.user.id), value);
+      return;
+    }
+
+    if (!interaction.isButton()) return;
+    const [action, scope] = id.split(":");
+    if (!scope) return;
+
+    const weekStartIso =
+      scope === "ranch"
+        ? await getState("ranch_week_start_iso", new Date().toISOString())
+        : await getState("camp_week_start_iso", new Date().toISOString());
+
+    if (action === "paid_prev") {
+      const pageKey = `${scope}_paid_page`;
+      const cur = Number(await getState(pageKey, "0"));
+      await setState(pageKey, String(Math.max(0, cur - 1)));
+      if (scope === "ranch") await renderRanchBoard(false);
+      else await renderCampBoard(false);
+      return;
+    }
+
+    if (action === "paid_next") {
+      const pageKey = `${scope}_paid_page`;
+      const cur = Number(await getState(pageKey, "0"));
+      await setState(pageKey, String(cur + 1));
+      if (scope === "ranch") await renderRanchBoard(false);
+      else await renderCampBoard(false);
+      return;
+    }
+
+    if (action === "paid_mark" || action === "paid_unmark") {
+      const selected = selectedUserByAdmin.get(selKey(scope, interaction.user.id));
+      if (!selected) return;
+      const isPaid = action === "paid_mark";
+      await setPaid(scope, weekStartIso, selected, isPaid, interaction.user.id);
+      if (scope === "ranch") await renderRanchBoard(false);
+      else await renderCampBoard(false);
+    }
+  } catch (e) {
+    console.error("❌ interactionCreate error:", e);
+  }
+});
+
 /* ================= STARTUP ================= */
 client.once("clientReady", async () => {
   try {
@@ -1225,6 +1301,7 @@ client.once("clientReady", async () => {
     await initWeekStartsIfMissing();
     await getGuild();
 
+    // Ensure exactly one current message per board
     await renderRanchBoard(false);
     await renderCampBoard(false);
 
@@ -1260,6 +1337,7 @@ client.once("clientReady", async () => {
       }
     }
 
+    // Pollers: only edit boards if something inserted (prevents spam edits)
     setInterval(async () => {
       try {
         const r = await pollOnce(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
@@ -1284,6 +1362,7 @@ client.once("clientReady", async () => {
       }
     }, POLL_EVERY_MS);
 
+    // Weekly rollover check: safe + idempotent
     setInterval(() => {
       weeklyRolloverIfDue().catch((e) => console.error("❌ weeklyRolloverIfDue:", e));
     }, 30_000);
