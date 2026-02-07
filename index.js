@@ -1,3 +1,12 @@
+/**
+ * Beaver Falls Ranch + Camp Manager
+ * - Reads Syn County webhook logs from 2 input channels (ranch + camp)
+ * - Stores parsed events in Postgres (deduped by discord message id + kind)
+ * - Maintains 1 static leaderboard message per output channel (edited, no spam)
+ * - Leaderboards ONLY update when NEW events were inserted (prevents blank/idle spam)
+ * - Admin backfill endpoint: /admin/backfill?key=...&scope=all&hours=1&max=2000
+ */
+
 import express from "express";
 import {
   Client,
@@ -17,6 +26,8 @@ const PORT = process.env.PORT || 8080;
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
+
+const ADMIN_KEY = process.env.ADMIN_KEY;
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -53,6 +64,7 @@ function must(name) {
 [
   "DISCORD_TOKEN",
   "DATABASE_URL",
+  "ADMIN_KEY",
   "GUILD_ID",
   "RANCH_INPUT_CHANNEL_ID",
   "RANCH_OUTPUT_CHANNEL_ID",
@@ -71,7 +83,7 @@ const pool = new pg.Pool({ connectionString: DATABASE_URL });
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // resolve names
+    GatewayIntentBits.GuildMembers, // resolve display names
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
@@ -114,7 +126,7 @@ async function ensureTables() {
     );
   `);
 
-  // unique per message+kind so one discord message can insert multiple kinds safely
+  // dedupe per discord message + kind
   await pool.query(`
     DO $$
     BEGIN
@@ -154,34 +166,38 @@ async function setState(key, value) {
 // =====================
 // NAME RESOLVING
 // =====================
-const nameCache = new Map(); // userId -> name
+const nameCache = new Map(); // userId -> display string
 async function resolveDisplayName(userId) {
   if (!userId) return "unknown-user";
-  if (nameCache.has(userId)) return nameCache.get(userId);
+  const id = String(userId);
+  if (nameCache.has(id)) return nameCache.get(id);
 
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
-    const member = await guild.members.fetch(userId).catch(() => null);
+
+    // Prefer member display name (server nickname)
+    const member = await guild.members.fetch(id).catch(() => null);
     if (member) {
       const name =
         member.displayName ||
         member.user?.globalName ||
         member.user?.username ||
-        `user-${String(userId).slice(-4)}`;
-      nameCache.set(userId, name);
+        `user-${id.slice(-4)}`;
+      nameCache.set(id, name);
       return name;
     }
 
-    const user = await client.users.fetch(userId).catch(() => null);
+    // Fallback to global user fetch
+    const user = await client.users.fetch(id).catch(() => null);
     if (user) {
-      const name = user.globalName || user.username || `user-${String(userId).slice(-4)}`;
-      nameCache.set(userId, name);
+      const name = user.globalName || user.username || `user-${id.slice(-4)}`;
+      nameCache.set(id, name);
       return name;
     }
   } catch {}
 
-  const fallback = `user-${String(userId).slice(-4)}`;
-  nameCache.set(userId, fallback);
+  const fallback = `user-${id.slice(-4)}`;
+  nameCache.set(id, fallback);
   return fallback;
 }
 
@@ -224,8 +240,7 @@ function parseRanchMessage(content) {
   const eggsMatch = content.match(/Added\s+Eggs\s+to\s+ranch\s+id\s+\d+\s*:\s*(\d+)/i);
   if (eggsMatch) events.push({ user_id: userId, kind: "eggs", qty: Number(eggsMatch[1]), amount: 0 });
 
-  // cattle sale: "sold 2 Pronghorn for 256.0$"
-  // tolerant: commas + any animal text
+  // cattle sale: "Player @X ... sold 2 Pronghorn for 256.0$"
   const soldMatch = content.match(/sold\s+(\d+)\s+(.+?)\s+for\s+([\d.,]+)\$/i);
   if (soldMatch) {
     const qty = Number(soldMatch[1]);
@@ -243,12 +258,15 @@ function parseCampMessage(content) {
 
   const events = [];
 
+  // Supplies
   const supplies = content.match(/Delivered\s+Supplies:\s*(\d+)/i);
   if (supplies) events.push({ user_id: userId, kind: "supplies", qty: Number(supplies[1]), amount: 0 });
 
+  // Materials (skins etc.)
   const mats = content.match(/Materials\s+added:\s*([\d.]+)/i);
   if (mats) events.push({ user_id: userId, kind: "materials", qty: Number(mats[1]), amount: 0 });
 
+  // Deliveries / stock sale value
   const stockSale = content.match(/Made a Sale Of\s+(\d+)\s+Of\s+Stock\s+For\s+\$([\d.]+)/i);
   if (stockSale) {
     const value = Number(stockSale[2]);
@@ -267,7 +285,7 @@ async function insertEvent(table, messageId, evt, createdAtIso) {
     `,
     [String(messageId), String(evt.user_id), evt.kind, evt.qty, evt.amount, createdAtIso || new Date().toISOString()]
   );
-  return res.rowCount; // 1 if inserted, 0 if duplicate
+  return res.rowCount;
 }
 
 // =====================
@@ -295,6 +313,85 @@ async function ensureSingleMessage(channelId, stateKey, initialPayload) {
 }
 
 // =====================
+// ADMIN BACKFILL ENDPOINT
+// =====================
+async function backfillSince(channelId, parser, tableName, sinceDate, maxMessages = 2000) {
+  const channel = await fetchChannel(channelId);
+
+  let scanned = 0;
+  let inserted = 0;
+  let lastId = null;
+
+  while (scanned < maxMessages) {
+    const batch = await channel.messages.fetch({
+      limit: 100,
+      ...(lastId ? { before: lastId } : {}),
+    });
+
+    if (!batch.size) break;
+
+    for (const [, m] of batch) {
+      scanned++;
+      lastId = m.id;
+
+      // stop when we go older than cutoff
+      if (m.createdAt < sinceDate) return { scanned, inserted };
+
+      const content = (m.content || "").trim();
+      if (!content) continue;
+
+      const events = parser(content);
+      if (!events.length) continue;
+
+      for (const evt of events) {
+        inserted += await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
+      }
+
+      if (scanned >= maxMessages) break;
+    }
+  }
+
+  return { scanned, inserted };
+}
+
+app.get("/admin/backfill", async (req, res) => {
+  try {
+    const key = String(req.query.key || "");
+    const scope = String(req.query.scope || "all"); // ranch|camp|all
+    const hours = Number(req.query.hours || 1);
+    const max = Number(req.query.max || 2000);
+
+    if (!key || key !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "bad key" });
+    if (!Number.isFinite(hours) || hours <= 0) return res.status(400).json({ ok: false, error: "hours must be > 0" });
+
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+
+    let ranch = { scanned: 0, inserted: 0 };
+    let camp = { scanned: 0, inserted: 0 };
+
+    if (scope === "ranch" || scope === "all") {
+      ranch = await backfillSince(RANCH_INPUT_CHANNEL_ID, parseRanchMessage, "ranch_events", since, max);
+    }
+    if (scope === "camp" || scope === "all") {
+      camp = await backfillSince(CAMP_INPUT_CHANNEL_ID, parseCampMessage, "camp_events", since, max);
+    }
+
+    // trigger a render soon
+    scheduleUpdate();
+
+    return res.json({
+      ok: true,
+      since: since.toISOString(),
+      ranch,
+      camp,
+    });
+  } catch (e) {
+    console.error("admin backfill error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// =====================
 // FORMATTING
 // =====================
 function money(n) {
@@ -307,7 +404,7 @@ function fmtNextPayoutLabel(prefix) {
   const now = new Date();
   const d = new Date(now);
   const day = d.getDay();
-  const diff = (6 - day + 7) % 7 || 7;
+  const diff = (6 - day + 7) % 7 || 7; // next Saturday
   d.setDate(d.getDate() + diff);
   const label = d.toLocaleDateString("en-US", {
     weekday: "long",
@@ -382,7 +479,6 @@ async function campTotalsActiveOnly() {
   const users = usersRaw.filter((u) => (u.materials + u.supplies + u.deliveries) > 0);
 
   const totalPoints = users.reduce((a, u) => a + u.points, 0);
-
   const withPayouts = users.map((u) => {
     const payout = totalPoints > 0 ? (u.points / totalPoints) * payoutPool : 0;
     return { ...u, payout };
@@ -518,6 +614,7 @@ function makePagerRow(prefix, page, totalPages) {
 let editTimer = null;
 
 async function renderAllBoards() {
+  // RANCH
   const ranchUsers = await ranchTotalsActiveOnly();
   const ranchTotalPages = Math.max(1, Math.ceil(ranchUsers.length / PAGE_SIZE));
   let ranchPage = Number((await getState("ranch_page")) || 0);
@@ -533,6 +630,7 @@ async function renderAllBoards() {
   const ranchEmbed = await makeRanchEmbed({ users: ranchUsers, page: ranchPage, totalPages: ranchTotalPages });
   await ranchMsg.edit({ embeds: [ranchEmbed], components: [makePagerRow("ranch", ranchPage, ranchTotalPages)] });
 
+  // CAMP
   const camp = await campTotalsActiveOnly();
   const campUsers = camp.users;
   const campTotalPages = Math.max(1, Math.ceil(campUsers.length / PAGE_SIZE));
@@ -644,9 +742,7 @@ async function pollChannelOnce(channelId, parser, tableName, label) {
     if (!events.length) continue;
 
     for (const evt of events) {
-      try {
-        inserted += await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
-      } catch {}
+      inserted += await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
     }
   }
 
@@ -675,9 +771,7 @@ async function backfillChannel(channelId, parser, tableName, maxMessages, label)
       if (!events.length) continue;
 
       for (const evt of events) {
-        try {
-          inserted += await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
-        } catch {}
+        inserted += await insertEvent(tableName, m.id, evt, m.createdAt?.toISOString());
       }
 
       if (scanned >= maxMessages) break;
@@ -696,9 +790,10 @@ client.once("clientReady", async () => {
     console.log(`🤖 Online as ${client.user.tag}`);
     await ensureTables();
 
-    if (!(await getState("ranch_page"))) await setState("ranch_page", 0);
-    if (!(await getState("camp_page"))) await setState("camp_page", 0);
+    if ((await getState("ranch_page")) === null) await setState("ranch_page", 0);
+    if ((await getState("camp_page")) === null) await setState("camp_page", 0);
 
+    // ensure static messages exist
     await ensureSingleMessage(RANCH_OUTPUT_CHANNEL_ID, "ranch_board_msg", {
       embeds: [new EmbedBuilder().setTitle("Loading…")],
       components: [],
@@ -710,20 +805,8 @@ client.once("clientReady", async () => {
 
     if (BACKFILL_ON_START) {
       console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
-      await backfillChannel(
-        RANCH_INPUT_CHANNEL_ID,
-        parseRanchMessage,
-        "ranch_events",
-        BACKFILL_MAX_MESSAGES,
-        "RANCH"
-      );
-      await backfillChannel(
-        CAMP_INPUT_CHANNEL_ID,
-        parseCampMessage,
-        "camp_events",
-        BACKFILL_MAX_MESSAGES,
-        "CAMP"
-      );
+      await backfillChannel(RANCH_INPUT_CHANNEL_ID, parseRanchMessage, "ranch_events", BACKFILL_MAX_MESSAGES, "RANCH");
+      await backfillChannel(CAMP_INPUT_CHANNEL_ID, parseCampMessage, "camp_events", BACKFILL_MAX_MESSAGES, "CAMP");
     }
 
     await renderAllBoards();
@@ -743,8 +826,8 @@ client.once("clientReady", async () => {
           "CAMP"
         );
 
-        // only update boards if anything new was inserted
-        if ((ranchInserted + campInserted) > 0) scheduleUpdate();
+        // ONLY re-render if there was new data
+        if (ranchInserted + campInserted > 0) scheduleUpdate();
       } catch (e) {
         console.error("❌ poll loop error:", e?.message || e);
       }
@@ -758,4 +841,5 @@ client.once("clientReady", async () => {
 });
 
 client.login(DISCORD_TOKEN);
+
 app.listen(PORT, () => console.log(`🚀 Web listening on ${PORT}`));
