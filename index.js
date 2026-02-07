@@ -1,6 +1,6 @@
 // index.js — Beaver Falls Ranch + Camp Manager (Railway + Discord + Postgres)
 // Ranch = embed columns (inline fields, 3 columns per row)
-// Camp  = embed columns matching Ranch (inline fields, 3 columns per row) + top-3 badges
+// Camp  = embed layout EXACTLY like screenshot (no medals, no top totals row, clean 3-col inline fields)
 // Poll  = 2000ms
 // Weekly rollover = Saturday 12:00 PM ET, posts archive + creates new weekly messages
 
@@ -725,7 +725,7 @@ async function renderRanchBoard(isFinal = false) {
   await msg.edit({ content: "", embeds });
 }
 
-/* ================= CAMP: EMBED COLUMNS (MATCH RANCH) ================= */
+/* ================= CAMP: EMBED EXACT LIKE SCREENSHOT ================= */
 function campMathRow(r) {
   const materials = Number(r.materials);
   const supplies = Number(r.supplies);
@@ -767,56 +767,57 @@ async function buildCampEmbeds(isFinal) {
   const weekStartIso = await getState("camp_week_start_iso", now.toISOString());
   const weekStart = new Date(weekStartIso);
 
-  const PER_PAGE = 12; // 3 columns x 4 rows
-  const pageCount = Math.max(1, Math.ceil(players.length / PER_PAGE));
+  // EXACTLY like screenshot: one embed "card" with inline player fields (3 columns).
+  // If more than 12 players, we spill into additional embeds that look identical (no "Page x/y" text).
+  const PER_EMBED = 12; // 3 columns x 4 rows (still matches the look)
+  const embedCount = Math.max(1, Math.ceil(players.length / PER_EMBED));
   const embeds = [];
 
-  const medals = ["🥇 ", "🥈 ", "🥉 "];
-
-  for (let page = 0; page < pageCount; page++) {
-    const slice = players.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
+  for (let idx = 0; idx < embedCount; idx++) {
+    const slice = players.slice(idx * PER_EMBED, (idx + 1) * PER_EMBED);
 
     const embed = new EmbedBuilder()
       .setColor(0x2b2d31)
-      .setTitle(`🏕️ Beaver Falls Camp — Page ${page + 1}/${pageCount}`)
+      .setTitle(`🏕️ Beaver Falls Camp`)
       .setDescription(
-        `📅 Next Camp Payout: ${nextPayoutLabel}${isFinal ? `\n✅ FINAL` : ""}\nPayout Mode: Points (${(
-          CAMP_FEE_RATE * 100
-        ).toFixed(0)}% camp fee)\n📅 ${fmtDateRange(weekStart, now)}`
+        `📅 Next Camp Payout: ${nextPayoutLabel}\n` +
+          `Payout Mode: Points (${Math.round(CAMP_FEE_RATE * 100)}% camp fee)\n` +
+          `Camp Payout Days: Saturday` +
+          (isFinal ? `\n✅ FINAL\n📅 ${fmtDateRange(weekStart, now)}` : "")
       );
 
-    // top totals row
-    embed.addFields(
-      { name: "💰 Camp Payout", value: `**${money(playerPool)}**`, inline: true },
-      { name: "⭐ Points", value: `**${totalPoints.toLocaleString()}**`, inline: true },
-      { name: "🧾 Delivery Value", value: `**${money(totalDeliveryValue)}**`, inline: true }
-    );
-
-    for (let i = 0; i < slice.length; i++) {
-      const p = slice[i];
-      const globalRank = page * PER_PAGE + i; // 0-based
-      const badge = globalRank < 3 ? medals[globalRank] : "";
+    for (const p of slice) {
       const name = await displayNameFor(p.user_id);
 
+      // EXACT line rules like screenshot:
+      // - Always show Materials + Points + Payout
+      // - Only show Deliveries if >0
+      // - Only show Supplies if >0
+      const lines = [];
+
+      // show materials with 2 decimals to mimic screenshot style
+      lines.push(`🪨 Materials: ${p.materials.toFixed(2)}`);
+
+      if (p.deliveries > 0) lines.push(`🚚 Deliveries: ${p.deliveries}`);
+      if (p.supplies > 0) lines.push(`📦 Supplies: ${p.supplies}`);
+
+      lines.push(`⭐ Points: ${p.points}`);
+      lines.push(`💰 Payout: **${money(p.payout)}**`);
+
       embed.addFields({
-        name: `${badge}${name}`,
-        value:
-          `🪨 Materials: ${p.materials}\n` +
-          `🚚 Deliveries: ${p.deliveries} (S:${p.ds} M:${p.dm} L:${p.dl})\n` +
-          `📦 Supplies: ${p.supplies}\n` +
-          `⭐ Points: ${p.points}\n` +
-          `💰 **Payout: ${money(p.payout)}**`,
+        name,
+        value: lines.join("\n"),
         inline: true,
       });
     }
 
     embed.setFooter({
-      text: `🪙 Camp Revenue: ${money(campRevenue)} • Value/pt: ${money(valuePerPoint)} • Today at ${fmtShortTime(
-        now
-      )}`,
+      text: `🧾 Total Delivery Value: ${money(totalDeliveryValue)} • 🪙 Camp Revenue: ${money(
+        campRevenue
+      )} • Today at ${fmtShortTime(now)}`,
     });
-    embed.setTimestamp(now);
 
+    embed.setTimestamp(now);
     embeds.push(embed);
   }
 
