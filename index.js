@@ -1,4 +1,5 @@
 // index.js — Beaver Falls Ranch + Camp Manager
+// FIX: Ranch inserted=0 was because ranch logs are EMBEDS; extractor now reads embed.data / toJSON.
 // ✅ Ranch: eggs/milk + herd_profit AND displays total animals SOLD (🐄xN) from Cattle Sale logs
 // ✅ Camp: deliveries classified by SALE AMOUNT RANGES (so $1600 counts as Large) + stronger Discord: line user-id parsing
 // ✅ 1 static message per channel (edited, no spam)
@@ -92,7 +93,7 @@ const PTS_SUPPLY = 1;
 const CAMP_LARGE_MIN = Number(process.env.CAMP_LARGE_MIN || 1400);
 const CAMP_MED_MIN = Number(process.env.CAMP_MED_MIN || 800);
 
-// Optional: for display/estimated totals (points still drives payouts)
+// Optional: for display totals (points still drives payouts)
 const CAMP_DELIVERY_SMALL_VALUE = Number(process.env.CAMP_DELIVERY_SMALL || 500);
 const CAMP_DELIVERY_MED_VALUE = Number(process.env.CAMP_DELIVERY_MED || 950);
 const CAMP_DELIVERY_LARGE_VALUE = Number(process.env.CAMP_DELIVERY_LARGE || 1500);
@@ -311,27 +312,49 @@ async function initWeekStartsIfMissing() {
 }
 
 /* ================= MESSAGE TEXT HELPERS ================= */
+
+// v15 embeds are Embed objects; content is inside .data or toJSON()
+function embedToText(embed) {
+  try {
+    const data =
+      embed?.data ||
+      (typeof embed?.toJSON === "function" ? embed.toJSON() : embed) ||
+      {};
+
+    let out = "";
+    if (data.title) out += `\n${data.title}`;
+    if (data.description) out += `\n${data.description}`;
+    if (data.author?.name) out += `\n${data.author.name}`;
+    if (Array.isArray(data.fields)) {
+      for (const f of data.fields) out += `\n${f.name}\n${f.value}`;
+    }
+    if (data.footer?.text) out += `\n${data.footer.text}`;
+    return out.trim();
+  } catch {
+    return "";
+  }
+}
+
 function extractAllText(message) {
   let text = (message.content || "").trim();
-  if (message.embeds?.length) {
+
+  // embeds
+  if (Array.isArray(message.embeds) && message.embeds.length) {
     for (const e of message.embeds) {
-      if (e.title) text += `\n${e.title}`;
-      if (e.description) text += `\n${e.description}`;
-      if (e.author?.name) text += `\n${e.author.name}`;
-      if (e.fields?.length)
-        for (const f of e.fields) text += `\n${f.name}\n${f.value}`;
-      if (e.footer?.text) text += `\n${e.footer.text}`;
+      const t = embedToText(e);
+      if (t) text += `\n${t}`;
     }
   }
+
   return text.trim();
 }
 
 function getUserIdFromMessage(message, text) {
-  // 1) True mention object
+  // 1) Mention object
   const first = message.mentions?.users?.first?.();
   if (first?.id) return first.id;
 
-  // 2) Prefer the "Discord:" line when present
+  // 2) Prefer "Discord:" line
   const discordLine = text.match(/Discord:\s*.*?(\d{17,19})\b/i);
   if (discordLine) return discordLine[1];
 
@@ -348,7 +371,7 @@ function getUserIdFromMessage(message, text) {
   return any ? any[1] : null;
 }
 
-// helper: find the LAST ": number" in a message (your ranch logs often end like ": 22")
+// helper: find the LAST ": number"
 function lastColonNumber(text) {
   const matches = [...text.matchAll(/:\s*(\d+)\b/g)];
   if (!matches.length) return 0;
@@ -360,6 +383,15 @@ function parseRanch(message) {
   const text = extractAllText(message);
   if (!text) return null;
 
+  // quick filter so we don't parse random chat
+  if (
+    !/Eggs\s+Added|Milk\s+Added|Added\s+Eggs|Added\s+Milk|Cattle\s+Sale|sold\s+\d+/i.test(
+      text
+    )
+  ) {
+    return null;
+  }
+
   const userId = getUserIdFromMessage(message, text);
   if (!userId) return null;
 
@@ -368,17 +400,16 @@ function parseRanch(message) {
   let herd_profit = 0;
   let cattle_sold = 0;
 
-  // ✅ SUPER forgiving ranch parsing (fixes your “inserted=0” problem)
-  // If the message contains "Added Eggs" anywhere, take the last ": number"
-  if (/Added\s+Eggs/i.test(text)) {
+  // Accept BOTH styles: "Eggs Added" title or "Added Eggs ..." line
+  if (/Eggs\s+Added|Added\s+Eggs/i.test(text)) {
     eggs += lastColonNumber(text);
   }
 
-  if (/Added\s+Milk/i.test(text)) {
+  if (/Milk\s+Added|Added\s+Milk/i.test(text)) {
     milk += lastColonNumber(text);
   }
 
-  // ✅ Cattle Sale parsing
+  // Cattle Sale
   const sale = text.match(
     /sold\s+(\d+)\s+([A-Za-z]+)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
   );
@@ -406,6 +437,12 @@ function parseCamp(message) {
   const text = extractAllText(message);
   if (!text) return null;
 
+  if (
+    !/Delivered\s+Supplies|Materials\s+added|Made\s+a\s+Sale\s+Of/i.test(text)
+  ) {
+    return null;
+  }
+
   const userId = getUserIdFromMessage(message, text);
   if (!userId) return null;
 
@@ -415,15 +452,12 @@ function parseCamp(message) {
   let del_med = 0;
   let del_large = 0;
 
-  // Supplies
   const s = text.match(/Delivered\s+Supplies:\s*(\d+)/i);
   if (s) supplies += Number(s[1] || 0);
 
-  // Materials
   const mats = text.match(/Materials\s+added:\s*([0-9]+(?:\.[0-9]+)?)/i);
   if (mats) materials += Math.floor(Number(mats[1] || 0));
 
-  // ✅ Delivery sale -> tier by RANGE (fixes $1600, $1550, etc)
   const sale = text.match(
     /Made\s+a\s+Sale\s+Of\s+\d+\s+Of\s+Stock\s+For\s+\$?([0-9]+(?:\.[0-9]+)?)/i
   );
@@ -741,6 +775,9 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
   let scanned = 0;
   let inserted = 0;
 
+  // debug sampling if ranch stays 0
+  let debugSamples = 0;
+
   while (scanned < BACKFILL_MAX_MESSAGES) {
     const limit = Math.min(100, BACKFILL_MAX_MESSAGES - scanned);
     const batch = await channel.messages.fetch(
@@ -755,7 +792,19 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
     for (const msg of msgs) {
       scanned++;
       const d = parseFn(msg);
+
+      if (!d && DEBUG && label === "RANCH" && debugSamples < 3) {
+        const t = extractAllText(msg);
+        console.log(
+          `🧪 RANCH sample msg=${msg.id} contentLen=${(msg.content || "").length} embedCount=${
+            msg.embeds?.length || 0
+          } text="${t.slice(0, 220).replace(/\n/g, " | ")}"`
+        );
+        debugSamples++;
+      }
+
       if (!d) continue;
+
       const ok = await insertFn(msg.id, d);
       if (ok) inserted++;
     }
@@ -772,15 +821,28 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
   const batch = await channel.messages.fetch({ limit: 100 });
 
   let inserted = 0;
+  let debugSamples = 0;
+
   for (const msg of batch.values()) {
     const d = parseFn(msg);
+
+    if (!d && DEBUG && label === "RANCH" && debugSamples < 1) {
+      const t = extractAllText(msg);
+      // only log 1 per poll tick
+      console.log(
+        `🧪 RANCH poll sample msg=${msg.id} contentLen=${(msg.content || "").length} embedCount=${
+          msg.embeds?.length || 0
+        } text="${t.slice(0, 220).replace(/\n/g, " | ")}"`
+      );
+      debugSamples++;
+    }
+
     if (!d) continue;
     const ok = await insertFn(msg.id, d);
     if (ok) inserted++;
   }
 
-  if (DEBUG)
-    console.log(`${label} poll fetched=${batch.size} inserted=${inserted}`);
+  if (DEBUG) console.log(`${label} poll fetched=${batch.size} inserted=${inserted}`);
   return inserted;
 }
 
@@ -821,7 +883,6 @@ client.once("clientReady", async () => {
       }
     }
 
-    // Ranch poll
     setInterval(async () => {
       try {
         const r = await pollOnce(
@@ -839,7 +900,6 @@ client.once("clientReady", async () => {
       }
     }, POLL_EVERY_MS);
 
-    // Camp poll
     setInterval(async () => {
       try {
         const c = await pollOnce(
@@ -857,7 +917,6 @@ client.once("clientReady", async () => {
       }
     }, POLL_EVERY_MS);
 
-    // Weekly rollover check
     setInterval(() => {
       rolloverIfDue().catch((e) => console.error("❌ rolloverIfDue:", e));
     }, 30_000);
