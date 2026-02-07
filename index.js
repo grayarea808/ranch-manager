@@ -53,15 +53,21 @@ const HERD_QUEUE_CHANNEL_ID =
   process.env.HERD_QUEUE_CHANNEL_ID || process.env.HERD_CHANNEL_ID;
 
 if (!RANCH_INPUT_CHANNEL_ID || !RANCH_OUTPUT_CHANNEL_ID) {
-  console.error("❌ Missing ranch channels: RANCH_INPUT_CHANNEL_ID / RANCH_OUTPUT_CHANNEL_ID");
+  console.error(
+    "❌ Missing ranch channels: RANCH_INPUT_CHANNEL_ID / RANCH_OUTPUT_CHANNEL_ID"
+  );
   process.exit(1);
 }
 if (!CAMP_INPUT_CHANNEL_ID || !CAMP_OUTPUT_CHANNEL_ID) {
-  console.error("❌ Missing camp channels: CAMP_INPUT_CHANNEL_ID / CAMP_OUTPUT_CHANNEL_ID");
+  console.error(
+    "❌ Missing camp channels: CAMP_INPUT_CHANNEL_ID / CAMP_OUTPUT_CHANNEL_ID"
+  );
   process.exit(1);
 }
 if (!HERD_QUEUE_CHANNEL_ID) {
-  console.error("❌ Missing herd queue channel var: HERD_QUEUE_CHANNEL_ID (or HERD_CHANNEL_ID)");
+  console.error(
+    "❌ Missing herd queue channel var: HERD_QUEUE_CHANNEL_ID (or HERD_CHANNEL_ID)"
+  );
   process.exit(1);
 }
 
@@ -83,7 +89,9 @@ const WEEKLY_MINUTE = Number(process.env.WEEKLY_ROLLOVER_MINUTE ?? 0);
 const EGGS_PRICE = 1.25;
 const MILK_PRICE = 1.25;
 const CATTLE_BISON_DEDUCTION = Number(process.env.CATTLE_BISON_DEDUCTION || 400);
-const CATTLE_DEFAULT_DEDUCTION = Number(process.env.CATTLE_DEFAULT_DEDUCTION || 300);
+const CATTLE_DEFAULT_DEDUCTION = Number(
+  process.env.CATTLE_DEFAULT_DEDUCTION || 300
+);
 
 // Camp math
 const CAMP_FEE_RATE = 0.30;
@@ -187,8 +195,7 @@ async function ensureSchema() {
       eggs INT NOT NULL DEFAULT 0,
       milk INT NOT NULL DEFAULT 0,
       herd_profit NUMERIC NOT NULL DEFAULT 0,
-      herd_runs INT NOT NULL DEFAULT 0,
-      herd_animals INT NOT NULL DEFAULT 0,
+      cattle_sold INT NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -197,8 +204,7 @@ async function ensureSchema() {
       eggs INT NOT NULL DEFAULT 0,
       milk INT NOT NULL DEFAULT 0,
       herd_profit NUMERIC NOT NULL DEFAULT 0,
-      herd_runs INT NOT NULL DEFAULT 0,
-      herd_animals INT NOT NULL DEFAULT 0,
+      cattle_sold INT NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -360,11 +366,12 @@ function parseRanch(message) {
 
   let eggs = 0;
   let milk = 0;
+
+  // profit included in payout, but we don't display any profit/deductions
   let herd_profit = 0;
 
-  // ✅ new: track herding completions
-  let herd_runs = 0;
-  let herd_animals = 0;
+  // ✅ what you want: total number of animals SOLD
+  let cattle_sold = 0;
 
   const eggsRegex = /Added\s+Eggs[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/gi;
   const milkRegex = /Added\s+Milk[\s\S]*?ranch\s+id\s+\d+\s*:\s*(\d+)/gi;
@@ -373,27 +380,28 @@ function parseRanch(message) {
   while ((m = eggsRegex.exec(text)) !== null) eggs += Number(m[1] || 0);
   while ((m = milkRegex.exec(text)) !== null) milk += Number(m[1] || 0);
 
-  // ✅ “Herding Completed” example:
-  // Successfully herded 5 Bison to ranch id 164
-  const herdRegex = /Successfully\s+herded\s+(\d+)\s+([A-Za-z]+)/gi;
-  while ((m = herdRegex.exec(text)) !== null) {
-    herd_runs += 1;
-    herd_animals += Number(m[1] || 0);
-  }
-
-  // Sale profit still counts into payout (not shown as a separate line)
-  const sale = text.match(/sold\s+\d+\s+([A-Za-z]+)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i);
+  // ✅ Sale example:
+  // Player @Peter ... sold 5 Bison for 1200.0$
+  const sale = text.match(
+    /sold\s+(\d+)\s+([A-Za-z]+)\s+for\s+([0-9]+(?:\.[0-9]+)?)\$/i
+  );
   if (sale) {
-    const animal = sale[1].toLowerCase();
-    const sell = Number(sale[2]);
+    const qty = Number(sale[1] || 0);
+    const animal = sale[2].toLowerCase();
+    const sell = Number(sale[3]);
+
+    cattle_sold += qty;
+
     const deduction = animal.includes("bison")
       ? CATTLE_BISON_DEDUCTION
       : CATTLE_DEFAULT_DEDUCTION;
+
+    // keep your existing profit logic
     herd_profit += sell - deduction;
   }
 
-  if (eggs === 0 && milk === 0 && herd_profit === 0 && herd_runs === 0) return null;
-  return { userId, eggs, milk, herd_profit, herd_runs, herd_animals };
+  if (eggs === 0 && milk === 0 && herd_profit === 0 && cattle_sold === 0) return null;
+  return { userId, eggs, milk, herd_profit, cattle_sold };
 }
 
 function parseCamp(message) {
@@ -415,7 +423,9 @@ function parseCamp(message) {
   const mats = text.match(/Materials\s+added:\s*([0-9]+(?:\.[0-9]+)?)/i);
   if (mats) materials += Math.floor(Number(mats[1] || 0));
 
-  const sale = text.match(/Made\s+a\s+Sale\s+Of\s+\d+\s+Of\s+Stock\s+For\s+\$?([0-9]+(?:\.[0-9]+)?)/i);
+  const sale = text.match(
+    /Made\s+a\s+Sale\s+Of\s+\d+\s+Of\s+Stock\s+For\s+\$?([0-9]+(?:\.[0-9]+)?)/i
+  );
   if (sale) {
     const amt = Math.round(Number(sale[1] || 0));
     if (amt === CAMP_DELIVERY_LARGE) del_large++;
@@ -423,7 +433,15 @@ function parseCamp(message) {
     else if (amt === CAMP_DELIVERY_SMALL) del_small++;
   }
 
-  if (materials === 0 && supplies === 0 && del_small === 0 && del_med === 0 && del_large === 0) return null;
+  if (
+    materials === 0 &&
+    supplies === 0 &&
+    del_small === 0 &&
+    del_med === 0 &&
+    del_large === 0
+  )
+    return null;
+
   return { userId, materials, supplies, del_small, del_med, del_large };
 }
 
@@ -432,12 +450,12 @@ async function insertRanchEvent(msgId, d) {
   const { rowCount } = await pool.query(
     `
     INSERT INTO public.ranch_events
-      (discord_message_id, user_id, eggs, milk, herd_profit, herd_runs, herd_animals)
+      (discord_message_id, user_id, eggs, milk, herd_profit, cattle_sold)
     VALUES
-      ($1, $2::bigint, $3::int, $4::int, $5::numeric, $6::int, $7::int)
+      ($1, $2::bigint, $3::int, $4::int, $5::numeric, $6::int)
     ON CONFLICT (discord_message_id) DO NOTHING
     `,
-    [msgId, d.userId, d.eggs, d.milk, d.herd_profit, d.herd_runs, d.herd_animals]
+    [msgId, d.userId, d.eggs, d.milk, d.herd_profit, d.cattle_sold]
   );
   return rowCount > 0;
 }
@@ -459,13 +477,12 @@ async function insertCampEvent(msgId, d) {
 async function rebuildRanchTotals() {
   await pool.query(`TRUNCATE public.ranch_totals`);
   await pool.query(`
-    INSERT INTO public.ranch_totals (user_id, eggs, milk, herd_profit, herd_runs, herd_animals, updated_at)
+    INSERT INTO public.ranch_totals (user_id, eggs, milk, herd_profit, cattle_sold, updated_at)
     SELECT user_id,
       COALESCE(SUM(eggs),0)::int,
       COALESCE(SUM(milk),0)::int,
       COALESCE(SUM(herd_profit),0)::numeric,
-      COALESCE(SUM(herd_runs),0)::int,
-      COALESCE(SUM(herd_animals),0)::int,
+      COALESCE(SUM(cattle_sold),0)::int,
       NOW()
     FROM public.ranch_events
     GROUP BY user_id
@@ -509,7 +526,7 @@ async function ensureCurrentMessage(key, channelId, defaultText) {
   }
 }
 
-/* ================= RANCH RENDER (compact + herds shown) ================= */
+/* ================= RANCH RENDER (compact + animals sold shown) ================= */
 async function renderRanchBoard(isFinal = false) {
   const key = "ranch_current_msg";
   const msgId = await ensureCurrentMessage(
@@ -522,9 +539,9 @@ async function renderRanchBoard(isFinal = false) {
   const msg = await channel.messages.fetch(msgId);
 
   const { rows } = await pool.query(`
-    SELECT user_id, eggs, milk, herd_profit, herd_runs, herd_animals
+    SELECT user_id, eggs, milk, herd_profit, cattle_sold
     FROM public.ranch_totals
-    WHERE eggs>0 OR milk>0 OR herd_profit<>0 OR herd_runs>0
+    WHERE eggs>0 OR milk>0 OR herd_profit<>0 OR cattle_sold>0
   `);
 
   const players = rows
@@ -532,20 +549,11 @@ async function renderRanchBoard(isFinal = false) {
       const eggs = Number(r.eggs);
       const milk = Number(r.milk);
       const herdProfit = Number(r.herd_profit);
-      const herdRuns = Number(r.herd_runs);
-      const herdAnimals = Number(r.herd_animals);
+      const cattleSold = Number(r.cattle_sold);
 
-      // payout includes herd profit, but we don't display deductions/profit lines
       const payout = eggs * EGGS_PRICE + milk * MILK_PRICE + herdProfit;
 
-      return {
-        user_id: r.user_id.toString(),
-        eggs,
-        milk,
-        herdRuns,
-        herdAnimals,
-        payout,
-      };
+      return { user_id: r.user_id.toString(), eggs, milk, cattleSold, payout };
     })
     .sort((a, b) => b.payout - a.payout);
 
@@ -570,12 +578,11 @@ async function renderRanchBoard(isFinal = false) {
     const rank = medals[i] || `#${i + 1}`;
     const name = tagName(nameList[i]);
 
-    // ✅ shows herd activity compactly:
-    // 🐄H2/10 = 2 herding completions, 10 animals herded total
-    const herdText =
-      p.herdRuns > 0 || p.herdAnimals > 0 ? ` 🐄H${p.herdRuns}/${p.herdAnimals}` : "";
+    const cattleText = p.cattleSold > 0 ? ` 🐄x${p.cattleSold}` : "";
 
-    out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk}${herdText} | 💰 **${money(p.payout)}**\n`;
+    out += `${rank} ${name} | 🥚${p.eggs} 🥛${p.milk}${cattleText} | 💰 **${money(
+      p.payout
+    )}**\n`;
   }
 
   const total = players.reduce((a, p) => a + p.payout, 0);
@@ -584,7 +591,7 @@ async function renderRanchBoard(isFinal = false) {
   await msg.edit({ content: out, embeds: [] });
 }
 
-/* ================= CAMP RENDER ================= */
+/* ================= CAMP RENDER (unchanged) ================= */
 function campMathRow(r) {
   const materials = Number(r.materials);
   const supplies = Number(r.supplies);
@@ -599,7 +606,9 @@ function campMathRow(r) {
     dl * CAMP_DELIVERY_LARGE;
 
   const points =
-    materials * PTS_MATERIAL + supplies * PTS_SUPPLY + deliveries * PTS_DELIVERY;
+    materials * PTS_MATERIAL +
+    supplies * PTS_SUPPLY +
+    deliveries * PTS_DELIVERY;
 
   return { materials, supplies, ds, dm, dl, deliveries, deliveryValue, points };
 }
@@ -642,9 +651,13 @@ async function renderCampBoard(isFinal = false) {
   const now = new Date();
   const range = `${fmtDate(weekStart)}–${fmtDate(now)}`;
 
-  let out = `🏕️ **Beaver Falls Camp — Weekly Payout (Points)${isFinal ? " (FINAL)" : ""}**\n`;
+  let out = `🏕️ **Beaver Falls Camp — Weekly Payout (Points)${
+    isFinal ? " (FINAL)" : ""
+  }**\n`;
   out += `📅 ${range}\n`;
-  out += `Fee: ${(CAMP_FEE_RATE * 100).toFixed(0)}% • Value/pt: ${money(valuePerPoint)}\n\n`;
+  out += `Fee: ${(CAMP_FEE_RATE * 100).toFixed(0)}% • Value/pt: ${money(
+    valuePerPoint
+  )}\n\n`;
 
   const medals = ["🥇", "🥈", "🥉"];
   const max = 80;
@@ -658,10 +671,14 @@ async function renderCampBoard(isFinal = false) {
     const rank = medals[i] || `#${i + 1}`;
     const name = tagName(nameList[i]);
 
-    out += `${rank} ${name} | 🪨${p.materials} 🚚${p.deliveries}(S${p.ds}/M${p.dm}/L${p.dl}) 📦${p.supplies} | ⭐${p.points} | 💰 **${money(p.payout)}**\n`;
+    out += `${rank} ${name} | 🪨${p.materials} 🚚${p.deliveries}(S${p.ds}/M${p.dm}/L${p.dl}) 📦${p.supplies} | ⭐${p.points} | 💰 **${money(
+      p.payout
+    )}**\n`;
   }
 
-  out += `\n---\n🧾 Total Delivery: ${money(totalDeliveryValue)} • 💰 Camp Revenue: ${money(campRevenue)} • ⭐ Total Points: ${totalPoints}`;
+  out += `\n---\n🧾 Total Delivery: ${money(
+    totalDeliveryValue
+  )} • 💰 Camp Revenue: ${money(campRevenue)} • ⭐ Total Points: ${totalPoints}`;
 
   await msg.edit({ content: out, embeds: [] });
 }
@@ -689,12 +706,16 @@ async function rolloverIfDue() {
 
   {
     const ch = await client.channels.fetch(RANCH_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏆 **Beaver Falls — Weekly Ranch Ledger**\n\n(Starting new week…)" });
+    const m = await ch.send({
+      content: "🏆 **Beaver Falls — Weekly Ranch Ledger**\n\n(Starting new week…)",
+    });
     await setBoardMessage("ranch_current_msg", RANCH_OUTPUT_CHANNEL_ID, m.id);
   }
   {
     const ch = await client.channels.fetch(CAMP_OUTPUT_CHANNEL_ID);
-    const m = await ch.send({ content: "🏕️ **Beaver Falls Camp — Weekly Payout (Points)**\n\n(Starting new week…)" });
+    const m = await ch.send({
+      content: "🏕️ **Beaver Falls Camp — Weekly Payout (Points)**\n\n(Starting new week…)",
+    });
     await setBoardMessage("camp_current_msg", CAMP_OUTPUT_CHANNEL_ID, m.id);
   }
 
@@ -724,10 +745,14 @@ async function backfillChannel(channelId, parseFn, insertFn, label) {
 
   while (scanned < BACKFILL_MAX_MESSAGES) {
     const limit = Math.min(100, BACKFILL_MAX_MESSAGES - scanned);
-    const batch = await channel.messages.fetch(lastId ? { limit, before: lastId } : { limit });
+    const batch = await channel.messages.fetch(
+      lastId ? { limit, before: lastId } : { limit }
+    );
     if (!batch.size) break;
 
-    const msgs = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    const msgs = [...batch.values()].sort(
+      (a, b) => a.createdTimestamp - b.createdTimestamp
+    );
     for (const msg of msgs) {
       scanned++;
       const d = parseFn(msg);
@@ -758,9 +783,6 @@ async function pollOnce(channelId, parseFn, insertFn, label) {
   return inserted;
 }
 
-/* ================= HERD QUEUE (unchanged from your working version) ================= */
-// (keep your existing herd queue block here exactly as-is)
-
 /* ================= STARTUP ================= */
 client.once("clientReady", async () => {
   try {
@@ -775,8 +797,18 @@ client.once("clientReady", async () => {
 
     if (BACKFILL_ON_START) {
       console.log(`📥 Backfilling ranch + camp (max ${BACKFILL_MAX_MESSAGES})...`);
-      const rInserted = await backfillChannel(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
-      const cInserted = await backfillChannel(CAMP_INPUT_CHANNEL_ID, parseCamp, insertCampEvent, "CAMP");
+      const rInserted = await backfillChannel(
+        RANCH_INPUT_CHANNEL_ID,
+        parseRanch,
+        insertRanchEvent,
+        "RANCH"
+      );
+      const cInserted = await backfillChannel(
+        CAMP_INPUT_CHANNEL_ID,
+        parseCamp,
+        insertCampEvent,
+        "CAMP"
+      );
 
       if (rInserted > 0) {
         await rebuildRanchTotals();
@@ -790,7 +822,12 @@ client.once("clientReady", async () => {
 
     setInterval(async () => {
       try {
-        const r = await pollOnce(RANCH_INPUT_CHANNEL_ID, parseRanch, insertRanchEvent, "RANCH");
+        const r = await pollOnce(
+          RANCH_INPUT_CHANNEL_ID,
+          parseRanch,
+          insertRanchEvent,
+          "RANCH"
+        );
         if (r > 0) {
           await rebuildRanchTotals();
           await renderRanchBoard(false);
@@ -802,7 +839,12 @@ client.once("clientReady", async () => {
 
     setInterval(async () => {
       try {
-        const c = await pollOnce(CAMP_INPUT_CHANNEL_ID, parseCamp, insertCampEvent, "CAMP");
+        const c = await pollOnce(
+          CAMP_INPUT_CHANNEL_ID,
+          parseCamp,
+          insertCampEvent,
+          "CAMP"
+        );
         if (c > 0) {
           await rebuildCampTotals();
           await renderCampBoard(false);
@@ -823,6 +865,7 @@ client.once("clientReady", async () => {
   }
 });
 
+/* ================= SHUTDOWN ================= */
 async function shutdown(signal) {
   console.log(`🛑 ${signal} received. Shutting down...`);
   try {
